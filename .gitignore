@@ -1,0 +1,34 @@
+# 构建产物
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# 运行期数据（orders.csv 等，由程序生成）
+/data
+# 日志（部署脚本写 /opt 下，但本地联调可能产生）
+logs/
+*.log
+# 账户凭证与主密钥：任何位置都不得入库（含备份/明文副本）
+account.csv
+account.csv.*
+*.key
+account.key
+CLAUDE.md
+.claude/
+# 已合并进 crates/trading-service/src/bin/ 的旧独立 mock crate（已 exclude 出 workspace）
+/crates/exchange-mock/
+/crates/strategy-mock/
+
+# 编辑器 / 系统文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 内部过程性文档（plan/测试记录/问答等），不随开源仓库发布
+docs/internal/
+
+# 内部变更请求记录
+cr/

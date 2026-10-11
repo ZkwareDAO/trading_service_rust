@@ -1,0 +1,34 @@
+[package]
+name = "trading-store"
+description = "Business assembly facade: registers Account/Order/Position tables with recovery and scheduled persistence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+store-core = { path = "../store-core" }
+trading-models = { path = "../trading-models" }
+# 进程级纯内存表（OrderRuleTable/QuoteTable）由 TradingStore 统一持有；
+# 类型留在 trading-core（不落盘），store 只收口所有权与初始化。
+trading-core = { path = "../trading-core" }
+dashmap = { workspace = true }
+thiserror = { workspace = true }
+# accounts 模块：account.csv 解析（csv）与 anyhow 结果/上下文。
+csv = { workspace = true }
+anyhow = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+# async_rt 模块：spawn_blocking / spawn / interval（CRUD 本身仍同步，不需要 rt-multi-thread）
+tokio = { version = "1", features = ["rt", "time"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
+
+[[example]]
+name = "concurrency_mock"
+path = "examples/concurrency_mock.rs"

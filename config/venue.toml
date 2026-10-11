@@ -1,0 +1,20 @@
+# Venue 可调参数（交易所特定）。
+# 该文件缺失时，服务使用内置默认值（与此处相同），不会启动失败。
+# 可用 --venue-config <path> 指定其它路径。
+
+[deribit]
+# 平仓价差闸门：期权 order book 买一卖一的绝对价差（以 BTC 计）。
+# 市价平仓时：
+#   · spread <= close_spread_max → 按对手 best bid/ask 转限价平仓；
+#   · spread >  close_spread_max → 本轮不下单、规则保持 active，
+#       每 200ms 重新判断价差，直到收敛；同时发「需人工平仓」企业微信告警
+#       （同一 symbol 每 60s 最多发送一次）。
+close_spread_max = "0.005"
+
+[hyperliquid]
+# 市价单（IOC）相对中间价 mid 的滑点比率；0.05=5%。该段或字段缺失时缺省 0.05。
+slippage = "0.05"
+
+# 市价开仓的「档位漂移」：以 mark 为基准、向有利方向漂移 N 个 tick
+# （买低 N tick / 卖高 N tick）挂限价被动单。限价开仓不使用此项。
+open_drift_ticks = 5

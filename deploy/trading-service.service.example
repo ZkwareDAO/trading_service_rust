@@ -1,0 +1,43 @@
+[Unit]
+Description=Trading Service (trading_service_rust)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# User= 由 deploy/deploy.sh 安装时替换为执行 sudo 的真实用户
+User=USER_PLACEHOLDER
+
+# /opt 一体化布局：二进制、配置、数据、日志均在安装目录内。
+# Environment= 行由 deploy.sh 按执行用户的代理环境注入（本机直连外网时为空）。
+Environment=
+WorkingDirectory=/opt/trading_service_rust/data
+
+ExecStart=/opt/trading_service_rust/bin/trading-service \
+  --south-addr 127.0.0.1:9100 \
+  --data-dir /opt/trading_service_rust/data \
+  --venue-config /opt/trading_service_rust/conf/venue.toml \
+  --account-file /opt/trading_service_rust/data/account.csv \
+  --south-secret-file /opt/trading_service_rust/data/south.key \
+  --notify-open-url 'REPLACE_WITH_OPEN_WEBHOOK' \
+  --notify-close-url 'REPLACE_WITH_CLOSE_WEBHOOK' \
+  --notify-test-url 'REPLACE_WITH_TEST_WEBHOOK' \
+  --notify-manual-close-url 'REPLACE_WITH_MANUAL_CLOSE_WEBHOOK' \
+  --notify-position-url 'REPLACE_WITH_POSITION_WEBHOOK'
+
+# 进程崩溃自动拉起
+Restart=always
+RestartSec=10
+
+# 安全加固。ProtectSystem=full 仅保护 /usr /boot /etc（只读），
+# /opt 与日志仍可写，不影响运行；不可用 ProtectSystem=strict。
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+# 日志写固定文件（append，重启不丢历史）。
+StandardOutput=append:/opt/trading_service_rust/logs/trading-service.log
+StandardError=append:/opt/trading_service_rust/logs/trading-service.log
+
+[Install]
+WantedBy=multi-user.target

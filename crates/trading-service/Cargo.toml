@@ -1,0 +1,58 @@
+[package]
+name = "trading-service"
+version.workspace = true
+edition.workspace = true
+
+# 二进制同属 trading-service 包：
+#   trading-service（核心服务）/ xili-exchange（本地模拟交易所服务端）
+#   / strategy-client（模拟信号客户端）/ loadtest（压测）/ account-tool（账户凭证与 account.csv 管理）
+[[bin]]
+name = "trading-service"
+path = "src/main.rs"
+
+[[bin]]
+name = "xili-exchange"
+path = "src/bin/xili-exchange.rs"
+
+[[bin]]
+name = "strategy-client"
+path = "src/bin/strategy-client.rs"
+
+[[bin]]
+name = "loadtest"
+path = "src/bin/loadtest.rs"
+
+[[bin]]
+name = "account-tool"
+path = "src/bin/account-tool.rs"
+
+[dependencies]
+trading-core.workspace = true
+trading-exchange.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_qs.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+rust_decimal.workspace = true
+dashmap.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+store-core.workspace = true
+trading-models.workspace = true
+trading-store.workspace = true
+csv.workspace = true
+rpassword.workspace = true
+# Binance SDK / vendored OpenSSL / tokio-stream 已随适配器迁入 trading-exchange。
+
+[dev-dependencies]
+tower = { workspace = true }
+tempfile = { workspace = true }

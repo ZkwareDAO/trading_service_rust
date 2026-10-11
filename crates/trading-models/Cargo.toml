@@ -1,0 +1,19 @@
+[package]
+name = "trading-models"
+description = "Account / Order / Position domain models for trading-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+store-core = { path = "../store-core" }
+serde = { workspace = true }
+rust_decimal = { workspace = true }
+# 账户凭证本地加密（AES-256-GCM）；密钥文件的 0600 落盘由服务层负责。
+aes-gcm = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+csv = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "store-core"
+description = "Generic in-memory tables with per-row locks and atomic CSV snapshot persistence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+csv = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
