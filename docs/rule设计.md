@@ -5,8 +5,7 @@
 > 由 `crates/trading-store` 门面注册为第四张表，账户作用域，
 > 持久化于 `{root}/{UTC日}/{账户名}/watch_rule.csv`。
 >
-> 持久化/并发机制与 account/order/position 完全一致，参见
-> 《内存持久化模块设计.md》《内存持久化-并发与调用问答.md》。
+> 持久化/并发机制与 account/order/position 完全一致，参见 [`内存和持久化管理.md`](./内存和持久化管理.md)。
 
 ## 1. 两类「规则」不要混淆
 
@@ -153,7 +152,7 @@ repo.retire(rule.id)?;   // 幂等
 通用表 `watch_rules()` 仅用于 CRUD/查询；**业务状态机一律走 `RuleRepo`**
 （`claim_self` / `chain_fire` / `retire` / `list_active(_for_position)`），
 禁止在 `update`/`with_row` 闭包内回查本表、不要在外层再包 `Mutex`，
-详见《内存持久化-并发与调用问答.md》Q3。
+并发约束详见 [`内存和持久化管理.md`](./内存和持久化管理.md) 的「核心设计原则」。
 
 ## 7. 运行时引擎（trading-service）
 
