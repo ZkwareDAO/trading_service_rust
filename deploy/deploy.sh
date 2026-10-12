@@ -56,7 +56,16 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SERVICE_SRC="$SCRIPT_DIR/trading-service.service.example"
+# ——— 部署源单元：一律以 deploy/trading-service.service 为准 ———
+# .example 只是首次部署的种子模板：目录下没有 .service 时拷一份出来。
+# 之后用户直接编辑 .service（监听地址、webhook、参数等全部以它为准），
+# 重跑本脚本即生效；.service 已加入 .gitignore，不会污染 git status。
+SERVICE_SRC="$SCRIPT_DIR/trading-service.service"
+if [ ! -f "$SERVICE_SRC" ]; then
+  cp "$SCRIPT_DIR/trading-service.service.example" "$SERVICE_SRC"
+  echo "==> 已从 trading-service.service.example 复制出 $SERVICE_SRC"
+  echo "    后续请编辑该文件自定义配置（如 --south-addr 监听地址），重跑部署即生效"
+fi
 
 for f in "$SERVICE_SRC" "$PROJECT_DIR/config/venue.toml" "$SCRIPT_DIR/account.example.csv"; do
   if [ ! -f "$f" ]; then
@@ -135,7 +144,7 @@ trap 'rm -f "$SED_SCRIPT"' EXIT
   echo "s|^WorkingDirectory=.*|WorkingDirectory=$DATA_DIR|"
   printf 's|^ExecStart=.*|ExecStart=%s \\\\|\n' "$BIN_DST"
   # ExecStart 的续行参数：路径类逐行替换（\\\\ 在 sed 输出中还原为续行符）。
-  printf 's|^  --south-addr .*|  --south-addr 127.0.0.1:9100 \\\\|\n'
+  # 注意：--south-addr（HTTP 监听地址）不做替换，直接以 .service 中的值为准。
   printf 's|^  --data-dir .*|  --data-dir %s \\\\|\n' "$DATA_DIR"
   printf 's|^  --venue-config .*|  --venue-config %s/venue.toml \\\\|\n' "$CONF_DIR"
   printf 's|^  --account-file .*|  --account-file %s/account.csv \\\\|\n' "$DATA_DIR"
@@ -186,8 +195,10 @@ trap 'rm -f "$SED_SCRIPT"' EXIT
   fi
   echo "s|^StandardOutput=.*|StandardOutput=append:$LOG_DIR/${PROJECT_NAME}.log|"
   echo "s|^StandardError=.*|StandardError=append:$LOG_DIR/${PROJECT_NAME}.log|"
-  # 重部署保护：旧单元已填的 webhook（非占位符）提取回填。
-  if [ -f "$SERVICE_DST" ]; then
+  # webhook 回填保护：用户可能在 .service 中直接填写了 webhook；
+  # 仅当 .service 仍为占位符而旧安装单元（/etc）已填过时，才从旧值回填，
+  # 避免重跑脚本时把用户在 .service 里新填的 webhook 覆盖回旧值。
+  if [ -f "$SERVICE_SRC" ] && [ -f "$SERVICE_DST" ]; then
     for var in OPEN CLOSE TEST MANUAL_CLOSE POSITION; do
       old_url=$(sed -n "s/.*--notify-${var,,}-url '\([^']*\)'.*/\1/p" "$SERVICE_DST" | head -1)
       if [ -n "$old_url" ] && [[ "$old_url" != REPLACE_WITH_* ]]; then
@@ -215,7 +226,7 @@ echo "  安装目录：$OPT_ROOT（属主 $RUN_USER，日常操作无需 sudo）
 echo "  管理：${PROJECT_NAME} {status|start|stop|restart|log|reload|conf}"
 echo "        （已软链到 $MANAGE_LINK；start/stop/restart 内部仍走 sudo）"
 echo "  日志：tail -f $LOG_DIR/${PROJECT_NAME}.log"
-echo "  查看生效配置：cat $SERVICE_DST（改路径改本脚本顶部常量，改 webhook 直接编辑该文件）"
+echo "  查看生效配置：cat $SERVICE_DST（自定义监听地址/webhook 等：编辑 deploy/trading-service.service 后重跑本脚本）"
 echo
 if [ "$ACCOUNT_CSV_FRESH" -eq 1 ]; then
   echo "添加账户（脚本只初始化 $ACCOUNT_CSV 的表头，不含任何账户记录）："

@@ -13,6 +13,8 @@ account.csv
 account.csv.*
 *.key
 account.key
+# 部署源单元（由 service.example 复制而来，用户本地编辑，不入库）
+deploy/trading-service.service
 CLAUDE.md
 .claude/
 # 已合并进 crates/trading-service/src/bin/ 的旧独立 mock crate（已 exclude 出 workspace）
