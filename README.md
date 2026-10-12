@@ -5,7 +5,7 @@
 - **南向 WS**：bind 端口对接多个策略客户端（HMAC 鉴权握手）；
 - **交易所方向（一律主动外连）**：trading-service 始终作为客户端——REST 下单 + 外向
   「账户事件 WS」收订单回报。已接入 **binance（U 本位永续）/ deribit（期权）/
-  hyperliquid** 真实适配器；本地 `exchange-mock` 模拟所用于联调；
+  hyperliquid** 真实适配器；本地 `xili-exchange` 模拟所用于联调；
 - **管理 REST**：`/api/v1/*` 提供订单/仓位/规则/账户查询与下单、建规则等运维接口；
 - **盯盘规则引擎**：定时扫描 active 规则，条件命中自动开仓/平仓，支持链式规则激活。
 
@@ -39,12 +39,12 @@
 | `crates/trading-core` | 库：定点 Decimal 线格式、ID/时间工具、WS/REST 协议（模型类型来自 trading-models） |
 | `crates/trading-exchange` | 库：交易所接入层。统一契约（`api`：`ExchangeApi`/`AccountEventStream`/`MarketDataStream`/`RuleFetcher`）、对宿主的出站端口（`port`：凭证解析/订单回报）、纯映射/退避/心跳/对账内核、`binance`/`deribit`/`hyperliquid` 适配器 + `xili` 本地模拟所适配器、`provider` 装配工厂、`runtime` 账户连接监督引擎；只向下依赖 trading-core/trading-models，不反向依赖服务 |
 | `crates/trading-service/src/main.rs` | 二进制 **trading-service**：解析配置 → 实现出站端口 → 构造交易所注册表 → 南向 bind WS、管理 REST 与业务编排 |
-| `crates/trading-service/src/bin/exchange-mock.rs` | 二进制 **exchange-mock**：固定端口同时提供 REST + `/ws` 账户事件，按节奏模拟成交 |
-| `crates/trading-service/src/bin/strategy-mock.rs` | 二进制 **strategy-mock**：WS 客户端，发一条命令并打印全部回报 |
-| `crates/trading-service/src/bin/strategy-client.rs` | 二进制 **strategy-client**：参考策略客户端（含 HMAC 签名与各命令参数装配） |
+| `crates/trading-service/src/bin/xili-exchange.rs` | 二进制 **xili-exchange**：本地模拟交易所，固定端口同时提供 REST + `/ws` 账户事件，按节奏模拟成交 |
+| `crates/trading-service/src/bin/strategy-client.rs` | 二进制 **strategy-client**：参考策略客户端（含 HMAC 签名与各命令参数装配，发送一条命令并打印全部回报） |
 | `crates/trading-service/src/bin/account-tool.rs` | 二进制 **account-tool**：账户管理（`add-account` 追加/更新账户、密钥生成、secret 加密；交互式问答或参数直传） |
+| `crates/trading-service/src/bin/loadtest.rs` | 二进制 **loadtest**：下单压测 |
 
-三个二进制同属一个 package，因此统一用 `cargo run -p trading-service --bin <名字>` 启动。
+五个二进制同属一个 package，因此统一用 `cargo run -p trading-service --bin <名字>` 启动。
 
 ## 核心业务流程
 
@@ -69,44 +69,44 @@
 
 ```bash
 # 终端 1：交易所模拟器（服务端：固定端口同时提供 REST + /ws 账户事件；可起多个，实例名/端口不同）
-cargo run -p trading-service --bin exchange-mock -- \
-  --mock-instance demo_venue --addr 127.0.0.1:9200
+cargo run -p trading-service --bin xili-exchange -- \
+  --instance demo_venue --addr 127.0.0.1:9200
 
-# 终端 2：核心服务（只 bind 南向；用 --mock 静态告知模拟所地址并主动外连，可重复多个）
+# 终端 2：核心服务（只 bind 南向；用 --exchange 静态告知模拟所地址并主动外连，可重复多个）
 cargo run -p trading-service --bin trading-service -- \
   --south-addr 127.0.0.1:9100 \
-  --mock demo_venue=http://127.0.0.1:9200 \
+  --exchange demo_venue=http://127.0.0.1:9200 \
   --data-dir ./data \
   --flush-interval 5s
 
-# 终端 3：策略模拟器（可启动多个，--strategy_name 不同）
-cargo run -p trading-service --bin strategy-mock -- \
-  --strategy_name test_strategy \
-  --exchange_mock demo_venue \
+# 终端 3：策略客户端（参考实现，发送一条命令并打印全部回报；可启动多个）
+cargo run -p trading-service --bin strategy-client -- \
+  --strategy-name test_strategy \
+  --exchange demo_venue \
   --account test_binance \
-  --instrument btcusdt \
+  --instrument BTCUSDT \
   --quantity 1 \
   --side long \
   --price 80000
 ```
 
-> CLI 同时接受下划线与连字符形式（clap 默认两者等价），例如 `--mock_instance` 或 `--mock-instance`。
+> CLI 同时接受下划线与连字符形式（clap alias），例如 `--strategy_name` 或 `--strategy-name`。
 
 ### 其它命令
 
 ```bash
-# 分多次成交，观察 PARTIAL -> FILLED
-cargo run -p trading-service --bin exchange-mock -- \
-  --mock_instance demo_venue --order_fill_times 5 --order_fill_interval 10s
+# 分多次成交，观察 PARTIAL -> FILLED（--instance 默认 xili）
+cargo run -p trading-service --bin xili-exchange -- \
+  --instance demo_venue --order_fill_times 5 --order_fill_interval 10s
 
 # 撤单（需要上一笔返回的 client_order_id）
-cargo run -p trading-service --bin strategy-mock -- \
-  --option cancel_order --strategy_name test_strategy --exchange_mock demo_venue \
+cargo run -p trading-service --bin strategy-client -- \
+  --option cancel_order --strategy-name test_strategy --exchange demo_venue \
   --client_order_id 0x....
 
 # 查持仓
-cargo run -p trading-service --bin strategy-mock -- \
-  --option get_positions --exchange_mock demo_venue --account test_binance
+cargo run -p trading-service --bin strategy-client -- \
+  --option get_positions --exchange demo_venue --account test_binance
 ```
 
 ## 南向连接鉴权
@@ -124,7 +124,7 @@ cargo run -p trading-service --bin strategy-mock -- \
   ```
 
   签名用恒定时间比较；`nonce` 一次性、5 分钟 TTL，重放即拒（过期条目后台 60s 清扫）。
-- `strategy-mock` 默认读 `./data/south.key` 自动签名，可用 `--secret_file <path>` 指定。
+- `strategy-client` 默认读 `./data/south.key` 自动签名，可用 `--secret-file <path>` 指定。
 
 仅本地联调可临时关闭验签（**严禁用于生产**，启动会打 ERROR 告警）：
 
@@ -132,7 +132,7 @@ cargo run -p trading-service --bin strategy-mock -- \
 # 服务端
 cargo run -p trading-service --bin trading-service -- --south-dev-insecure
 # 客户端（不带签名）
-cargo run -p trading-service --bin strategy-mock -- --insecure
+cargo run -p trading-service --bin strategy-client -- --insecure
 ```
 
 生产部署应在 TLS（`wss://`）之后承载，防止密钥相关参数在传输中被窃听或篡改。
