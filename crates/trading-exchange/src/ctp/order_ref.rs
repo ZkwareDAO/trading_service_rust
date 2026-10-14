@@ -7,7 +7,9 @@
 //!
 //! 生命周期：会话态（进程内存）；订单行持久化 `exchange_order_id`（受理时
 //! 为 OrderRef，首回报后升级为 OrderSysID）+ 宿主回查 fallback 承担重启恢复，
-//! 本表丢得起、可重建。
+//! 本表丢得起、可重建。清理有两个钩子：下单同步拒（`api.rs` 受理码非 0）
+//! 清脏表；委托到达终态（全部成交/撤销）经 `venue.rs` 终态钩子回收表项，
+//! 防长会话无限增长——终态后迟到的回报经宿主 fallback 兜底，无需映射。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

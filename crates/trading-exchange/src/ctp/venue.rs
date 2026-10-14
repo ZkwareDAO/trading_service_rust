@@ -180,6 +180,9 @@ pub struct CtpUserHandle {
     /// 停机标志（Drop 置位，线程自行退出并释放 .so）。
     pub(crate) shutdown: Arc<AtomicBool>,
     /// OrderSysID → 累计成交量（专用线程写，tokio 侧读；Mutex 保护而非 channel）。
+    /// 表项生存期 = 该单首笔成交 → 终态回报（终态钩子回收，见
+    /// [`release_terminal_tables`]）；崩溃恢复不依赖本表——重连补快照的
+    /// 委托回报自带柜台权威累计 `volume_traded`。
     pub(crate) filled_by_sys_id: Arc<Mutex<std::collections::HashMap<String, i64>>>,
     /// 下单请求信箱（async 侧投递 → 本线程消费；provider 级共享）。
     pub(crate) inserts: Arc<crate::ctp::mailbox::InsertMailbox>,
@@ -379,6 +382,9 @@ fn dispatch_event(
             // 回报反查：OrderRef → 本地长 cid（未命中保留原值，宿主 fallback 兜底）。
             let mut event = crate::translate::order_event(&state);
             event.client_order_id = resolve_event_cid(ctx, &s.order_ref);
+            // 终态清理钩子：反查完成后回收两张会话表（cid↔OrderRef 映射与
+            // 成交累计），防会话内无限增长；迟到/重放回报经宿主 fallback 兜底。
+            release_terminal_tables(&ctx.order_refs, &handle.filled_by_sys_id, &s);
             // 阻塞线程 → async 端口经有界队列投递（满则阻塞背压，不丢单）。
             if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Order(Box::new(event))) {
                 tracing::warn!(account = %ctx.account, "事件桥已关闭，订单事件丢弃：{e}");
@@ -439,10 +445,31 @@ fn dispatch_event(
     }
 }
 
+/// 终态清理钩子：委托到达终态（全部成交/撤销）后，回收两张会话表项——
+/// cid↔OrderRef 映射与 OrderSysID→累计成交量，防会话内无限增长。
+/// 两表均为"丢得起、可重建"的会话态：迟到/重放的回报经宿主
+/// `exchange_order_id` 回查 fallback 与补快照重放兜底，表不是真相源。
+fn release_terminal_tables(
+    order_refs: &crate::ctp::order_ref::OrderRefRegistry,
+    filled_by_sys_id: &Mutex<std::collections::HashMap<String, i64>>,
+    s: &crate::ctp::core::event::OrderSnapshot,
+) {
+    if !s.is_terminal() {
+        return;
+    }
+    // 映射表项的价值窗口 = 本单在途期间；终态之后留着是纯泄漏。
+    // AllTraded 单必有成交累计表项；Cancelled 单多半缺席，remove 天然 no-op。
+    order_refs.remove(&s.order_ref);
+    filled_by_sys_id.lock().unwrap().remove(&s.order_sys_id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ctp::core::account::CtpAccount;
+    use crate::ctp::core::event::OrderSnapshot;
+    use crate::ctp::core::types::{Direction, OrderStatus};
+    use crate::ctp::order_ref::OrderRefRegistry;
 
     fn account() -> CtpAccount {
         CtpAccount {
@@ -505,6 +532,106 @@ mod tests {
             .unwrap()
             .insert("7".to_string(), 3);
         assert_eq!(h.filled_of("7"), 3);
+    }
+
+    // ---- 终态清理钩子：委托终态即回收两张会话表（防无限增长）----
+
+    /// 构造委托快照（仅 status/order_ref/order_sys_id 参与钩子判定）。
+    fn snapshot(status: OrderStatus, order_ref: &str, order_sys_id: &str) -> OrderSnapshot {
+        OrderSnapshot {
+            order_ref: order_ref.to_string(),
+            instrument: "rb2510".to_string(),
+            exchange_id: "SHFE".to_string(),
+            order_sys_id: order_sys_id.to_string(),
+            insert_time: "09:30:00".to_string(),
+            direction: Direction::Buy,
+            status,
+            limit_price: 3500.0,
+            volume_total: 2,
+            volume_traded: 0,
+            status_msg: String::new(),
+            front_id: 1,
+            session_id: 1,
+        }
+    }
+
+    #[test]
+    fn terminal_release_frees_both_session_tables() {
+        // Arrange：长 cid 分配 OrderRef 入映射表；成交累计入累计表。
+        let refs = OrderRefRegistry::new();
+        let order_ref = refs.allocate(&format!("0x{}", "F".repeat(32)));
+        let sys_id = "20250101-1";
+        let filled: Mutex<std::collections::HashMap<String, i64>> =
+            Mutex::new(std::collections::HashMap::new());
+        filled.lock().unwrap().insert(sys_id.to_string(), 1);
+
+        // Act：全部成交（终态）——钩子回收两张表。
+        release_terminal_tables(
+            &refs,
+            &filled,
+            &snapshot(OrderStatus::AllTraded, &order_ref, sys_id),
+        );
+
+        // Assert：映射与累计表项均已回收。
+        assert!(
+            refs.cid_of(&order_ref).is_none(),
+            "终态后 OrderRef 映射应回收"
+        );
+        assert!(
+            filled.lock().unwrap().get(sys_id).is_none(),
+            "终态后成交累计表项应回收"
+        );
+    }
+
+    #[test]
+    fn non_terminal_keeps_both_session_tables() {
+        // Arrange：排队中的委托（非终态），两张表各有一条在途记录。
+        let refs = OrderRefRegistry::new();
+        let order_ref = refs.allocate(&format!("0x{}", "E".repeat(32)));
+        let sys_id = "20250101-2";
+        let filled: Mutex<std::collections::HashMap<String, i64>> =
+            Mutex::new(std::collections::HashMap::new());
+        filled.lock().unwrap().insert(sys_id.to_string(), 1);
+
+        // Act：未成交排队回报——钩子不得误清。
+        release_terminal_tables(
+            &refs,
+            &filled,
+            &snapshot(OrderStatus::NoTradeQueueing, &order_ref, sys_id),
+        );
+
+        // Assert：两张表均保留（订单仍在途，后续回报仍需反查/累计）。
+        assert!(
+            refs.cid_of(&order_ref).is_some(),
+            "非终态不得清 OrderRef 映射"
+        );
+        assert!(
+            filled.lock().unwrap().get(sys_id).is_some(),
+            "非终态不得清成交累计"
+        );
+    }
+
+    #[test]
+    fn cancelled_release_frees_mapping_and_tolerates_absent_entry() {
+        // Arrange：撤单终态（通常无成交，累计表缺席该 sys_id——remove 须为无害 no-op）。
+        let refs = OrderRefRegistry::new();
+        let order_ref = refs.allocate(&format!("0x{}", "D".repeat(32)));
+        let sys_id = "20250101-3";
+        let filled: Mutex<std::collections::HashMap<String, i64>> =
+            Mutex::new(std::collections::HashMap::new());
+
+        // Act
+        release_terminal_tables(
+            &refs,
+            &filled,
+            &snapshot(OrderStatus::Cancelled, &order_ref, sys_id),
+        );
+
+        // Assert：映射回收；缺席表项的移除不 panic。
+        assert!(
+            refs.cid_of(&order_ref).is_none(),
+            "撤销终态后 OrderRef 映射应回收"
+        );
     }
 
     #[test]
