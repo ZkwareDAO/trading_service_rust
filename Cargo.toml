@@ -74,6 +74,9 @@ sha3 = "0.10"
 hex = "0.4"
 # MessagePack：L1 action → connectionId 的序列化（与官方 SDK rmp_serde 同款）
 rmp-serde = "1.3"
+
+# ---- CTP 期货适配（feature="ctp" 专用）：vendored ctp2rs 动态绑定 ----
+ctp2rs = { path = "third_party/ctp2rs/ctp-dyn", default-features = false, features = ["v1alpha1", "ctp_v6_7_13"] }
 # store-core / trading-models / trading-store 存储体系
 store-core = { path = "crates/store-core" }
 trading-models = { path = "crates/trading-models" }

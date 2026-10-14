@@ -26,6 +26,8 @@ pub enum Venue {
     Hyperliquid,
     /// Deribit 期权。
     Deribit,
+    /// 国内期货 CTP。
+    Ctp,
 }
 
 /// 市场形态（现货 / 期货类 / 期权），行情订阅的三分类。

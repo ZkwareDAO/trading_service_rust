@@ -51,6 +51,31 @@ fn to_repo_input(ev: &OrderEvent) -> OrderEventInput {
 pub async fn apply_and_route(state: &AppState, ev: &OrderEvent, source: &str) {
     let orders = state.store.order_repo().expect("order repo after recover");
     let input = to_repo_input(ev);
+    // cid miss 时的回查 fallback（各所通用）：柜台回报可能只带交易所侧标识
+    // （CTP 重启后内存映射丢失，事件 cid=OrderRef；订单行受理时已落
+    // exchange_order_id）。命中唯一行则改写 cid 重试一次；其余维持丢弃语义。
+    let input = match orders.apply_event(&input) {
+        Ok(_) => input,
+        Err(_) => {
+            let fallback = orders
+                .resolve_cid_by_exchange_id(&ev.client_order_id, ev.exchange_order_id.as_deref());
+            match fallback {
+                Some(cid) => {
+                    tracing::info!(
+                        source,
+                        event_cid = %ev.client_order_id,
+                        resolved_cid = %cid,
+                        "order event cid miss, resolved by exchange_order_id"
+                    );
+                    OrderEventInput {
+                        client_order_id: cid,
+                        ..input
+                    }
+                }
+                None => input,
+            }
+        }
+    };
     match orders.apply_event(&input) {
         Ok(updated) => {
             tracing::info!(
@@ -79,7 +104,7 @@ pub async fn apply_and_route(state: &AppState, ev: &OrderEvent, source: &str) {
             }
         }
         Err(e) => {
-            tracing::warn!(error = %e, source = source, client_order_id = %ev.client_order_id, "cannot apply order event")
+            tracing::warn!(error = %e, source = source, client_order_id = %input.client_order_id, "cannot apply order event")
         }
     }
 }

@@ -49,7 +49,7 @@ mod tests {
     async fn lists_active_accounts_safe_fields_only() {
         // Arrange：两个活动账户（hedge 测试网、one_way 正式网）。
         let app = app_with_accounts(
-            "0,hedger,binance,K,s,,hedge,1,0,0,0\n\
+            "0,hedger,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\",\"\"position_mode\"\":\"\"hedge\"\",\"\"is_testnet\"\":true}\",0,0,0\n\
              0,plain,binance,K2,s2,,one_way,0,0,0,0\n",
         )
         .await;
@@ -106,9 +106,9 @@ mod tests {
     async fn filters_by_exchange_name_testnet_and_position_mode() {
         // Arrange
         let app = app_with_accounts(
-            "0,a1,binance,K,s,,one_way,0,0,0,0\n\
-             0,a2,binance,K,s,,hedge,1,0,0,0\n\
-             0,a3,okx,K,s,,one_way,0,0,0,0\n",
+            "0,a1,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n\
+             0,a2,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\",\"\"position_mode\"\":\"\"hedge\"\",\"\"is_testnet\"\":true}\",0,0,0\n\
+             0,a3,okx,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n",
         )
         .await;
 
@@ -192,8 +192,7 @@ mod tests {
     fn account_header_constant_shape() {
         assert_eq!(
             ACCOUNT_HEADER,
-            "id,name,exchange,api_key,api_secret,api_passphrase,position_mode,is_testnet,\
-             deleted,created_at,updated_at\n"
+            "id,name,exchange,credentials,deleted,created_at,updated_at\n"
         );
     }
 }

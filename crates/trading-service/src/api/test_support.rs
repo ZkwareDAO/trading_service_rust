@@ -14,9 +14,8 @@ use trading_store::init::{InitParams, Initialized};
 use crate::account_hub::AccountHub;
 use crate::state::{AppState, AssemblyDeps, VenueEndpoints};
 
-/// account.csv 表头（与生产一致）。
-pub const ACCOUNT_HEADER: &str =
-    "id,name,exchange,api_key,api_secret,api_passphrase,position_mode,is_testnet,deleted,created_at,updated_at\n";
+/// account.csv 表头（与生产一致：新 7 列，6 公共列 + credentials）。
+pub const ACCOUNT_HEADER: &str = "id,name,exchange,credentials,deleted,created_at,updated_at\n";
 
 /// 已装配的测试应用 + 其临时目录（保留句柄防止目录提前清理）。
 pub struct TestApp {

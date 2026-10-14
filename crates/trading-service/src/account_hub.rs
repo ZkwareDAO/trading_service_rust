@@ -44,21 +44,19 @@ impl Deref for AccountHub {
 }
 
 /// 交易所接入层凭证解析端口：精确名匹配 + 现取现解密，不长期缓存 secret。
+///
+/// 薄透传：解密与按 exchange 的 schema 路由已收口在 store 兼容层
+/// （`ResolvedAccount.credential` 直接携带强类型枚举），本 impl 无任何
+/// exchange 分支（迁移方案 B Phase 3）。
 impl CredentialResolver for AccountHub {
     fn resolve(
         &self,
         account: &str,
         exchange: &str,
     ) -> Option<trading_exchange::port::ExchangeCredential> {
-        self.0.resolve(account, Some(exchange)).map(|acc| {
-            trading_exchange::port::ExchangeCredential {
-                api_key: acc.api_key,
-                api_secret: acc.api_secret,
-                api_passphrase: acc.api_passphrase,
-                position_mode: acc.position_mode,
-                is_testnet: acc.is_testnet,
-            }
-        })
+        self.0
+            .resolve(account, Some(exchange))
+            .map(|acc| acc.credential)
     }
 }
 

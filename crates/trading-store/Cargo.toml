@@ -8,6 +8,11 @@ license.workspace = true
 [dependencies]
 store-core = { path = "../store-core" }
 trading-models = { path = "../trading-models" }
+# 凭证迁移方案 B：ResolvedAccount 直接携带 ExchangeCredential 枚举，
+# 兼容层按 exchange 路由各所 credentials JSON schema（port 层类型）。
+trading-exchange.workspace = true
+# accounts 兼容层：旧宽表行 → credentials JSON 明文的序列化。
+serde_json.workspace = true
 # 进程级纯内存表（OrderRuleTable/QuoteTable）由 TradingStore 统一持有；
 # 类型留在 trading-core（不落盘），store 只收口所有权与初始化。
 trading-core = { path = "../trading-core" }

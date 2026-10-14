@@ -165,6 +165,7 @@ fn venue_rank(venue: Venue) -> u8 {
         Venue::BinanceSpot => 2,
         Venue::Deribit => 1,
         Venue::Hyperliquid => 0,
+        Venue::Ctp => 4,
     }
 }
 

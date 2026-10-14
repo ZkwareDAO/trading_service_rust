@@ -32,6 +32,13 @@ impl ConnTarget {
 /// 某个 venue 的连接工厂：为指定账户启动一个长期运行的用户数据流任务。
 pub trait VenueConnector: Send + Sync {
     fn spawn(&self, exchange: &str, account: &str) -> JoinHandle<()>;
+
+    /// 优雅停机钩子：停掉各所按账户的长连接线程（默认无操作）。
+    ///
+    /// `abort` 对 `spawn_blocking` 任务无效，阻塞线程实现（CTP）必须
+    /// 经 provider 级停机标志退出；由 [`Supervisor::stop_all`] 的调用方
+    /// 在收尾时触发。
+    fn stop_account_streams(&self) {}
 }
 
 /// 运行态一项：连接任务句柄 + 其对应的目标版本。

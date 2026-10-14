@@ -102,7 +102,7 @@ mod tests {
     #[tokio::test]
     async fn query_returns_50001_when_exchange_unreachable() {
         // Arrange：binance 账户（测试无真实端点：connect/调用失败 → 50001）。
-        let app = app_with_accounts("0,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let router: Router = crate::api::router().with_state(app.state.clone());
 
         // Act
@@ -135,7 +135,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_json_returns_40001() {
-        let app = app_with_accounts("0,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let router = crate::api::router().with_state(app.state.clone());
         let (status, v) = post(&router, "/api/v1/exchange/positions", "{x").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);

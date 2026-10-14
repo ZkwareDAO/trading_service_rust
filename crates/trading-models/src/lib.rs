@@ -15,7 +15,7 @@ pub mod quote;
 pub mod types;
 pub mod watch_rule;
 
-pub use account::{Account, SecretCipher};
+pub use account::{Account, SecretCipher, ACCOUNT_CSV_HEADER, SECRET_PREFIX};
 pub use order::{Order, OrderStatus, OrderType, TimeInForce};
 pub use order_rule::{OrderRule, OrderRuleKey, PriceTier};
 pub use position::{revalue_positions, Position, PositionPrice, QtyUnit, ROI_SCALE};

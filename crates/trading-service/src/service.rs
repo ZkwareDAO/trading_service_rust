@@ -235,7 +235,7 @@ pub(crate) async fn submit_order_core(
     order.order_cash = order_cash;
     order.instrument_type = instrument_type;
     // 测试网是账户属性：随该下单账户。
-    order.test_net = trading_account.is_testnet;
+    order.test_net = trading_account.is_testnet();
     order.order_type = order_type;
     order.time_in_force = time_in_force;
     order.order_price = if matches!(order_type, OrderType::Market) {
@@ -278,7 +278,7 @@ pub(crate) async fn submit_order_core(
         // positionSide 统一收口：权威实现在 binance::prep（单向=BOTH，hedge
         // 平仓锁定被平持仓而非反向开仓）。
         position_side: trading_exchange::binance::prep::order_position_side(
-            trading_account.position_mode,
+            trading_account.position_mode(),
             side,
             order.reduce_only,
         ),
@@ -1056,9 +1056,10 @@ mod tests {
     #[tokio::test]
     async fn submit_core_aligns_quantity_to_lot_step_before_insert() {
         // Arrange：起带 binance 账户的应用，并在规则表放入合成交易规则。
-        let app =
-            crate::api::test_support::app_with_accounts("0,tb,binance,K,s,,one_way,0,0,0,0\n")
-                .await;
+        let app = crate::api::test_support::app_with_accounts(
+            "0,tb,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n",
+        )
+        .await;
         app.state.store.order_rules().put(binance_rule());
 
         let d = |s: &str| rust_decimal::Decimal::from_str(s).unwrap();
@@ -1133,9 +1134,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_order_returns_active_order() {
-        let app =
-            crate::api::test_support::app_with_accounts("1,alice,binance,K,s,,one_way,0,0,0,0\n")
-                .await;
+        let app = crate::api::test_support::app_with_accounts(
+            "1,alice,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n",
+        )
+        .await;
         let url = crate::api::test_support::serve_south_ws(&app.state).await;
         let cid = "0x000000000000000000000000000000a1";
         let acct_id = app
@@ -1166,9 +1168,10 @@ mod tests {
     #[tokio::test]
     async fn get_order_returns_terminal_tombstone() {
         // 当日终态单已软删：peek tombstone 仍须可读。
-        let app =
-            crate::api::test_support::app_with_accounts("1,alice,binance,K,s,,one_way,0,0,0,0\n")
-                .await;
+        let app = crate::api::test_support::app_with_accounts(
+            "1,alice,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n",
+        )
+        .await;
         let url = crate::api::test_support::serve_south_ws(&app.state).await;
         let cid = "0x000000000000000000000000000000a2";
         let acct_id = app
@@ -1197,9 +1200,10 @@ mod tests {
     #[tokio::test]
     async fn get_order_falls_back_to_history_file() {
         // 跨日已 purge：内存无此单，从历史 CSV 回读。
-        let app =
-            crate::api::test_support::app_with_accounts("1,alice,binance,K,s,,one_way,0,0,0,0\n")
-                .await;
+        let app = crate::api::test_support::app_with_accounts(
+            "1,alice,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n",
+        )
+        .await;
         let url = crate::api::test_support::serve_south_ws(&app.state).await;
         let cid = "0x000000000000000000000000000000a3";
         let acct_id = app
@@ -1228,9 +1232,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_order_errors_on_missing_cid() {
-        let app =
-            crate::api::test_support::app_with_accounts("1,alice,binance,K,s,,one_way,0,0,0,0\n")
-                .await;
+        let app = crate::api::test_support::app_with_accounts(
+            "1,alice,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n",
+        )
+        .await;
         let url = crate::api::test_support::serve_south_ws(&app.state).await;
         let mut ws = connect_south(&url, "s1").await;
 
@@ -1242,9 +1247,10 @@ mod tests {
     #[tokio::test]
     async fn get_order_rejects_other_strategy_order() {
         // 订单属于 s2：s1 不得查到（归属校验失败按查无处理）。
-        let app =
-            crate::api::test_support::app_with_accounts("1,alice,binance,K,s,,one_way,0,0,0,0\n")
-                .await;
+        let app = crate::api::test_support::app_with_accounts(
+            "1,alice,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n",
+        )
+        .await;
         let url = crate::api::test_support::serve_south_ws(&app.state).await;
         let cid = "0x000000000000000000000000000000a4";
         let acct_id = app
@@ -1272,9 +1278,10 @@ mod tests {
     async fn get_order_supports_signal_id_key() {
         // WS get_order 也应支持按 signal_id（配合握手策略身份）查询，
         // 与 REST GET /orders 等价。
-        let app =
-            crate::api::test_support::app_with_accounts("1,alice,binance,K,s,,one_way,0,0,0,0\n")
-                .await;
+        let app = crate::api::test_support::app_with_accounts(
+            "1,alice,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n",
+        )
+        .await;
         let url = crate::api::test_support::serve_south_ws(&app.state).await;
         let cid = "0x000000000000000000000000000000a5";
         let acct_id = app
@@ -1345,9 +1352,10 @@ mod tests {
     #[tokio::test]
     async fn get_positions_reads_local_table_with_full_fields() {
         // Arrange：本地仓位表有一条活跃仓（不接入任何交易所适配器）。
-        let app =
-            crate::api::test_support::app_with_accounts("1,alice,binance,K,s,,one_way,0,0,0,0\n")
-                .await;
+        let app = crate::api::test_support::app_with_accounts(
+            "1,alice,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n",
+        )
+        .await;
         let url = crate::api::test_support::serve_south_ws(&app.state).await;
         let acct_id = app
             .state
@@ -1390,7 +1398,7 @@ mod tests {
     async fn get_positions_no_args_returns_all_rows() {
         // Arrange：两个账户各一条仓位。
         let app = crate::api::test_support::app_with_accounts(
-            "1,alice,binance,K,s,,one_way,0,0,0,0\n2,bob,binance,K,s,,one_way,0,0,0,0\n",
+            "1,alice,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n2,bob,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n",
         )
         .await;
         let url = crate::api::test_support::serve_south_ws(&app.state).await;
@@ -1430,9 +1438,10 @@ mod tests {
     #[tokio::test]
     async fn get_positions_filters_by_account_exchange_type_instrument() {
         // Arrange：同账户两条不同标的仓位。
-        let app =
-            crate::api::test_support::app_with_accounts("1,alice,binance,K,s,,one_way,0,0,0,0\n")
-                .await;
+        let app = crate::api::test_support::app_with_accounts(
+            "1,alice,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n",
+        )
+        .await;
         let url = crate::api::test_support::serve_south_ws(&app.state).await;
         let acct_id = app
             .state
@@ -1473,9 +1482,10 @@ mod tests {
     #[tokio::test]
     async fn get_positions_no_match_returns_empty_list_not_error() {
         // Arrange：本地有一条 BTCUSDT 仓位。
-        let app =
-            crate::api::test_support::app_with_accounts("1,alice,binance,K,s,,one_way,0,0,0,0\n")
-                .await;
+        let app = crate::api::test_support::app_with_accounts(
+            "1,alice,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n",
+        )
+        .await;
         let url = crate::api::test_support::serve_south_ws(&app.state).await;
         let acct_id = app
             .state

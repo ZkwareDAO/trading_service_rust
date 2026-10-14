@@ -214,7 +214,7 @@ mod tests {
 
     /// 起带一个 binance 账户的应用，返回 router。
     async fn app() -> Router {
-        let app = app_with_accounts("0,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         crate::api::router().with_state(app.state.clone())
     }
 

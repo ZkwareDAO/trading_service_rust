@@ -78,8 +78,7 @@ mod tests {
     use super::*;
     use store_core::SystemClock;
 
-    const HEADER: &str =
-        "id,name,exchange,api_key,api_secret,api_passphrase,position_mode,is_testnet,deleted,created_at,updated_at\n";
+    const HEADER: &str = "id,name,exchange,credentials,deleted,created_at,updated_at\n";
 
     fn tmp_dir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,9 +98,12 @@ mod tests {
         let csv = dir.join("account.csv");
         let key = dir.join("account.key");
         // 两个账户：binance + okx（去重连接逻辑在账户管理器单测覆盖）。
+        // 新 7 列口径：credentials 为联调明文 JSON（CSV 引号转义：内嵌双引号双写）。
+        let json = r#"{"api_key":"K","api_secret":"s"}"#;
+        let cell = format!("\"{}\"", json.replace('"', "\"\""));
         std::fs::write(
             &csv,
-            format!("{HEADER}0,a1,binance,K,s,,,0,0,0,0,0\n0,a2,okx,K,s,,,0,0,0,0,0\n"),
+            format!("{HEADER}0,a1,binance,{cell},0,0,0\n0,a2,okx,{cell},0,0,0\n"),
         )
         .unwrap();
 

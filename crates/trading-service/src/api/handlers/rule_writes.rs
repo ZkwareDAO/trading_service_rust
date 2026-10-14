@@ -524,7 +524,7 @@ mod tests {
 
     /// 起带一个 binance 账户的应用。
     async fn app() -> Router {
-        let app = app_with_accounts("0,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         crate::api::router().with_state(app.state.clone())
     }
 
@@ -554,7 +554,7 @@ mod tests {
     #[tokio::test]
     async fn create_risk_rule_binds_position_id() {
         // Arrange：先解析账户真实 id，再建一条该账户持仓拿到 position_id。
-        let app = app_with_accounts("0,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let account_id = app
             .state
             .accounts
@@ -646,7 +646,7 @@ mod tests {
     #[tokio::test]
     async fn resubmit_profit_drawdown_updates_instead_of_appending() {
         // 复现生产：profit_drawdown >=0.05 连发两次相同请求，应更新而非新增。
-        let app = app_with_accounts("0,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let account_id = app
             .state
             .accounts
@@ -682,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn different_condition_kind_is_still_a_new_rule() {
         // Arrange
-        let app = app_with_accounts("0,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let account_id = app
             .state
             .accounts
@@ -790,7 +790,7 @@ mod tests {
     #[tokio::test]
     async fn batch_create_two_pass_inserts_and_backfills_actions() {
         // Arrange：账户 + 一条持仓。
-        let app = app_with_accounts("0,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let account_id = app
             .state
             .accounts
@@ -844,7 +844,7 @@ mod tests {
     #[tokio::test]
     async fn batch_resubmit_same_rules_updates_instead_of_duplicating() {
         // Arrange：账户 + 一条持仓。
-        let app = app_with_accounts("0,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let account_id = app
             .state
             .accounts
@@ -911,7 +911,7 @@ mod tests {
     #[tokio::test]
     async fn resubmit_same_value_updates_instead_of_appending() {
         // 身份完全一致（含 value）时绝不 append：两次相同请求复用同 id 走更新。
-        let app = app_with_accounts("0,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let account_id = app
             .state
             .accounts
@@ -954,7 +954,7 @@ mod tests {
     #[tokio::test]
     async fn resubmit_changed_value_creates_new_rule() {
         // 身份其余字段一致、仅 value 不同 → 不复用，创建第二条独立规则。
-        let app = app_with_accounts("0,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let account_id = app
             .state
             .accounts
@@ -1005,7 +1005,7 @@ mod tests {
     #[tokio::test]
     async fn batch_resubmit_changed_value_appends_new_rule() {
         // 批量接口同口径：value 不同 → append 新行；value 相同 → 复用更新。
-        let app = app_with_accounts("0,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let account_id = app
             .state
             .accounts
@@ -1054,7 +1054,7 @@ mod tests {
     #[tokio::test]
     async fn batch_resubmit_same_value_updates_field_with_same_id() {
         // 批量接口：身份完全一致（含 value）→ 绝不 append，复用同 id 更新。
-        let app = app_with_accounts("0,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let account_id = app
             .state
             .accounts

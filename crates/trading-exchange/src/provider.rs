@@ -82,6 +82,9 @@ pub struct ProviderDeps {
     pub endpoints: Arc<Vec<VenueEndpoint>>,
     /// Venue 可调参数（如 deribit 价差阈值/漂移档数）。
     pub venue: PrepConfig,
+    /// CTP 运行参数（.so 路径/流目录基准；venue.toml [ctp] 段，缺失回退 vendored）。
+    #[cfg(feature = "ctp")]
+    pub ctp: crate::ctp::CtpConfig,
     /// Hyperliquid 可调参数（市价滑点）。
     pub hyperliquid: HyperliquidConfig,
     /// 行情订阅兴趣供给（宿主读仓位∪规则）；None=不做动态订阅。
@@ -90,6 +93,12 @@ pub struct ProviderDeps {
 
 /// 一家交易所的完整套件扩展点。注册表按 [`VenueProvider::matches`] 把请求路由给它。
 pub trait VenueProvider: Send + Sync {
+    /// 优雅停机钩子：停掉该所按账户的长连接线程。
+    ///
+    /// 默认无操作；CTP 等阻塞线程实现必须置位停机标志——`abort` 对
+    /// `spawn_blocking` 任务无效，标志是其唯一停机通道。
+    fn stop_account_streams(&self) {}
+
     /// 该所是否归本 provider 处理。
     ///
     /// 约定：交易所名全局唯一，做**大小写敏感的精确相等**匹配，不接受别名、

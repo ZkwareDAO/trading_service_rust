@@ -64,4 +64,18 @@ impl PositionProfile {
             fallback_valuation: Some((Venue::Hyperliquid, MarketKind::Futures)),
         }
     }
+
+    /// CTP 国内期货档案：合约对账；入站/兜底均为 CTP 合约行情
+    /// （行情前置不可用时 market.rs 降级：QuoteTable 无该标的行时兜底
+    /// 自然取不到价，由宿主 fallback_valuation 语义处理，不阻断交易）。
+    #[cfg(feature = "ctp")]
+    pub const fn ctp() -> Self {
+        Self {
+            exchange: "ctp",
+            instrument_type: InstrumentType::Futures,
+            quote_venue: Venue::Ctp,
+            quote_kind: MarketKind::Futures,
+            fallback_valuation: Some((Venue::Ctp, MarketKind::Futures)),
+        }
+    }
 }

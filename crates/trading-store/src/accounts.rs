@@ -9,10 +9,14 @@
 //!   停旧起新（改密/切测试网即时生效）；
 //! * 下单时按账户名现取解密后的凭证，不长期缓存 secret。
 //!
-//! 本模块是**纯账户域**：只依赖 store-core/trading-models，不认识交易所网络层与
-//! 交易服务。对接外部端口（凭证解析 `CredentialResolver`、账户目标 `AccountTargets`、
-//! 规则账户反查）的 trait 实现由服务层 `AccountHub` newtype 委托本管理器，
-//! 以同时规避跨 crate 依赖与孤儿规则。不使用 channel。
+//! 本模块是**纯账户域**：只依赖 store-core/trading-models/trading-exchange 端口，
+//! 不认识交易所网络层与交易服务。对接外部端口（凭证解析 `CredentialResolver`、
+//! 账户目标 `AccountTargets`、规则账户反查）的 trait 实现由服务层 `AccountHub`
+//! newtype 委托本管理器，以同时规避跨 crate 依赖与孤儿规则。不使用 channel。
+//!
+//! **新 7 列格式是唯一读取口径**（迁移方案 B；Phase 2 的旧宽表兼容读路径已随
+//! Phase 4 删除，不留双轨）：旧宽表文件拒载并提示 `account-tool migrate`，
+//! 旧→新映射逻辑归 account-tool 的 `migrate` 子命令所有。
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -22,42 +26,43 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use store_core::Table;
+use trading_exchange::port::{credential_from_json, ExchangeCredential};
 use trading_models::{Account, SecretCipher};
 
-/// 下单时取用的、已解密凭证（[`std::fmt::Debug`] 刻意不打印 secret）。
+/// 下单/建连时取用的、已解密凭证（[`std::fmt::Debug`] 脱敏由
+/// [`ExchangeCredential`] 自带实现，不打印任何密钥字段）。
 #[derive(Clone)]
 pub struct ResolvedAccount {
     pub id: u64,
     pub name: String,
     pub exchange: String,
-    pub api_key: String,
-    pub api_secret: String,
-    pub api_passphrase: Option<String>,
-    /// 持仓模式：one_way（BOTH）/ hedge（LONG/SHORT）。
-    pub position_mode: trading_models::PositionMode,
-    /// 该账户连接测试网还是正式网（用户级路径：下单 REST + 账户事件流）。
-    pub is_testnet: bool,
+    /// 解密后的强类型凭证：REST 签名所 [`ExchangeCredential::ApiSecret`]，
+    /// CTP 期货 [`ExchangeCredential::Ctp`]（按 exchange 路由 schema）。
+    pub credential: ExchangeCredential,
 }
 
-impl std::fmt::Debug for ResolvedAccount {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedAccount")
-            .field("id", &self.id)
-            .field("name", &self.name)
-            .field("exchange", &self.exchange)
-            .field("position_mode", &self.position_mode)
-            .field("is_testnet", &self.is_testnet)
-            .field("api_key", &mask(&self.api_key))
-            .field("api_secret", &"<redacted>")
-            .field(
-                "api_passphrase",
-                &self.api_passphrase.as_ref().map(|_| "<redacted>"),
-            )
-            .finish()
+impl ResolvedAccount {
+    /// 账户级持仓模式：REST 所取自凭证；CTP 无该概念按单向（one_way）。
+    pub fn position_mode(&self) -> trading_models::PositionMode {
+        match &self.credential {
+            ExchangeCredential::ApiSecret { position_mode, .. } => *position_mode,
+            ExchangeCredential::Ctp { .. } => trading_models::PositionMode::OneWay,
+        }
+    }
+
+    /// 账户级选网：REST 所取自凭证；CTP 无测试网概念，恒按正式网。
+    pub fn is_testnet(&self) -> bool {
+        match &self.credential {
+            ExchangeCredential::ApiSecret { is_testnet, .. } => *is_testnet,
+            ExchangeCredential::Ctp { .. } => false,
+        }
     }
 }
 
 /// 不含密钥的账户只读简报（规则引擎账户反查、交易所去重、REST 账户投影等场景）。
+///
+/// `position_mode` / `is_testnet` 是账户级属性，迁移后存于 credentials JSON，
+/// 构建简报时现取现解密提取（只读投影，失败按缺省告警，不阻断）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountBrief {
     pub name: String,
@@ -116,6 +121,8 @@ impl AccountManager {
 
     /// 解析当前活动账户并解密凭证。`exchange` 给 Some 时同时做交易所**精确名**
     /// （大小写敏感）校验：字面不一致即视为不匹配。
+    ///
+    /// credentials JSON 解密/反序列化失败返回 None 并告警——拒载不静默。
     pub fn resolve(&self, name: &str, exchange: Option<&str>) -> Option<ResolvedAccount> {
         let acc = self.table.list().into_iter().find(|a| a.name == name)?;
         if let Some(ex) = exchange {
@@ -129,16 +136,29 @@ impl AccountManager {
                 return None;
             }
         }
-        let secret = self.cipher.decrypt(&acc.api_secret).ok()?;
+        let plain = match acc.decode_credentials(&self.cipher) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(account = %name, "账户凭证解密失败：{e:#}");
+                return None;
+            }
+        };
+        let credential = match credential_from_json(&acc.exchange, &plain) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    account = %name,
+                    exchange = %acc.exchange,
+                    "credentials JSON 解析失败，拒载该账户：{e:#}"
+                );
+                return None;
+            }
+        };
         Some(ResolvedAccount {
             id: acc.id,
             name: acc.name,
             exchange: acc.exchange,
-            api_key: acc.api_key,
-            api_secret: secret,
-            api_passphrase: acc.api_passphrase,
-            position_mode: acc.position_mode,
-            is_testnet: acc.is_testnet,
+            credential,
         })
     }
 
@@ -160,26 +180,13 @@ impl AccountManager {
     /// 全部活动账户的不含密钥简报（顺序不保证，调用方按需自行排序）。
     /// 上层账户连接监督器据此 + [`Self::reload_version`] 组 (交易所,账户) 目标集。
     pub fn list_active_briefs(&self) -> Vec<AccountBrief> {
-        self.table
-            .list()
-            .into_iter()
-            .map(|a| AccountBrief {
-                name: a.name,
-                exchange: a.exchange,
-                position_mode: a.position_mode,
-                is_testnet: a.is_testnet,
-            })
-            .collect()
+        self.table.list().iter().map(|a| self.brief_of(a)).collect()
     }
 
-    /// 按账户表主键取账户简报（不解密密钥），供规则引擎账户反查等只读场景。
+    /// 按账户表主键取账户简报（不解密密钥字段本身，但需解出 credentials JSON
+    /// 提取账户级属性），供规则引擎账户反查等只读场景。
     pub fn account_by_id(&self, id: u64) -> Option<AccountBrief> {
-        self.table.get(id).ok().flatten().map(|a| AccountBrief {
-            name: a.name,
-            exchange: a.exchange,
-            position_mode: a.position_mode,
-            is_testnet: a.is_testnet,
-        })
+        self.table.get(id).ok().flatten().map(|a| self.brief_of(&a))
     }
 
     /// 按账户名取表主键（不解密、不做交易所二次过滤）。
@@ -219,6 +226,19 @@ impl AccountManager {
             desired.insert(name, row);
         }
 
+        // 新 7 列格式是唯一支持的读取口径（兼容读路径已随迁移方案 B Phase 4
+        // 删除，不留双轨）：旧宽表（含 api_key 列）或表头缺 credentials 列 →
+        // 在任何表变更（软删/写入）前整体拒载，并给出可操作的迁移提示。
+        if let Some(row) = desired.values().next() {
+            if row.contains_key("api_key") || !row.contains_key("credentials") {
+                return Err(anyhow::anyhow!(
+                    "account.csv 为旧宽表格式（含 api_key 列）或表头非法：请先运行 \
+                     `account-tool migrate --csv <account.csv> --key <account.key>` \
+                     迁移到新 7 列格式（原文件自动备份 .bak）"
+                ));
+            }
+        }
+
         // 文件中消失的活动账户 -> 软删除并停用连接。
         for acc in self.table.list_including_deleted() {
             if !desired.contains_key(&acc.name) && !acc.deleted {
@@ -230,34 +250,17 @@ impl AccountManager {
         let mut applied = 0usize;
         for (name, row) in desired {
             let exchange = row.get("exchange").cloned().unwrap_or_default();
-            let api_key = row.get("api_key").cloned().unwrap_or_default();
-            let raw_secret = row.get("api_secret").cloned().unwrap_or_default();
-            let passphrase = row
-                .get("api_passphrase")
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
+            let credentials_plain = row.get("credentials").cloned().unwrap_or_default();
+            // 明文 credentials JSON 归一化为密文形态（不回写人工文件）。
+            let (stored, _was_plain) = self.cipher.encrypt_if_plaintext(&credentials_plain)?;
+
             let deleted = matches!(
                 row.get("deleted").map(|s| s.as_str()).unwrap_or("0").trim(),
                 "1" | "true" | "TRUE"
             );
-            let is_testnet = parse_bool_column(
-                row.get("is_testnet").map(|s| s.as_str()).unwrap_or(""),
-                "is_testnet",
-                &name,
-            );
-
-            // 明文 secret 在内存中归一化为密文形态（不回写人工文件）。
-            let (stored_secret, _was_plain) = self.cipher.encrypt_if_plaintext(&raw_secret)?;
-
             let mut account = Account::new(&name, &exchange);
             account.id = stable_id(&name);
-            account.api_key = api_key.trim().to_string();
-            account.api_secret = stored_secret;
-            account.api_passphrase = passphrase;
-            account.position_mode =
-                parse_position_mode(row.get("position_mode").map(|s| s.as_str()).unwrap_or(""));
-            account.is_testnet = is_testnet;
+            account.credentials = stored;
             account.deleted = deleted;
             if let Ok(ts) = row
                 .get("updated_at")
@@ -270,16 +273,70 @@ impl AccountManager {
             }
             self.table.upsert(account)?;
             applied += 1;
-            tracing::info!(account = %name, exchange = %exchange, is_testnet, deleted, "account loaded");
+            tracing::info!(account = %name, exchange = %exchange, deleted, "account loaded");
         }
         Ok(applied)
+    }
+
+    /// 账户只读简报：账户级属性（position_mode/is_testnet）从 credentials JSON
+    /// 现取现解密提取。空串/解析失败按缺省（正式网 + 单向）并告警——简报是
+    /// 只读投影，不阻断调用方。
+    fn brief_of(&self, acc: &Account) -> AccountBrief {
+        const DEFAULT: (trading_models::PositionMode, bool) =
+            (trading_models::PositionMode::OneWay, false);
+        let attrs = self.brief_attributes(acc, DEFAULT);
+        AccountBrief {
+            name: acc.name.clone(),
+            exchange: acc.exchange.clone(),
+            position_mode: attrs.0,
+            is_testnet: attrs.1,
+        }
+    }
+
+    /// 从 credentials JSON 解出 (position_mode, is_testnet)；任一环节失败
+    /// 告警后按 default 归一（CTP 凭证天然无该属性，亦走缺省）。
+    fn brief_attributes(
+        &self,
+        acc: &Account,
+        default: (trading_models::PositionMode, bool),
+    ) -> (trading_models::PositionMode, bool) {
+        let plain = match acc.decode_credentials(&self.cipher) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    account = %acc.name,
+                    "简报解密 credentials 失败，按缺省属性处理：{e:#}"
+                );
+                return default;
+            }
+        };
+        if plain.is_empty() {
+            // 空 credentials：未配置凭证的账户行。
+            return default;
+        }
+        match credential_from_json(&acc.exchange, &plain) {
+            Ok(ExchangeCredential::ApiSecret {
+                position_mode,
+                is_testnet,
+                ..
+            }) => (position_mode, is_testnet),
+            Ok(ExchangeCredential::Ctp { .. }) => default,
+            Err(e) => {
+                tracing::warn!(
+                    account = %acc.name,
+                    exchange = %acc.exchange,
+                    "简报提取 credentials JSON 失败，按缺省属性处理：{e:#}"
+                );
+                default
+            }
+        }
     }
 }
 
 /// 加载账户主密钥；文件不存在则生成 32 字节随机密钥并以 0600 原子新建。
 ///
 /// 加解密原语在 [`SecretCipher`]；此处只负责密钥文件的读取/首启生成与
-/// 0600 落盘（与 south.key 共用 [`fsutil`]）。
+/// 0600 落盘（与 south.key 共用 fsutil）。
 fn load_or_create_cipher(key_file: &Path) -> anyhow::Result<SecretCipher> {
     if let Some(parent) = key_file.parent() {
         if !parent.as_os_str().is_empty() {
@@ -348,43 +405,12 @@ fn stable_id(name: &str) -> u64 {
     }
 }
 
-/// account.csv 的 position_mode 列解析；非法/缺省按 one_way。
-fn parse_position_mode(raw: &str) -> trading_models::PositionMode {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "hedge" | "dual" | "true" | "1" => trading_models::PositionMode::Hedge,
-        _ => trading_models::PositionMode::OneWay,
-    }
-}
-
-/// 布尔列（is_testnet 等）解析：1/true 为真，其余（含缺列/空）为假。
-fn parse_bool_column(raw: &str, column: &str, account: &str) -> bool {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "0" | "false" => false,
-        "1" | "true" => true,
-        other => {
-            tracing::warn!(
-                account,
-                column,
-                value = other,
-                "布尔列值非法，按 false 处理"
-            );
-            false
-        }
-    }
-}
-
-fn mask(s: &str) -> String {
-    if s.len() <= 4 {
-        "****".to_string()
-    } else {
-        format!("{}…***", &s[..4])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use store_core::{Store, SystemClock};
+    use trading_exchange::port::ExchangeCredential;
+    use trading_models::PositionMode;
 
     /// 测试用：建一个独立 Store 并注册账户表（生产环境由 TradingStore 统一注册）。
     fn account_table() -> Arc<Table<Account>> {
@@ -405,77 +431,250 @@ mod tests {
         p
     }
 
-    const HEADER: &str =
-        "id,name,exchange,api_key,api_secret,api_passphrase,position_mode,is_testnet,deleted,created_at,updated_at\n";
+    /// 新 7 列表头（恒定，见 trading_models::ACCOUNT_CSV_HEADER）。
+    const NEW_HEADER: &str = trading_models::ACCOUNT_CSV_HEADER;
+    /// 旧宽表表头（REST 签名所变体；仅用于钉「拒载 + 迁移提示」语义）。
+    const LEGACY_HEADER: &str = "id,name,exchange,api_key,api_secret,api_passphrase,position_mode,is_testnet,deleted,created_at,updated_at";
 
-    #[test]
-    fn position_mode_and_testnet_parse() {
-        use trading_models::PositionMode;
-        let dir = tmp_dir();
-        let csv = dir.join("account.csv");
-        let key = dir.join("account.key");
-        // hedge + 测试网账户；默认（缺列）账户走正式网/单向。
-        std::fs::write(
-            &csv,
-            format!("{HEADER}0,hedger,binance,K,s,,hedge,1,0,0,0\n0,plain,binance,K2,s2,,one_way,0,0,0,0\n"),
-        )
-        .unwrap();
-        let mgr = AccountManager::bootstrap(
+    fn bootstrap(dir: &Path) -> AccountManager {
+        AccountManager::bootstrap(
             account_table(),
             dir.to_str().unwrap(),
-            csv.clone(),
-            key.clone(),
+            dir.join("account.csv"),
+            dir.join("account.key"),
         )
-        .unwrap();
-        let hedger = mgr.resolve("hedger", Some("binance")).unwrap();
-        assert_eq!(hedger.position_mode, PositionMode::Hedge);
-        assert!(hedger.is_testnet);
-        let plain = mgr.resolve("plain", Some("binance")).unwrap();
-        assert_eq!(plain.position_mode, PositionMode::OneWay);
-        assert!(!plain.is_testnet);
+        .unwrap()
+    }
+
+    fn write_csv(dir: &Path, text: &str) {
+        std::fs::write(dir.join("account.csv"), text).unwrap();
+    }
+
+    /// JSON 单元格的 CSV 转义：引号包裹且内嵌双引号双写。
+    fn csv_cell(json: &str) -> String {
+        format!("\"{}\"", json.replace('"', "\"\""))
+    }
+
+    // ---- 新 7 列格式读取 ----
+
+    #[test]
+    fn new_format_row_resolves_typed_credential() {
+        // Arrange：新 7 列行，credentials 为整串密文 JSON。
+        // 先 bootstrap 生成主密钥，再用管理器 cipher 加密（保证密钥一致）。
+        let dir = tmp_dir();
+        let mgr = bootstrap(&dir);
+        let json = r#"{"api_key":"KEY-A","api_secret":"secret-a","position_mode":"hedge","is_testnet":true}"#;
+        write_csv(
+            &dir,
+            &format!(
+                "{NEW_HEADER}\n0,alice,binance,{},0,0,0\n",
+                mgr.cipher.encrypt(json).unwrap()
+            ),
+        );
+        mgr.load_from_csv(false).unwrap();
+
+        // Act
+        let acc = mgr.resolve("alice", Some("binance")).expect("alice active");
+
+        // Assert：强类型枚举字段逐一就位（ResolvedAccount 直接携带枚举）。
+        assert_eq!(acc.name, "alice");
+        assert_eq!(acc.exchange, "binance");
+        match acc.credential {
+            ExchangeCredential::ApiSecret {
+                api_key,
+                api_secret,
+                api_passphrase,
+                position_mode,
+                is_testnet,
+            } => {
+                assert_eq!(api_key, "KEY-A");
+                assert_eq!(api_secret, "secret-a");
+                assert_eq!(api_passphrase, None);
+                assert_eq!(position_mode, PositionMode::Hedge);
+                assert!(is_testnet);
+            }
+            other => panic!("应为 ApiSecret 凭证，实际 {other:?}"),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn loads_resolves_and_reloads() {
+    fn plaintext_credentials_json_is_normalized_and_resolves() {
+        // Arrange：credentials 列为无前缀明文 JSON（联调口径），导入侧归一化加密。
         let dir = tmp_dir();
-        let csv = dir.join("account.csv");
-        let key = dir.join("account.key");
-        std::fs::write(
-            &csv,
-            format!("{HEADER}0,alice,binance,KEY-A,secret-a,,,0,0,0,0\n"),
-        )
-        .unwrap();
+        let json = r#"{"api_key":"k","api_secret":"s"}"#;
+        write_csv(
+            &dir,
+            &format!("{NEW_HEADER}\n0,alice,binance,{},0,0,0\n", csv_cell(json)),
+        );
+        let mgr = bootstrap(&dir);
 
-        let mgr = AccountManager::bootstrap(
+        // Act / Assert：明文 JSON 可解析（解密路径对无前缀输入透传兼容）。
+        let acc = mgr.resolve("alice", None).expect("plaintext compatible");
+        match acc.credential {
+            ExchangeCredential::ApiSecret { api_key, .. } => assert_eq!(api_key, "k"),
+            other => panic!("应为 ApiSecret 凭证，实际 {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- 旧宽表兼容已删除（Phase 4 收尾，不留双轨）：拒载语义见
+    // legacy_wide_csv_is_rejected_with_migrate_hint；旧→新映射逻辑归
+    // account-tool migrate 所有。----
+
+    // ---- 解析失败拒载不静默 ----
+
+    #[test]
+    fn resolved_account_accessors_expose_account_attributes() {
+        // Arrange：hedge+测试网 binance 行（新格式）与 CTP 行并存。
+        let dir = tmp_dir();
+        let mgr = bootstrap(&dir);
+        let binance_json =
+            r#"{"api_key":"k","api_secret":"s","position_mode":"hedge","is_testnet":true}"#;
+        let ctp_json = r#"{"broker_id":"9999","user_id":"u","password":"p","app_id":"a","auth_code":"c","front_address":"tcp://f:1"}"#;
+        write_csv(
+            &dir,
+            &format!(
+                "{NEW_HEADER}\n\
+                 0,alice,binance,{},0,0,0\n\
+                 0,ctp-acct,ctp,{},0,0,0\n",
+                mgr.cipher.encrypt(binance_json).unwrap(),
+                mgr.cipher.encrypt(ctp_json).unwrap(),
+            ),
+        );
+        mgr.load_from_csv(false).unwrap();
+
+        // Act / Assert：REST 所属性取自凭证；CTP 无该概念按缺省（正式网 + 单向）。
+        let alice = mgr.resolve("alice", None).unwrap();
+        assert_eq!(alice.position_mode(), PositionMode::Hedge);
+        assert!(alice.is_testnet());
+        let ctp = mgr.resolve("ctp-acct", None).unwrap();
+        assert_eq!(ctp.position_mode(), PositionMode::OneWay);
+        assert!(!ctp.is_testnet());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_wide_csv_is_rejected_with_migrate_hint() {
+        // Arrange：旧宽表 binance 行（迁移期已过，兼容读路径已删，不留双轨）。
+        let dir = tmp_dir();
+        write_csv(
+            &dir,
+            &format!("{LEGACY_HEADER}\n0,alice,binance,KEY-A,secret-a,,hedge,1,0,0,0\n"),
+        );
+
+        // Act / Assert：拒载并给出可操作的迁移提示。
+        let err = AccountManager::bootstrap(
             account_table(),
             dir.to_str().unwrap(),
-            csv.clone(),
-            key.clone(),
+            dir.join("account.csv"),
+            dir.join("account.key"),
         )
-        .unwrap();
+        .err()
+        .expect("旧宽表文件必须拒载");
+        assert!(format!("{err:#}").contains("account-tool migrate"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
-        let acc = mgr.resolve("alice", Some("binance")).expect("alice active");
-        assert_eq!(acc.api_secret, "secret-a");
+    #[test]
+    fn malformed_credentials_json_rejects_resolve() {
+        // Arrange：credentials 列非法（非 JSON）。
+        let dir = tmp_dir();
+        write_csv(
+            &dir,
+            &format!("{NEW_HEADER}\n0,bad,binance,not-json,0,0,0\n"),
+        );
+        let mgr = bootstrap(&dir);
+
+        // Act / Assert：resolve 返回 None（告警拒载），而非带空凭证的账户。
+        assert!(mgr.resolve("bad", None).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- 简报属性从 credentials JSON 提取 ----
+
+    #[test]
+    fn briefs_carry_attributes_from_credentials() {
+        // Arrange：hedge+测试网的 binance 行（新格式）与 CTP 行并存。
+        // 先 bootstrap 生成主密钥，再用管理器 cipher 加密（保证密钥一致）。
+        let dir = tmp_dir();
+        let mgr = bootstrap(&dir);
+        let binance_json =
+            r#"{"api_key":"k","api_secret":"s","position_mode":"hedge","is_testnet":true}"#;
+        let ctp_json = r#"{"broker_id":"9999","user_id":"u","password":"p","app_id":"a","auth_code":"c","front_address":"tcp://f:1"}"#;
+        write_csv(
+            &dir,
+            &format!(
+                "{NEW_HEADER}\n\
+                 0,hedger,binance,{},0,0,0\n\
+                 0,ctp-acct,ctp,{},0,0,0\n",
+                mgr.cipher.encrypt(binance_json).unwrap(),
+                mgr.cipher.encrypt(ctp_json).unwrap(),
+            ),
+        );
+        mgr.load_from_csv(false).unwrap();
+
+        // Act
+        let mut briefs = mgr.list_active_briefs();
+        briefs.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Assert：REST 所属性取自 JSON；CTP 无该属性按缺省（正式网 + 单向）。
+        assert_eq!(briefs.len(), 2);
+        assert_eq!(briefs[0].name, "ctp-acct");
+        assert!(!briefs[0].is_testnet);
+        assert_eq!(briefs[0].position_mode, PositionMode::OneWay);
+        assert_eq!(briefs[1].name, "hedger");
+        assert!(briefs[1].is_testnet);
+        assert_eq!(briefs[1].position_mode, PositionMode::Hedge);
+        // account_by_id 口径一致。
+        let by_id = mgr
+            .account_by_id(mgr.account_id_by_name("hedger").unwrap())
+            .unwrap();
+        assert_eq!(by_id.position_mode, PositionMode::Hedge);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- 既有行为保留（重载 / 软删 / 去重 / 加密往返）----
+
+    #[test]
+    fn loads_resolves_and_reloads() {
+        let dir = tmp_dir();
+        let json_a = r#"{"api_key":"KEY-A","api_secret":"secret-a"}"#;
+        write_csv(
+            &dir,
+            &format!("{NEW_HEADER}\n0,alice,binance,{},0,0,0\n", csv_cell(json_a)),
+        );
+        let mgr = bootstrap(&dir);
+
+        assert!(mgr.resolve("alice", Some("binance")).is_some());
         assert!(mgr.resolve("alice", Some("deribit")).is_none());
         assert!(mgr.resolve("bob", None).is_none());
 
         // 重载：改密 + 新增 bob。
-        std::fs::write(
-            &csv,
-            format!("{HEADER}0,alice,binance,KEY-A,secret-a2,,,0,0,0,0\n0,bob,binance,KEY-B,secret-b,,,0,0,0,0\n"),
-        )
-        .unwrap();
+        let json_a2 = r#"{"api_key":"KEY-A","api_secret":"secret-a2"}"#;
+        let json_b = r#"{"api_key":"KEY-B","api_secret":"secret-b"}"#;
+        write_csv(
+            &dir,
+            &format!(
+                "{NEW_HEADER}\n0,alice,binance,{},0,0,0\n0,bob,binance,{},0,0,0\n",
+                csv_cell(json_a2),
+                csv_cell(json_b),
+            ),
+        );
         mgr.reload().unwrap();
-        assert_eq!(mgr.resolve("alice", None).unwrap().api_secret, "secret-a2");
+        match mgr.resolve("alice", None).unwrap().credential {
+            ExchangeCredential::ApiSecret { api_secret, .. } => {
+                assert_eq!(api_secret, "secret-a2")
+            }
+            other => panic!("应为 ApiSecret 凭证，实际 {other:?}"),
+        }
         assert!(mgr.resolve("bob", None).is_some());
 
         // 文件中移除 alice -> 软删除。
-        std::fs::write(
-            &csv,
-            format!("{HEADER}0,bob,binance,KEY-B,secret-b,,,0,0,0,0\n"),
-        )
-        .unwrap();
+        write_csv(
+            &dir,
+            &format!("{NEW_HEADER}\n0,bob,binance,{},0,0,0\n", csv_cell(json_b)),
+        );
         mgr.reload().unwrap();
         assert!(mgr.resolve("alice", None).is_none());
         assert!(mgr.resolve("bob", None).is_some());
@@ -487,57 +686,51 @@ mod tests {
     fn reload_bumps_target_version() {
         // Arrange：首载一个账户，记录其目标 version。
         let dir = tmp_dir();
-        let csv = dir.join("account.csv");
-        let key = dir.join("account.key");
-        std::fs::write(
-            &csv,
-            format!("{HEADER}0,alice,binance,KEY-A,secret-a,,,0,0,0,0\n"),
-        )
-        .unwrap();
-        let mgr = AccountManager::bootstrap(
-            account_table(),
-            dir.to_str().unwrap(),
-            csv.clone(),
-            key.clone(),
-        )
-        .unwrap();
+        let json = r#"{"api_key":"KEY-A","api_secret":"secret-a"}"#;
+        write_csv(
+            &dir,
+            &format!("{NEW_HEADER}\n0,alice,binance,{},0,0,0\n", csv_cell(json)),
+        );
+        let mgr = bootstrap(&dir);
         let v0 = mgr.reload_version();
         assert_eq!(mgr.distinct_exchanges(), vec!["binance".to_string()]);
 
         // Act：文件变化后经 API 口径重载。
-        std::fs::write(
-            &csv,
-            format!("{HEADER}0,alice,binance,KEY-A,secret-a2,,,1,0,0,0\n"),
-        )
-        .unwrap();
+        let json2 = r#"{"api_key":"KEY-A","api_secret":"secret-a2","is_testnet":true}"#;
+        write_csv(
+            &dir,
+            &format!("{NEW_HEADER}\n0,alice,binance,{},0,0,0\n", csv_cell(json2)),
+        );
         mgr.reload().unwrap();
 
         // Assert：version 单调递增，且 is_testnet 已切换。
         let v1 = mgr.reload_version();
         assert!(v1 > v0);
-        assert!(mgr.resolve("alice", None).unwrap().is_testnet);
+        match mgr.resolve("alice", None).unwrap().credential {
+            ExchangeCredential::ApiSecret { is_testnet, .. } => assert!(is_testnet),
+            other => panic!("应为 ApiSecret 凭证，实际 {other:?}"),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn distinct_exchanges_dedups_and_sorts_by_name() {
-        // 3 个账户：2 binance、1 okx；HashMap 迭代序不定，结果必须按名稳定排序。
+        // 3 个账户：2 binance、1 okx；迭代序不定，结果必须稳定。
         let dir = tmp_dir();
-        let csv = dir.join("account.csv");
-        let key = dir.join("account.key");
-        std::fs::write(
-            &csv,
-            format!(
-                "{HEADER}\
-                 0,a1,binance,K,s,,,0,0,0,0,0\n\
-                 0,a2,okx,K,s,,,0,0,0,0,0\n\
-                 0,a3,binance,K,s,,,0,0,0,0,0\n"
+        let json = r#"{"api_key":"k","api_secret":"s"}"#;
+        write_csv(
+            &dir,
+            &format!(
+                "{NEW_HEADER}\n\
+                 0,a1,binance,{},0,0,0\n\
+                 0,a2,okx,{},0,0,0\n\
+                 0,a3,binance,{},0,0,0\n",
+                csv_cell(json),
+                csv_cell(json),
+                csv_cell(json),
             ),
-        )
-        .unwrap();
-        let mgr =
-            AccountManager::bootstrap(account_table(), dir.to_str().unwrap(), csv, key).unwrap();
-        // 去重且按账户表首次出现顺序保序：binance 先于 okx。
+        );
+        let mgr = bootstrap(&dir);
         assert_eq!(
             mgr.distinct_exchanges(),
             vec!["binance".to_string(), "okx".to_string()]
@@ -551,74 +744,34 @@ mod tests {
     }
 
     #[test]
-    fn active_briefs_carry_position_mode() {
-        // Arrange：一个 hedge 测试网账户、一个 one_way 正式网账户。
+    fn encrypted_json_roundtrips_through_file() {
+        // Arrange：文件里预置整串加密 credentials。
         let dir = tmp_dir();
-        let csv = dir.join("account.csv");
-        let key = dir.join("account.key");
-        std::fs::write(
-            &csv,
-            format!(
-                "{HEADER}\
-                 0,hedger,binance,K,s,,hedge,1,0,0,0\n\
-                 0,plain,binance,K2,s2,,one_way,0,0,0,0\n"
-            ),
-        )
-        .unwrap();
-        let mgr =
-            AccountManager::bootstrap(account_table(), dir.to_str().unwrap(), csv, key).unwrap();
-
-        // Act
-        let mut briefs = mgr.list_active_briefs();
-        briefs.sort_by(|a, b| a.name.cmp(&b.name));
-
-        // Assert：简报携带持仓模式（REST 账户安全投影消费）。
-        assert_eq!(briefs.len(), 2);
-        assert_eq!(briefs[0].name, "hedger");
-        assert_eq!(briefs[0].position_mode, trading_models::PositionMode::Hedge);
-        assert!(briefs[0].is_testnet);
-        assert_eq!(
-            briefs[1].position_mode,
-            trading_models::PositionMode::OneWay
-        );
-        assert!(!briefs[1].is_testnet);
-        // account_by_id 口径一致。
-        let by_id = mgr
-            .account_by_id(mgr.account_id_by_name("hedger").unwrap())
+        let mgr = bootstrap(&dir);
+        let enc = mgr
+            .cipher
+            .encrypt(r#"{"api_key":"k","api_secret":"topsecret"}"#)
             .unwrap();
-        assert_eq!(by_id.position_mode, trading_models::PositionMode::Hedge);
-        std::fs::remove_dir_all(&dir).ok();
-    }
+        write_csv(
+            &dir,
+            &format!("{NEW_HEADER}\n0,carol,binance,{enc},0,0,0\n"),
+        );
 
-    #[test]
-    fn encrypted_secret_roundtrips_through_file() {
-        let dir = tmp_dir();
-        let csv = dir.join("account.csv");
-        let key = dir.join("account.key");
-        let mgr = AccountManager::bootstrap(
-            account_table(),
-            dir.to_str().unwrap(),
-            csv.clone(),
-            key.clone(),
-        )
-        .unwrap();
-        let enc = mgr.cipher.encrypt("topsecret").unwrap();
-        std::fs::write(&csv, format!("{HEADER}0,carol,binance,K,{enc},,,0,0,0,0\n")).unwrap();
+        // Act / Assert：加载后解密还原 secret。
         mgr.load_from_csv(false).unwrap();
-        assert_eq!(mgr.resolve("carol", None).unwrap().api_secret, "topsecret");
+        match mgr.resolve("carol", None).unwrap().credential {
+            ExchangeCredential::ApiSecret { api_secret, .. } => {
+                assert_eq!(api_secret, "topsecret")
+            }
+            other => panic!("应为 ApiSecret 凭证，实际 {other:?}"),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn missing_file_is_empty_not_fatal() {
         let dir = tmp_dir();
-        let mgr = AccountManager::bootstrap(
-            account_table(),
-            dir.to_str().unwrap(),
-            dir.join("account.csv"),
-            dir.join("account.key"),
-        )
-        .unwrap();
+        let mgr = bootstrap(&dir);
         assert_eq!(mgr.distinct_exchanges().len(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }

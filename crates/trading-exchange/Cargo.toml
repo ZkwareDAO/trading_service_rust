@@ -32,3 +32,13 @@ rmp-serde.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 webpki-roots = "0.26"
+
+# CTP 期货适配：仅在 feature="ctp" 下编译（bindgen 构建期需 libclang；
+# 运行期经 libloading dlopen .so，路径走 config/venue.toml 的 [ctp] 段）。
+ctp2rs = { workspace = true, optional = true }
+encoding_rs = { version = "0.8", optional = true }
+thiserror = { workspace = true, optional = true }
+
+[features]
+default = []
+ctp = ["dep:ctp2rs", "dep:encoding_rs", "dep:thiserror"]

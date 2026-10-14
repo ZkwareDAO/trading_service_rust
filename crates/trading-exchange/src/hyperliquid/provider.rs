@@ -56,13 +56,22 @@ impl HyperliquidProvider {
             })?;
         // Hyperliquid 凭证口径：api_secret=EVM 私钥（仅用于签名）；
         // api_key=钱包地址，作为下单/查单的 user（保持原始大小写）。
+        let crate::port::ExchangeCredential::ApiSecret {
+            api_key,
+            api_secret,
+            is_testnet,
+            ..
+        } = cred
+        else {
+            anyhow::bail!("hyperliquid 凭证形态错误：应为 ApiSecret");
+        };
         HyperliquidUser::new(
             self.deps.http.clone(),
             Arc::clone(&self.deps.rules),
             Arc::clone(&self.deps.quotes),
-            &cred.api_key,
-            &cred.api_secret,
-            cred.is_testnet,
+            &api_key,
+            &api_secret,
+            is_testnet,
             self.deps.hyperliquid.slippage,
         )
         .map(Arc::new)

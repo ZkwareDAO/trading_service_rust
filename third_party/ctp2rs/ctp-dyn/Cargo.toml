@@ -1,0 +1,58 @@
+[package]
+name = "ctp2rs"
+version = "0.1.11-alpha1"
+edition = "2021"
+authors = ["Pseudo <pseudocodes@gmail.com>"]
+description = "Shanghai Futures CTP/CTP-Mini/CTP-Sopt Rust native binding, supporting production, evaluation, stock-option, OpenCTP, and LocalCTP versions, compatible with Linux and macOS"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/pseudocodes/ctp2rs/tree/master/ctp-dyn"
+keywords = ["ctp", "ctp-rs", "ctp-binding", "quant", "trader"]
+categories = ["api-bindings", "finance"]
+
+exclude = [
+    "*.log",
+    "*.tmp",
+    "scripts/*",
+    "*.con",
+    "*.framework",
+    "*.so",
+    "*.dll",
+    "*.lib",
+    "codegen/*.md",
+    "src/v1alpha1/generated/README.md",
+]
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[build-dependencies]
+clang-sys = { version = "1.9.1", features = ["clang_16_0", "runtime"] }
+clang = { version = "2.1.0", features = ["clang_10_0"] }
+bindgen = "0.72.0"
+regex = "1.13.1"
+Inflector = "0.11.4"
+roxmltree = "0.21.0"
+
+[dependencies]
+libloading = "0.9.0"
+memchr = "2.8.3"
+encoding_rs = "0.8.35"
+
+[features]
+default = ["v1alpha1", "ctp_v6_7_13"]
+v1alpha1 = []
+v1alpha2 = []
+
+dynlib = []
+sopt = []
+mini = []
+union = []
+openctp = []
+
+ctp_v6_7_2 = ["dynlib"]
+ctp_v6_7_7 = ["dynlib"]
+ctp_v6_7_11 = ["dynlib", "union"]
+ctp_v6_7_13 = ["dynlib", "union"]
+mini_v1_7_0 = ["dynlib", "mini"]
+mini_v1_7_5 = ["dynlib", "mini"]
+sopt_v3_7_3 = ["dynlib", "sopt"]
+sopt_v3_7_5 = ["dynlib", "sopt"]

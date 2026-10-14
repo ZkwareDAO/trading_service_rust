@@ -80,11 +80,11 @@ fn upsert_replaces_and_preserves_created_at() {
 
     h.clock.advance(1_000);
     let mut changed = acc.get(1).unwrap().unwrap();
-    changed.api_key = "k2".into();
+    changed.credentials = "k2".into();
     acc.upsert(changed).unwrap();
 
     let got = acc.get(1).unwrap().unwrap();
-    assert_eq!(got.api_key, "k2");
+    assert_eq!(got.credentials, "k2");
     assert_eq!(got.created_at, T0);
     assert_eq!(got.updated_at, T0 + 1_000);
 

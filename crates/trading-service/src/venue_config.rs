@@ -23,13 +23,17 @@ pub const DEFAULT_OPEN_DRIFT_TICKS: i64 = 5;
 /// 默认 hyperliquid 市价滑点（5%）。
 pub const DEFAULT_HYPERLIQUID_SLIPPAGE: &str = "0.05";
 
-/// 加载后的全部 venue 配置。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 加载后的全部 venue 配置（CtpConfig 含 String 非 Copy，整体退化为 Clone）。
+#[derive(Debug, Clone)]
 pub struct LoadedVenueConfigs {
     /// Deribit：漂移档数 + 平仓价差。
     pub deribit: PrepConfig,
     /// Hyperliquid：市价滑点。
     pub hyperliquid: HyperliquidConfig,
+    /// CTP：.so 路径/流目录基准（feature="ctp" 时由 registry 消费；生产模式
+    /// 开关已下沉账户级 credentials）。
+    #[cfg(feature = "ctp")]
+    pub ctp: trading_exchange::ctp::CtpConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -80,6 +84,23 @@ struct VenueFile {
     deribit: DeribitSection,
     #[serde(default)]
     hyperliquid: HyperliquidSection,
+    /// CTP 段（feature="ctp" 时由 registry 消费；缺失回退 vendored 缺省）。
+    #[serde(default)]
+    #[cfg(feature = "ctp")]
+    ctp: CtpSection,
+}
+
+/// CTP 配置段：.so 路径/流目录/生产模式；全部可选。
+#[cfg(feature = "ctp")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+struct CtpSection {
+    trader_so: Option<String>,
+    md_so: Option<String>,
+    flow_path: Option<String>,
+    md_front: Option<String>,
+    md_account: Option<String>,
+    md_anon: Option<bool>,
+    md_pass_is_authcode: Option<bool>,
 }
 
 /// 加载 venue 配置：文件不存在 → 全默认；存在则按字段补默认。
@@ -99,6 +120,16 @@ pub fn load(path: &Path) -> anyhow::Result<LoadedVenueConfigs> {
         hyperliquid: HyperliquidConfig {
             slippage: parsed.hyperliquid.slippage,
         },
+        #[cfg(feature = "ctp")]
+        ctp: trading_exchange::ctp::from_values(
+            parsed.ctp.trader_so,
+            parsed.ctp.md_so,
+            parsed.ctp.flow_path,
+            parsed.ctp.md_front,
+            parsed.ctp.md_account,
+            parsed.ctp.md_anon,
+            parsed.ctp.md_pass_is_authcode,
+        ),
     })
 }
 
@@ -112,6 +143,8 @@ pub fn default_configs() -> LoadedVenueConfigs {
         hyperliquid: HyperliquidConfig {
             slippage: default_slippage(),
         },
+        #[cfg(feature = "ctp")]
+        ctp: trading_exchange::ctp::from_values(None, None, None, None, None, None, None),
     }
 }
 
@@ -122,7 +155,7 @@ mod tests {
     #[test]
     fn missing_file_yields_defaults() {
         let cfg = load(Path::new("/nonexistent/venue.toml")).expect("ok");
-        assert_eq!(cfg, default_configs());
+        assert_eq!(cfg.deribit, default_configs().deribit);
         assert_eq!(cfg.deribit.drift_ticks, 5);
         assert_eq!(cfg.deribit.spread_threshold, "0.005".parse().unwrap());
         // hyperliquid 缺省 0.05。
@@ -160,7 +193,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("venue.toml");
         std::fs::write(&path, "").unwrap();
-        assert_eq!(load(&path).expect("ok"), default_configs());
+        let cfg = load(&path).expect("ok");
+        assert_eq!(cfg.deribit, default_configs().deribit);
+        assert_eq!(cfg.hyperliquid, default_configs().hyperliquid);
     }
 
     #[test]

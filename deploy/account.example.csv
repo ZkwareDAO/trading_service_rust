@@ -1,3 +1,3 @@
-id,name,exchange,api_key,api_secret,api_passphrase,position_mode,is_testnet,deleted,created_at,updated_at
-0,test_binance,binance,YOUR_API_KEY,your-plaintext-or-enc.v1-secret,,one_way,0,0,0,0
-1,test_hyperliquid,hyperliquid,0xYOUR_EVM_ADDRESS,your-enc.v1-evm-private-key-hex,,,,0,0,0
+id,name,exchange,credentials,deleted,created_at,updated_at
+0,test_binance,binance,"{""api_key"":""YOUR_API_KEY"",""api_secret"":""your-secret"",""api_passphrase"":null,""position_mode"":""one_way"",""is_testnet"":false}",0,0,0
+1,test_hyperliquid,hyperliquid,"{""api_key"":""0xYOUR_EVM_ADDRESS"",""api_secret"":""your-evm-private-key-hex""}",0,0,0

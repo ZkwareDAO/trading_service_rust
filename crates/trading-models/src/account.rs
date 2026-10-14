@@ -2,34 +2,29 @@ use serde::{Deserialize, Serialize};
 use store_core::model::bool_u8;
 use store_core::{AccountModel, Model, StorageScope};
 
-use crate::types::PositionMode;
+/// account.csv 表头（恒 7 列：6 公共列 + credentials 私有列），列序固定不再变化。
+///
+/// 各所凭证 schema 归属各自 venue 模块（见 trading-exchange 的
+/// `ApiSecretCreds` / `CtpCreds`），本结构不含任何 venue 专属字段。
+pub const ACCOUNT_CSV_HEADER: &str = "id,name,exchange,credentials,deleted,created_at,updated_at";
 
 /// 交易账户。全局表，持久化于 `{day}/_system/account.csv`。
+///
+/// 自迁移方案 B 起收敛为「公共列 + credentials 密文 JSON」：`credentials`
+/// 存整串密文 `enc.v1.<b64>`，解密后为各所 credentials JSON，编解码见
+/// [`Account::encode_credentials`] / [`Account::decode_credentials`]。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     /// 本地主键。
     pub id: u64,
     /// 账号名称（同一 exchange 内唯一，同时作为持久化目录名）。
     pub name: String,
-    /// 交易所：binance / hyperliquid / deribit / …
+    /// 交易所：binance / hyperliquid / deribit / ctp / …
     pub exchange: String,
-    /// API key / 公钥。
-    pub api_key: String,
-    /// API secret / 私钥。调用方负责加解密，本模块只按字符串存储。
-    pub api_secret: String,
-    /// 第三凭证/口令：OKX/KuCoin passphrase，CTP/FIX/IBKR 登录密码；
-    /// binance/deribit/hyperliquid 为空。
-    pub api_passphrase: Option<String>,
-    /// 持仓模式：one_way（默认，positionSide=BOTH）/ hedge（LONG/SHORT）。
-    /// 旧文件缺列时按 one_way 处理。
+    /// 凭证密文（`enc.v1.<b64>`，明文为各所 credentials JSON）。
+    /// 旧宽表文件缺列时按空串处理（旧格式兼容层在 trading-store）。
     #[serde(default)]
-    pub position_mode: PositionMode,
-    /// 是否连接交易所测试网。环境是**账户属性**：下单 REST 与账户事件流
-    /// （ORDER_TRADE_UPDATE / ACCOUNT_UPDATE）按此逐账户选网；交易所级公共
-    /// 行情/规则不随账户区分、恒定正式网。旧文件缺列时按正式网处理。
-    #[serde(default)]
-    #[serde(with = "bool_u8")]
-    pub is_testnet: bool,
+    pub credentials: String,
     /// 软删除标记：0=正常，1=已删除。
     #[serde(with = "bool_u8")]
     pub deleted: bool,
@@ -43,15 +38,23 @@ impl Account {
             id: 0,
             name: name.into(),
             exchange: exchange.into(),
-            api_key: String::new(),
-            api_secret: String::new(),
-            api_passphrase: None,
-            position_mode: PositionMode::OneWay,
-            is_testnet: false,
+            credentials: String::new(),
             deleted: false,
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    /// 将 `credentials` 归一化为密文存储形态（返回值由调用方回写，不修改自身）：
+    /// 明文告警并加密为 `enc.v1.<b64>`；已是密文或空串原样返回。
+    pub fn encode_credentials(&self, cipher: &SecretCipher) -> Result<String> {
+        Ok(cipher.encrypt_if_plaintext(&self.credentials)?.0)
+    }
+
+    /// 将 `credentials` 解密为 JSON 明文：空串透传；无 `enc.v1.` 前缀的
+    /// 历史明文按兼容口径原样返回（导入侧告警见 [`SecretCipher::encrypt_if_plaintext`]）。
+    pub fn decode_credentials(&self, cipher: &SecretCipher) -> Result<String> {
+        cipher.decrypt(&self.credentials)
     }
 }
 
@@ -252,38 +255,126 @@ mod base64_lite {
 mod tests {
     use super::*;
 
+    // ---- 新结构：公共列 + credentials JSON（迁移方案 B Phase 1）----
+
     #[test]
-    fn new_account_defaults_to_production() {
-        // 缺省账户一律走正式网；测试网必须逐账户显式声明。
+    fn new_account_credentials_defaults_empty() {
+        // Arrange / Act：新建账户。
         let a = Account::new("alice", "binance");
-        assert!(!a.is_testnet);
+        // Assert：credentials 缺省空串（凭证 JSON 由上层导入时填充）。
+        assert!(a.credentials.is_empty());
     }
 
     #[test]
-    fn csv_roundtrip_preserves_is_testnet() {
-        // Arrange：一个声明走测试网的账户。
-        let mut a = Account::new("alice", "binance");
-        a.is_testnet = true;
-        a.position_mode = PositionMode::Hedge;
+    fn csv_header_is_fixed_public_plus_credentials() {
+        // Arrange / Act / Assert：表头恒为「6 公共列 + credentials」，列序固定。
+        const EXPECTED: [&str; 7] = [
+            "id",
+            "name",
+            "exchange",
+            "credentials",
+            "deleted",
+            "created_at",
+            "updated_at",
+        ];
+        assert_eq!(ACCOUNT_CSV_HEADER.split(',').collect::<Vec<_>>(), EXPECTED);
+    }
 
-        // Act：按框架实际落盘格式序列化（无表头单行）。
+    #[test]
+    fn new_format_csv_row_parses_credentials_json() {
+        // Arrange：新格式行；credentials 为含逗号/引号的 JSON，按 CSV 规范
+        // 引号包裹且内嵌双引号双写转义。
+        let json = r#"{"api_key":"abc123","api_secret":"s3cret","api_passphrase":null,"position_mode":"one_way","is_testnet":false}"#;
+        let csv_text = format!(
+            "{ACCOUNT_CSV_HEADER}\n1,main,binance,\"{}\",0,1728600000,1728600000\n",
+            json.replace('"', "\"\"")
+        );
+
+        // Act：flexible 读取，按表头名匹配字段。
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .from_reader(csv_text.as_bytes());
+        let back: Account = rdr.deserialize().next().unwrap().unwrap();
+
+        // Assert：公共列就位，credentials 保留 JSON 原文。
+        assert_eq!(back.id, 1);
+        assert_eq!(back.name, "main");
+        assert_eq!(back.exchange, "binance");
+        assert_eq!(back.credentials, json);
+        assert!(!back.deleted);
+        assert_eq!(back.created_at, 1728600000);
+    }
+
+    #[test]
+    fn new_format_csv_roundtrip_preserves_credentials() {
+        // Arrange：带完整 JSON 凭证的账户。
+        let mut a = Account::new("main", "binance");
+        a.credentials = r#"{"api_key":"abc123","api_secret":"s3cret"}"#.into();
+
+        // Act：按框架实际落盘格式（无表头单行）序列化再读回。
         let mut wtr = csv::WriterBuilder::new()
             .has_headers(false)
             .from_writer(Vec::new());
         wtr.serialize(&a).unwrap();
         let line = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
-        // 字段顺序（下标从 0 起）：…,api_passphrase(5),
-        //          position_mode(6),is_testnet(7),deleted(8)；bool_u8 存 1。
-        let cols: Vec<&str> = line.split(',').collect();
-        assert_eq!(cols[6], "hedge");
-        assert_eq!(cols[7], "1");
-
-        // Assert：反序列化后测试网标记保留。
-        let mut rdr = csv::ReaderBuilder::new()
+        // 新结构序列化恒 7 列（JSON 内逗号由 CSV 引号包裹，不可按逗号裸切）。
+        let record = csv::ReaderBuilder::new()
             .has_headers(false)
-            .from_reader(line.as_bytes());
-        let back: Account = rdr.deserialize().next().unwrap().unwrap();
-        assert!(back.is_testnet);
+            .flexible(true)
+            .from_reader(line.as_bytes())
+            .records()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.len(), 7);
+        let back: Account = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(line.as_bytes())
+            .deserialize()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        // Assert：credentials 原文往返保留。
+        assert_eq!(back.credentials, a.credentials);
+        assert_eq!(back.name, "main");
+        assert_eq!(back.exchange, "binance");
+    }
+
+    #[test]
+    fn credentials_codec_roundtrips_through_cipher() {
+        // Arrange：JSON 明文凭证 + 随机主密钥。
+        let cipher = SecretCipher::from_key_bytes(&SecretCipher::random_key()).unwrap();
+        let mut a = Account::new("main", "binance");
+        a.credentials = r#"{"api_key":"k","api_secret":"s"}"#.into();
+
+        // Act：明文归一化为密文存储形态，回写后解密。
+        let stored = a.encode_credentials(&cipher).unwrap();
+        a.credentials = stored;
+        assert!(a.credentials.starts_with(SECRET_PREFIX));
+        let plain = a.decode_credentials(&cipher).unwrap();
+
+        // Assert：解密还原 JSON 原文。
+        assert_eq!(plain, r#"{"api_key":"k","api_secret":"s"}"#);
+    }
+
+    #[test]
+    fn credentials_codec_empty_and_plaintext_passthrough() {
+        // Arrange：空串与无前缀历史明文的兼容口径。
+        let cipher = SecretCipher::from_key_bytes(&SecretCipher::random_key()).unwrap();
+        let mut a = Account::new("main", "binance");
+
+        // Act / Assert：空串双向透传（不产生密文）。
+        assert_eq!(a.encode_credentials(&cipher).unwrap(), "");
+        assert_eq!(a.decode_credentials(&cipher).unwrap(), "");
+
+        // 无 enc.v1. 前缀的历史明文：encode 告警并归一为密文；decode 原样透传。
+        a.credentials = "plain-json".into();
+        let stored = a.encode_credentials(&cipher).unwrap();
+        assert!(stored.starts_with(SECRET_PREFIX));
+        assert_eq!(a.decode_credentials(&cipher).unwrap(), "plain-json");
     }
 
     // ---- SecretCipher（账户凭证本地加解密原语）----
@@ -334,22 +425,6 @@ mod tests {
         assert_eq!(cipher.decrypt(&twice).unwrap(), "abc");
     }
 
-    #[test]
-    fn legacy_csv_without_is_testnet_column_defaults_false() {
-        // Arrange：旧 account.csv 表头没有 is_testnet 列（serde(default) 兼容）。
-        let csv_text = "id,name,exchange,api_key,api_secret,api_passphrase,position_mode,deleted,created_at,updated_at\n\
-                        1,alice,binance,k,s,,one_way,0,0,0\n";
-
-        // Act：flexible 读取，按表头名匹配字段。
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .flexible(true)
-            .from_reader(csv_text.as_bytes());
-        let back: Account = rdr.deserialize().next().unwrap().unwrap();
-
-        // Assert：缺列归一为正式网，其余字段不受影响。
-        assert!(!back.is_testnet);
-        assert_eq!(back.name, "alice");
-        assert_eq!(back.exchange, "binance");
-    }
+    // 旧宽表格式（api_key/CTP 逐列）的解析与兼容读取测试随迁移方案 B
+    // 移至 trading-store 兼容层（Phase 2），本模块只钉新 7 列结构。
 }

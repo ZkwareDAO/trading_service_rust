@@ -30,6 +30,7 @@ pub(crate) fn market_key(exchange: &str, itype: InstrumentType) -> Option<(Venue
         ("hyperliquid", InstrumentType::Futures | InstrumentType::Perpetual) => {
             Some((Venue::Hyperliquid, MarketKind::Futures))
         }
+        ("ctp", InstrumentType::Futures) => Some((Venue::Ctp, MarketKind::Futures)),
         _ => None,
     }
 }

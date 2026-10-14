@@ -37,13 +37,22 @@ impl DeribitProvider {
                     "deribit 期权需要在 account.csv 配置 exchange=deribit 的账户 `{account}`"
                 )
             })?;
+        let crate::port::ExchangeCredential::ApiSecret {
+            api_key,
+            api_secret,
+            is_testnet,
+            ..
+        } = cred
+        else {
+            anyhow::bail!("deribit 凭证形态错误：应为 ApiSecret");
+        };
         Ok(Arc::new(DeribitUser::new(
             self.deps.http.clone(),
             Arc::clone(&self.deps.rules),
             Arc::clone(&self.deps.quotes),
-            cred.api_key,
-            cred.api_secret,
-            cred.is_testnet,
+            api_key,
+            api_secret,
+            is_testnet,
             self.deps.venue,
         )))
     }
@@ -158,13 +167,22 @@ impl DeribitUserProvider for DeribitProviderUser {
             .credentials
             .resolve(account, NAME)
             .ok_or_else(|| anyhow::anyhow!("deribit 账户凭证不可解析：{account}"))?;
+        let crate::port::ExchangeCredential::ApiSecret {
+            api_key,
+            api_secret,
+            is_testnet,
+            ..
+        } = cred
+        else {
+            anyhow::bail!("deribit 凭证形态错误：应为 ApiSecret");
+        };
         Ok(Arc::new(DeribitUser::new(
             self.http.clone(),
             Arc::clone(&self.rules),
             Arc::clone(&self.quotes),
-            cred.api_key,
-            cred.api_secret,
-            cred.is_testnet,
+            api_key,
+            api_secret,
+            is_testnet,
             self.venue,
         )))
     }

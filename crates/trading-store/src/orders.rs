@@ -292,6 +292,46 @@ impl OrderRepo {
         Ok(updated)
     }
 
+    /// cid miss 时的回查 fallback（各所通用）：按交易所侧单号定位本地 cid。
+    ///
+    /// 场景：柜台回报可能只带交易所侧标识——CTP 重启后内存映射丢失，
+    /// 事件 cid=OrderRef，而订单行受理时已落 `exchange_order_id`。
+    /// Binance 等事件恒带正确 cid，本方法不会被触达。
+    ///
+    /// 守卫：命中必须**唯一**，否则返回 None（宁可孤儿不可错配）；
+    /// cid 本可直接命中的行不参与（正常路径不受影响）。
+    pub fn resolve_cid_by_exchange_id(
+        &self,
+        ev_client_order_id: &str,
+        ev_exchange_order_id: Option<&str>,
+    ) -> Option<String> {
+        // 终态订单会被软删（本项目唯一软删规则点），而迟到的终态回报
+        // 恰是重启恢复的目标场景——必须查 including_deleted。
+        let hits: Vec<String> = self
+            .table
+            .list_including_deleted()
+            .into_iter()
+            .filter(|o| o.client_order_id != ev_client_order_id)
+            .filter(|o| {
+                o.exchange_order_id.as_deref() == Some(ev_client_order_id)
+                    || ev_exchange_order_id
+                        .is_some_and(|x| o.exchange_order_id.as_deref() == Some(x))
+            })
+            .map(|o| o.client_order_id)
+            .collect();
+        if hits.len() == 1 {
+            hits.into_iter().next()
+        } else {
+            if hits.len() > 1 {
+                tracing::warn!(
+                    count = hits.len(),
+                    "exchange_order_id 回查命中多行，拒绝改写"
+                );
+            }
+            None
+        }
+    }
+
     /// 应用北向订单回报（定点推进，禁浮点）。终结态订单收到回报报错。
     pub fn apply_event(&self, ev: &OrderEventInput) -> Result<Order, OrderRepoError> {
         let current = self.get_required(&ev.client_order_id)?;
@@ -721,5 +761,67 @@ mod tests {
         let repo = OrderRepo::new(table);
         assert_eq!(repo.get_by_cid(&cid).unwrap().account_id, 3);
         assert_eq!(repo.list_active().len(), 1);
+    }
+
+    // ---- cid miss 回查 fallback（各所通用；CTP 重启恢复的关键路径）----
+
+    fn cid(n: u64) -> String {
+        format!("0x{n:032x}")
+    }
+
+    fn order_with(cid: &str, exchange_order_id: Option<&str>) -> Order {
+        let mut o = Order::new(1, cid.to_string(), "binance", "BTCUSDT", Side::Buy);
+        o.exchange_order_id = exchange_order_id.map(str::to_string);
+        o.order_quantity = rust_decimal::Decimal::new(1, 0);
+        o
+    }
+
+    #[test]
+    fn resolve_by_exchange_id_hits_accept_stamp() {
+        // Arrange：订单行受理时已落 exchange_order_id=OrderRef（CTP 重启场景：
+        // 内存映射丢失，回报 cid=OrderRef，须按行内记录回查）。
+        let repo = repo();
+        repo.insert(order_with(&cid(1), Some("17"))).unwrap();
+
+        // Act：回报只带 cid="17"（OrderRef），本地 cid 是 0x…01。
+        let got = repo.resolve_cid_by_exchange_id("17", None);
+
+        // Assert：回查命中本地 cid。
+        assert_eq!(got.as_deref(), Some(cid(1).as_str()));
+    }
+
+    #[test]
+    fn resolve_by_event_exchange_order_id() {
+        // Arrange：行内已是 OrderSysID（首回报后升级）；事件自带同一单号。
+        let repo = repo();
+        repo.insert(order_with(&cid(2), Some("9001"))).unwrap();
+
+        // Act / Assert：事件 exchange_order_id 命中。
+        let got = repo.resolve_cid_by_exchange_id("0xother", Some("9001"));
+        assert_eq!(got.as_deref(), Some(cid(2).as_str()));
+    }
+
+    #[test]
+    fn resolve_requires_unique_match() {
+        // Arrange：两行同 exchange_order_id（异常数据）——宁可孤儿不可错配。
+        let repo = repo();
+        repo.insert(order_with(&cid(3), Some("17"))).unwrap();
+        repo.insert(order_with(&cid(4), Some("17"))).unwrap();
+
+        // Act / Assert：命中不唯一 → None（维持丢弃语义）。
+        assert!(repo.resolve_cid_by_exchange_id("17", None).is_none());
+    }
+
+    #[test]
+    fn resolve_skips_rows_whose_cid_already_hits() {
+        // Arrange：cid 本可直接命中的行不走 fallback（正常路径不受影响）。
+        let repo = repo();
+        repo.insert(order_with(&cid(5), Some("9001"))).unwrap();
+
+        // Act：ev.client_order_id 就是该行 cid。
+        let got = repo.resolve_cid_by_exchange_id(&cid(5), None);
+
+        // Assert：fallback 返回 None（调用方首查已命中，不需要改写）。
+        assert!(got.is_none());
     }
 }

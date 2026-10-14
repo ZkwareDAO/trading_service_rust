@@ -53,13 +53,21 @@ impl BinanceUsers {
                 "binance 合约需要在 account.csv 配置 exchange=binance 的账户 `{account}`"
             )
         })?;
-        let opts = BinanceFuturesOptions::new(cred.is_testnet, self.timeout_ms);
+        let crate::port::ExchangeCredential::ApiSecret {
+            position_mode,
+            is_testnet,
+            ..
+        } = &cred
+        else {
+            anyhow::bail!("binance 凭证形态错误：应为 ApiSecret");
+        };
+        let opts = BinanceFuturesOptions::new(*is_testnet, self.timeout_ms);
         let sdk = self.cache.get_or_build(account, &cred, opts)?;
         Ok(Arc::new(BinanceUser::from_sdk(
             sdk,
             Arc::clone(&self.rules),
-            cred.position_mode,
-            cred.is_testnet,
+            *position_mode,
+            *is_testnet,
         )))
     }
 }

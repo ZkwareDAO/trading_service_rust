@@ -41,7 +41,7 @@
 | `crates/trading-service/src/main.rs` | 二进制 **trading-service**：解析配置 → 实现出站端口 → 构造交易所注册表 → 南向 bind WS、管理 REST 与业务编排 |
 | `crates/trading-service/src/bin/xili-exchange.rs` | 二进制 **xili-exchange**：本地模拟交易所，固定端口同时提供 REST + `/ws` 账户事件，按节奏模拟成交 |
 | `crates/trading-service/src/bin/strategy-client.rs` | 二进制 **strategy-client**：参考策略客户端（含 HMAC 签名与各命令参数装配，发送一条命令并打印全部回报） |
-| `crates/trading-service/src/bin/account-tool.rs` | 二进制 **account-tool**：账户管理（`add-account` 追加/更新账户、密钥生成、secret 加密；交互式问答或参数直传） |
+| `crates/trading-service/src/bin/account-tool.rs` | 二进制 **account-tool**：账户管理（`add-account` 追加/更新账户、`migrate` 旧宽表迁移、密钥生成、credentials 加密；交互式问答或参数直传） |
 | `crates/trading-service/src/bin/loadtest.rs` | 二进制 **loadtest**：下单压测 |
 
 五个二进制同属一个 package，因此统一用 `cargo run -p trading-service --bin <名字>` 启动。
@@ -142,15 +142,14 @@ cargo run -p trading-service --bin strategy-client -- --insecure
 账户**不读环境变量**，来源是人工可编辑的 `<data-dir>/account.csv`：
 
 ```
-id,name,exchange,api_key,api_secret,api_passphrase,position_mode,is_testnet,deleted,created_at,updated_at
-0,test_binance,binance,YOUR_API_KEY,your-secret,,one_way,0,0,0,0
+id,name,exchange,credentials,deleted,created_at,updated_at
+0,test_binance,binance,enc.v1.x8Fk2Q…,0,0,0
 ```
 
 - 重载经管理 API `POST /admin/accounts/reload` 显式触发；交易所连接随后按重载版本停旧起新（对账周期 `--account-reload-interval`，默认 2s）。
 - 新增账户即由 supervisor 拉起其用户数据流连接；删除/`deleted=1` 即停用连接；坏文件保留旧表。
-- `is_testnet=1` 时该账户的**下单 REST 与账户事件流**走用户级测试网（如 `testnet.binancefuture.com`）；公共行情恒定正式网。
-- `position_mode`：`one_way` / `hedge`。
-- `api_secret` 支持明文（仅联调，启动会告警并在内存归一化）或加密形态 `enc.v1.*`（AES-256-GCM，主密钥在 `<data-dir>/account.key`，0600，首启自动生成）。模板见 `deploy/account.example.csv`，账户管理工具见 `account-tool`。
+- `credentials` 为**整串凭证 JSON**（按 exchange 选 schema：REST 签名所 `{api_key, api_secret, api_passphrase?, position_mode, is_testnet}`，CTP `{broker_id, user_id, password, app_id, auth_code, investor_id?, front_address, is_production_mode?}`），支持明文 JSON（仅联调，启动会告警并在内存归一化）或加密形态 `enc.v1.*`（AES-256-GCM，主密钥在 `<data-dir>/account.key`，0600，首启自动生成）。REST 所的 `is_testnet`/`position_mode` 是账户级属性（随该账户的凭证 JSON）。
+- 模板见 `deploy/account.example.csv`，账户管理（含旧宽表迁移 `migrate`）见 `account-tool`。
 - 下单校验：真实 venue（如 binance）必须有名称与交易所都匹配的活动账户，否则直接回 `REJECTED`；本地模拟所账户可选。
 - `account.csv`、`*.key` 已在 `.gitignore`，禁止入库。
 
@@ -253,6 +252,14 @@ CSV 异步落盘、重启恢复、账户热加载、管理 REST、盯盘规则�
 企业微信通知（开平仓播报/人工介入告警）。
 
 进行中/留待后续：历史跨日数据查询接口、更多产品类型（现货余额端点等）、REST 校验补全与错误码细分。
+
+---
+
+## 免责声明
+
+本项目是一套可对接真实交易所并执行实盘交易的系统，**不构成投资建议，不对
+任何交易盈亏负责**。接入真实资金前请以最小仓位充分验证，并妥善备份密钥。
+完整条款见 [DISCLAIMER.md](DISCLAIMER.md)。
 
 ---
 

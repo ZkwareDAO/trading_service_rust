@@ -26,5 +26,10 @@ pub mod hyperliquid;
 /// 本地模拟交易所 xili 适配器（教学案例所，与 binance 平级、同构）。
 pub mod xili;
 
+/// CTP 国内期货适配器：核心类型 + FFI 网关，仅在 feature="ctp" 下编译。
+/// 运行期经 libloading 动态加载柜台 .so，路径与生产模式开关走 venue 配置。
+#[cfg(feature = "ctp")]
+pub mod ctp;
+
 /// 仓位流水线档案（各交易所 VenueProvider 自描述），crate 根直接可用。
 pub use position_profile::PositionProfile;

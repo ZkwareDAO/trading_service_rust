@@ -40,9 +40,18 @@ impl ExchangeRegistry {
             crate::hyperliquid::provider::HyperliquidProvider::new(deps.clone()),
         );
         let binance: Arc<dyn VenueProvider> =
-            Arc::new(crate::binance::provider::BinanceProvider::new(deps));
+            Arc::new(crate::binance::provider::BinanceProvider::new(deps.clone()));
         let xili: Arc<dyn VenueProvider> = Arc::new(XiliProvider::new(endpoints, http));
+        // CTP（feature="ctp"）：同步阻塞特例，.so/生产模式开关经 CtpConfig 注入。
+        #[cfg(feature = "ctp")]
+        let ctp: Arc<dyn VenueProvider> = Arc::new(crate::ctp::provider::CtpProvider::new(
+            deps.clone(),
+            deps.ctp.clone(),
+        ));
         // xili 排在前：同名端点名时本地模拟所优先（便于教学/联调覆盖）。
+        #[cfg(feature = "ctp")]
+        return Self::from_providers(vec![xili, deribit, hyperliquid, binance, ctp]);
+        #[cfg(not(feature = "ctp"))]
         Self::from_providers(vec![xili, deribit, hyperliquid, binance])
     }
 
@@ -129,6 +138,7 @@ impl ExchangeRegistry {
         // per-account：supervisor 把期望目标集分派给支持的 provider。
         let supervisor = Supervisor::new();
         let connector = RegistryConnector::new(self.providers(), sink);
+        let stop_connector = connector.clone();
         let running = supervisor.clone();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering;
@@ -138,23 +148,31 @@ impl ExchangeRegistry {
                 running.reconcile(&targets.active_targets(), &connector);
             }
         });
-        AccountEventsHandle { supervisor }
+        AccountEventsHandle {
+            supervisor,
+            connector: stop_connector,
+        }
     }
 }
 
 /// 账户事件侧句柄：优雅关闭时停掉全部按账户的长连接。
 pub struct AccountEventsHandle {
     supervisor: Supervisor,
+    /// 连接器（provider 停机钩子经它分发——CTP 会话线程必须靠停机标志退出）。
+    connector: RegistryConnector,
 }
 
 impl AccountEventsHandle {
     pub fn stop_all(&self) {
+        // 先置位阻塞线程的停机标志（abort 对 spawn_blocking 无效），再回收任务句柄。
+        self.connector.stop_account_streams();
         self.supervisor.stop_all();
     }
 }
 
 /// 把 supervisor 的 per-account 连接请求按名分派给支持的 provider；
 /// 无 provider 支持时返回占位任务（未知所），不影响其它所。
+#[derive(Clone)]
 struct RegistryConnector {
     providers: Vec<Arc<dyn VenueProvider>>,
     sink: Arc<dyn OrderEventSink>,
@@ -167,6 +185,12 @@ impl RegistryConnector {
 }
 
 impl VenueConnector for RegistryConnector {
+    fn stop_account_streams(&self) {
+        for p in &self.providers {
+            p.stop_account_streams();
+        }
+    }
+
     fn spawn(&self, exchange: &str, account: &str) -> JoinHandle<()> {
         for p in &self.providers {
             if p.matches(exchange) {

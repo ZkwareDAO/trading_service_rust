@@ -53,6 +53,10 @@ csv.workspace = true
 rpassword.workspace = true
 # Binance SDK / vendored OpenSSL / tokio-stream 已随适配器迁入 trading-exchange。
 
+[features]
+# CTP 适配（trading-exchange 的 feature="ctp" 由本 feature 透传）。
+ctp = ["trading-exchange/ctp"]
+
 [dev-dependencies]
 tower = { workspace = true }
 tempfile = { workspace = true }

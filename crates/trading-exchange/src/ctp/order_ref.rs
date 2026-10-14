@@ -1,0 +1,148 @@
+//! CTP OrderRef 分配与回报反查（cid ↔ OrderRef 映射）。
+//!
+//! 背景：`OrderRef` 是客户端自填、柜台原样回传的订单关联字段，上限 13 字节；
+//! 本系统 cid 为 `0x`+32hex（34 字节）超限——对长 cid 分配数字短号（epoch
+//! 毫秒播种，跨重启单调、不与历史小号空间重叠），回报时反查还原长 cid。
+//! ≤13 字节的 cid 直接透传（未来上游若统一短格式，本表自动退化为零开销）。
+//!
+//! 生命周期：会话态（进程内存）；订单行持久化 `exchange_order_id`（受理时
+//! 为 OrderRef，首回报后升级为 OrderSysID）+ 宿主回查 fallback 承担重启恢复，
+//! 本表丢得起、可重建。
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+/// cid ↔ OrderRef 映射表（会话态，进程内存）。
+///
+/// 内部仅 AtomicU64 + Mutex<HashMap>，自动满足 Send + Sync，可安全跨
+/// `Arc` 在 tokio 短会话与专用 OS 线程间共享。
+///
+/// 撤单（将来 `ReqOrderAction`）可经映射反查 OrderRef；重启后不重建——
+/// 历史订单的回报经宿主 `exchange_order_id` 回查 fallback 收敛（见
+/// trading-service event 匹配），新订单从 epoch 毫秒量级播种分配。
+#[derive(Default)]
+pub struct OrderRefRegistry {
+    /// 下一个可分配的数字短号（epoch 毫秒播种，进程内单调递增）。
+    next: AtomicU64,
+    /// OrderRef → 本地长 cid。
+    map: Mutex<HashMap<String, String>>,
+}
+
+impl OrderRefRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 为长 cid 分配 OrderRef：≤12 字节直接透传（不占表）；长 cid 分配
+    /// `max(epoch 毫秒/10, 上次值+1)` 的 **12 位**数字短号——OrderRef 定长
+    /// 13 字节须留 1 字节 `\0` 终止符（实测填满 13 位会被柜台截断为 12 位，
+    /// 回报反查错配）；重启后计数器不落回历史小号空间，反查天然无碰撞。
+    pub fn allocate(&self, cid: &str) -> String {
+        if cid.len() <= 13 {
+            return cid.to_owned();
+        }
+        loop {
+            let last = self.next.load(Ordering::SeqCst);
+            let next = (last + 1).max(epoch_millis_div10());
+            if self
+                .next
+                .compare_exchange(last, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let order_ref = next.to_string();
+                self.map
+                    .lock()
+                    .unwrap()
+                    .insert(order_ref.clone(), cid.to_owned());
+                return order_ref;
+            }
+        }
+    }
+
+    /// 回报反查：OrderRef → 本地长 cid（未命中返回 None，调用方保留原值）。
+    pub fn cid_of(&self, order_ref: &str) -> Option<String> {
+        self.map.lock().unwrap().get(order_ref).cloned()
+    }
+
+    /// 移除映射（柜台受理失败时清脏表：未受理的 OrderRef 不会有回报）。
+    pub fn remove(&self, order_ref: &str) {
+        self.map.lock().unwrap().remove(order_ref);
+    }
+}
+
+/// 12 位播种基数：epoch 毫秒去掉末位（10ms 精度）。
+fn epoch_millis_div10() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64 / 10)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn long_cid(tag: &str) -> String {
+        format!("0x{}", tag.repeat(32))
+    }
+
+    #[test]
+    fn allocate_is_monotonic_and_unique() {
+        // Arrange / Act：连续分配两笔。
+        let r = OrderRefRegistry::new();
+        let a = r.allocate(&long_cid("A"));
+        let b = r.allocate(&long_cid("B"));
+
+        // Assert：互不相同、可反查回各自长 cid。
+        assert_ne!(a, b);
+        assert_eq!(r.cid_of(&a).as_deref(), Some(long_cid("A").as_str()));
+        assert_eq!(r.cid_of(&b).as_deref(), Some(long_cid("B").as_str()));
+    }
+
+    #[test]
+    fn allocate_seeds_from_epoch_millis_across_restart() {
+        // Arrange：新进程 = 新 registry（计数器归零），模拟重启。
+        let r = OrderRefRegistry::new();
+
+        // Act：重启后第一笔分配。
+        let a = r.allocate(&long_cid("A"));
+
+        // Assert：短号 ≥ 当前 epoch 毫秒（13 位量级）——
+        // 不会与历史运行的小号空间（1..1000）重叠，回报反查天然无碰撞。
+        let floor = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 1_000)
+            / 10;
+        let n: u64 = a.parse().expect("短号应为纯数字（OrderRef 数字口径）");
+        assert!(n >= floor, "分配号 {n} 应从 epoch 毫秒/10 量级播种");
+        assert!(a.len() <= 12, "OrderRef 须留 1 字节 \0 终止符，实际 {a}");
+    }
+
+    #[test]
+    fn short_cid_passes_through_without_mapping() {
+        // Arrange / Act：≤13 字节的 cid 直接透传。
+        let r = OrderRefRegistry::new();
+        let a = r.allocate("12345678");
+
+        // Assert：原样返回且不占表（cid_of 本身也是它自己，翻译自然成立）。
+        assert_eq!(a, "12345678");
+        assert!(r.cid_of("12345678").is_none());
+    }
+
+    #[test]
+    fn remove_drops_translation() {
+        // Arrange：受理失败的脏映射应可清除。
+        let r = OrderRefRegistry::new();
+        let a = r.allocate(&long_cid("A"));
+        assert!(r.cid_of(&a).is_some());
+
+        // Act
+        r.remove(&a);
+
+        // Assert：反查未命中（回报不会带着未受理的 OrderRef 回来）。
+        assert!(r.cid_of(&a).is_none());
+    }
+}

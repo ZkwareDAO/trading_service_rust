@@ -3,18 +3,21 @@
 //! 复用与服务完全一致的 AES-256-GCM 原语（`trading_models::SecretCipher`）：
 //! * `gen-key`：生成 32 字节主密钥，0600 落盘（即 account.key）
 //! * `encrypt`：加密单个明文，输出 `enc.v1.*`
-//! * `encrypt-csv`：把 account.csv 中 api_secret 列的明文批量加密、原子回写
+//! * `migrate`：把**旧宽表** account.csv 逐行迁移为新 7 列格式（原文件备份
+//!   `.bak`；`--key` 提供时 credentials 整串加密回写）
 //! * `add-account`：校验并追加一条账户到 account.csv（文件不存在先建表头；
-//!   同名账户默认拒绝，`--update` 时按 name 整行替换），`--key` 提供时写入前
-//!   即刻加密 secret
+//!   同名账户默认拒绝，`--update` 时按 name 整行替换）。新 7 列格式：公共列 +
+//!   `credentials` JSON（按 exchange 选 schema，binance/ctp 模板见
+//!   [`credentials_template`]），`--key` 提供时写入前 `encrypt_if_plaintext`
+//!   整串加密
 //!
 //! 已是 `enc.v1.*` / 空值会原样跳过（encrypt/encrypt-csv）。
 //!
 //! # 交互式与脚本两种用法
 //!
-//! 所有参数都是**可选**的：交互终端下缺什么就问什么（secret 输入不回显）；
-//! 非交互管道/脚本场景则按命令行参数执行，必填参数缺失时报错退出，方便
-//! CI / 部署脚本无人工调用。
+//! 所有参数都是**可选**的：交互终端下缺什么就问什么（credentials JSON 输入
+//! 不回显）；非交互管道/脚本场景则按命令行参数执行，必填参数缺失时报错退出，
+//! 方便 CI / 部署脚本无人工调用。
 //!
 //! 注意：account.key 存的是 32 字节原始密钥（非 hex），与服务读取口径一致。
 //! 主密钥丢失后历史密文将无法解密，请妥善备份。
@@ -26,19 +29,18 @@
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use clap::{Parser, Subcommand};
+use trading_exchange::port::credential_from_json;
 use trading_models::account::SecretCipher;
 
-/// account.csv 的标准表头（与 deploy/account.example.csv 一致）。
-pub const ACCOUNT_CSV_HEADER: [&str; 11] = [
+/// account.csv 的标准表头（新 7 列：6 公共列 + credentials，与
+/// trading_models::ACCOUNT_CSV_HEADER 一致，测试钉死等价）。
+pub const ACCOUNT_CSV_HEADER: [&str; 7] = [
     "id",
     "name",
     "exchange",
-    "api_key",
-    "api_secret",
-    "api_passphrase",
-    "position_mode",
-    "is_testnet",
+    "credentials",
     "deleted",
     "created_at",
     "updated_at",
@@ -98,9 +100,14 @@ enum Cmd {
         secret: Option<String>,
     },
 
-    /// 批量加密 account.csv 的 api_secret 列，原地原子回写。
-    EncryptCsv {
-        /// 主密钥文件（32 字节 raw）。
+    /// 把**旧宽表** account.csv 迁移为新 7 列格式（原文件备份 .bak）。
+    ///
+    /// 逐行按 exchange 拼 credentials JSON（CTP 行 api_key=user_id、
+    /// api_passphrase=password；旧 api_secret 列若已是 enc.v1. 密文需 `--key`
+    /// 解密还原），`--key` 提供时整串 `encrypt_if_plaintext` 加密回写。
+    /// 已是新格式（无 api_key 列）则原样跳过。
+    Migrate {
+        /// 主密钥文件（32 字节 raw）；旧 secret 列有密文时必须提供。
         #[arg(long)]
         key: Option<PathBuf>,
         /// account.csv 路径。
@@ -108,9 +115,12 @@ enum Cmd {
         csv: Option<PathBuf>,
     },
 
-    /// 追加一条账户到 account.csv（文件不存在则先创建表头）。
+    /// 追加一条账户到 account.csv（新 7 列格式；文件不存在则先创建表头）。
     ///
-    /// 交互终端下逐项提问（secret 不回显）；脚本场景用参数直传。
+    /// credentials 为**整串 JSON**：REST 签名所（binance/deribit/hyperliquid）
+    /// 用 ApiSecret schema，CTP 期货用 Ctp schema（交互终端下按 exchange 打印
+    /// 对应模板）。写入前按 exchange 校验 JSON 合法性；`--key` 提供时
+    /// `encrypt_if_plaintext` 整串加密（生产推荐），缺省明文写入（服务会告警）。
     AddAccount {
         /// account.csv 路径（数据目录下，如 ./data/account.csv）。
         #[arg(long)]
@@ -118,28 +128,16 @@ enum Cmd {
         /// 账户名（同一 exchange 内唯一；服务据此生成稳定 id）。
         #[arg(long)]
         name: Option<String>,
-        /// 交易所精确名（binance / deribit / hyperliquid …）。
+        /// 交易所精确名（binance / deribit / hyperliquid / ctp …）。
         #[arg(long)]
         exchange: Option<String>,
-        /// API key / 公钥。
+        /// credentials JSON 明文（整串）；不传则交互按模板提问（不回显）或读 stdin。
         #[arg(long)]
-        api_key: Option<String>,
-        /// API secret / 私钥；不传则交互提问（不回显）或从 stdin 读取。
-        #[arg(long)]
-        secret: Option<String>,
+        credentials: Option<String>,
         /// 主密钥文件；提供时写入前先加密为 enc.v1.*（生产推荐）。
         /// 缺省则按明文写入（服务启动会告警，仅限本地联调）。
         #[arg(long)]
         key: Option<PathBuf>,
-        /// 第三凭证/口令（部分交易所使用；binance/deribit/hyperliquid 为空）。
-        #[arg(long)]
-        api_passphrase: Option<String>,
-        /// 持仓模式：one_way（默认）/ hedge。
-        #[arg(long)]
-        position_mode: Option<String>,
-        /// 连接交易所测试网（生产必须省略此开关）。
-        #[arg(long, default_value_t = false)]
-        testnet: bool,
         /// 同名账户已存在时，整行替换而不是报错退出。
         #[arg(long, default_value_t = false)]
         update: bool,
@@ -163,7 +161,7 @@ fn main() -> anyhow::Result<()> {
             // 原子 0600 新建，与服务首启生成 account.key 完全一致。
             store_core::fs::write_new_0600(&key, &raw)?;
             println!("已生成主密钥（0600）：{}", key.display());
-            println!("请妥善备份；丢失后已加密的 api_secret 无法解密。");
+            println!("请妥善备份；丢失后已加密的 credentials 无法解密。");
         }
         Cmd::Encrypt { key, secret } => {
             let key = match key {
@@ -171,74 +169,47 @@ fn main() -> anyhow::Result<()> {
                 None => prompt_path("主密钥文件路径", &default_data_file("account.key"))?,
             };
             let cipher = load_cipher(&key)?;
-            let plain = read_secret(secret)?;
+            let plain = read_secret_input(secret, "API secret / 私钥（输入不回显）：")?;
             println!("{}", cipher.encrypt(&plain)?);
         }
 
-        Cmd::EncryptCsv { key, csv } => {
-            let key = match key {
-                Some(k) => k,
-                None => prompt_path("主密钥文件路径", &default_data_file("account.key"))?,
-            };
+        Cmd::Migrate { key, csv } => {
             let csv = match csv {
                 Some(c) => c,
                 None => prompt_path("account.csv 路径", &default_data_file("account.csv"))?,
             };
-            let cipher = load_cipher(&key)?;
-            let raw = std::fs::read_to_string(&csv)?;
-            let mut reader = csv::ReaderBuilder::new()
-                .has_headers(true)
-                .flexible(true)
-                .from_reader(raw.as_bytes());
-            let headers = reader.headers()?.clone();
-
-            let secret_idx = headers
-                .iter()
-                .position(|h| h.trim() == "api_secret")
-                .ok_or_else(|| anyhow::anyhow!("CSV 缺少 api_secret 列"))?;
-
-            let mut writer = csv::Writer::from_writer(Vec::new());
-            writer.write_record(headers.iter())?;
-
-            let mut encrypted = 0usize;
-            for record in reader.records() {
-                let mut record = record?;
-                if let Some(field) = record.get(secret_idx) {
-                    let value = field.trim();
-                    if !value.is_empty()
-                        && !value.starts_with(trading_models::account::SECRET_PREFIX)
-                    {
-                        let enc = cipher.encrypt(value)?;
-                        // StringRecord 无原地替换：按列重建该记录。
-                        record = csv::StringRecord::from(
-                            record
-                                .iter()
-                                .enumerate()
-                                .map(|(i, v)| if i == secret_idx { enc.as_str() } else { v })
-                                .collect::<Vec<_>>(),
-                        );
-                        encrypted += 1;
-                    }
-                }
-                writer.write_record(record.iter())?;
+            let cipher = match &key {
+                Some(k) => Some(load_cipher(k)?),
+                None => None,
+            };
+            if cipher.is_none() {
+                eprintln!("警告：未提供主密钥，迁移产出的 credentials 将以明文 JSON 写入（仅限本地联调）。");
             }
-            let bytes = writer.into_inner()?;
-
-            // 原子回写：tmp + rename，避免写一半损坏 account.csv。
-            write_csv_atomic(&csv, &bytes)?;
-            println!("已加密 {encrypted} 条明文 api_secret：{}", csv.display());
+            let report = migrate_csv(&csv, cipher.as_ref())?;
+            if report.migrated == 0 {
+                println!(
+                    "未检测到旧宽表格式（表头无 api_key 列），无需迁移：{}",
+                    csv.display()
+                );
+            } else {
+                println!(
+                    "已迁移 {} 条账户到新 7 列格式：{}",
+                    report.migrated,
+                    csv.display()
+                );
+                if let Some(b) = report.backup {
+                    println!("原文件已备份：{}（验证无误后可删除）", b.display());
+                }
+                println!("手工触发重载：curl -X POST {RELOAD_URL}");
+            }
         }
 
         Cmd::AddAccount {
             csv,
             name,
             exchange,
-            api_key,
-            secret,
+            credentials,
             key,
-            api_passphrase,
-            position_mode,
-            testnet,
             update,
         } => {
             // —— 逐项取值：参数优先，缺什么在交互终端下问什么 ——
@@ -252,16 +223,27 @@ fn main() -> anyhow::Result<()> {
             };
             let exchange = match exchange {
                 Some(e) => e,
-                None => prompt_required("交易所（binance / deribit / hyperliquid …）")?,
+                None => prompt_required("交易所（binance / deribit / hyperliquid / ctp …）")?,
             };
-            let api_key = match api_key {
-                Some(k) => k,
-                None => prompt_required("API key / 公钥")?,
-            };
-            let plain = read_secret(secret)?;
-            if plain.is_empty() {
-                anyhow::bail!("secret 为空：请用 --secret 传入、交互输入或从 stdin 提供私钥");
+            // 按 exchange 打印 credentials JSON 模板，再整段读取。
+            if interactive() {
+                println!(
+                    "credentials JSON 模板（{}）：\n  {}",
+                    exchange,
+                    credentials_template(&exchange)
+                );
             }
+            let plain_json =
+                read_secret_input(credentials, "credentials JSON（整串输入，不回显）：")?;
+            if plain_json.is_empty() {
+                anyhow::bail!(
+                    "credentials 为空：请用 --credentials 传入、交互输入或从 stdin 提供整串 JSON"
+                );
+            }
+            // 写入前按 exchange 校验 JSON（schema 反序列化，缺必填字段即报错）。
+            credential_from_json(&exchange, &plain_json).map_err(|e| {
+                anyhow::anyhow!("credentials JSON 与交易所 `{exchange}` 不匹配：{e:#}")
+            })?;
             let key = match key {
                 Some(k) => Some(k),
                 None if interactive() => {
@@ -269,37 +251,17 @@ fn main() -> anyhow::Result<()> {
                 }
                 None => None,
             };
-            let api_passphrase = match api_passphrase {
-                Some(p) => Some(p),
-                None => prompt_optional("第三凭证/口令 passphrase（多数交易所为空，回车跳过）")?,
-            };
-            let position_mode = match position_mode {
-                Some(p) => p,
-                None => prompt_default("持仓模式（one_way / hedge）", "one_way")?,
-            };
-            // 测试网开关：参数未给时交互确认（生产默认 N，防止误把测试网 key 写成主网口径）。
-            let testnet = if testnet {
-                true
-            } else if interactive() {
-                prompt_yes_no("是否连接交易所测试网（testnet）？", false)?
-            } else {
-                false
-            };
 
-            // 主密钥提供 → 写入前即刻加密（生产路径）；缺省按明文（联调，服务会告警）。
-            let stored_secret = match &key {
-                Some(k) => load_cipher(k)?.encrypt(&plain)?,
+            // 主密钥提供 → 写入前整串加密（生产路径）；缺省按明文（联调，服务会告警）。
+            let stored_credentials = match &key {
+                Some(k) => load_cipher(k)?.encrypt_if_plaintext(&plain_json)?.0,
                 None => {
                     eprintln!(
-                        "警告：未提供主密钥，secret 将以明文写入（仅限本地联调，服务启动会告警）。"
+                        "警告：未提供主密钥，credentials 将以明文写入（仅限本地联调，服务启动会告警）。"
                     );
-                    plain
+                    plain_json
                 }
             };
-
-            let mode = normalize_position_mode(&position_mode).ok_or_else(|| {
-                anyhow::anyhow!("非法 position_mode `{position_mode}`（仅支持 one_way / hedge）")
-            })?;
 
             // 组装行（列序与表头一致）；id/created_at 写 0——服务按 name 生成稳定 id。
             let record = build_account_row(
@@ -307,11 +269,7 @@ fn main() -> anyhow::Result<()> {
                 &AccountRowInput {
                     name: &name,
                     exchange: &exchange,
-                    api_key: &api_key,
-                    api_secret: &stored_secret,
-                    api_passphrase: api_passphrase.as_deref(),
-                    position_mode: mode,
-                    is_testnet: testnet,
+                    credentials: &stored_credentials,
                     updated_at: 0,
                 },
             )
@@ -407,6 +365,16 @@ fn prompt_required(label: &str) -> anyhow::Result<String> {
     }
 }
 
+/// 提问读一个路径（带默认值）。
+fn prompt_path(label: &str, default: &str) -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(prompt_default(label, default)?))
+}
+
+/// 提问读一个可选路径；空输入返回 None。
+fn prompt_path_opt(label: &str) -> anyhow::Result<Option<PathBuf>> {
+    Ok(prompt_optional(label)?.map(PathBuf::from))
+}
+
 /// 提问读一行可选值；空输入返回 None。
 fn prompt_optional(label: &str) -> anyhow::Result<Option<String>> {
     if !interactive() {
@@ -433,16 +401,6 @@ fn prompt_default(label: &str, default: &str) -> anyhow::Result<String> {
     Ok(if v.is_empty() { default.to_string() } else { v })
 }
 
-/// 提问读一个路径（带默认值）。
-fn prompt_path(label: &str, default: &str) -> anyhow::Result<PathBuf> {
-    Ok(PathBuf::from(prompt_default(label, default)?))
-}
-
-/// 提问读一个可选路径；空输入返回 None。
-fn prompt_path_opt(label: &str) -> anyhow::Result<Option<PathBuf>> {
-    Ok(prompt_optional(label)?.map(PathBuf::from))
-}
-
 /// y/N 提问；非交互按默认。
 fn prompt_yes_no(label: &str, default: bool) -> anyhow::Result<bool> {
     if !interactive() {
@@ -464,22 +422,28 @@ fn prompt_yes_no(label: &str, default: bool) -> anyhow::Result<bool> {
     }
 }
 
-/// secret 入参兜底：交互 → 不回显提问；管道 → 读 stdin（去除首尾空白）。
-fn read_secret(secret: Option<String>) -> anyhow::Result<String> {
-    if let Some(s) = secret {
+/// 隐感输入兜底（secret / credentials JSON）：显式入参 → trim 返回；
+/// 交互 → 不回显提问（防密钥留在终端回滚缓冲/屏幕记录）；管道 → 读 stdin（trim）。
+fn read_secret_input(provided: Option<String>, prompt: &str) -> anyhow::Result<String> {
+    if let Some(s) = provided {
         return Ok(s.trim().to_string());
     }
     if interactive() {
-        // 不回显输入，防止私钥留在终端回滚缓冲/屏幕记录里。
-        Ok(
-            rpassword::prompt_password("API secret / 私钥（输入不回显）：")?
-                .trim()
-                .to_string(),
-        )
+        Ok(rpassword::prompt_password(prompt)?.trim().to_string())
     } else {
         let mut buf = String::new();
         std::io::stdin().read_to_string(&mut buf)?;
         Ok(buf.trim().to_string())
+    }
+}
+
+/// 各所 credentials JSON 模板（交互提示用）：CTP 看穿式 7 件套；
+/// 其余所（binance/deribit/hyperliquid 同构）共用 ApiSecret schema。
+fn credentials_template(exchange: &str) -> &'static str {
+    if exchange.trim().eq_ignore_ascii_case("ctp") {
+        r#"{"broker_id":"9999","user_id":"100001","password":"pwd","app_id":"simnow_client","auth_code":"0000000000000000","investor_id":"","front_address":"tcp://182.254.243.31:40001","is_production_mode":false}"#
+    } else {
+        r#"{"api_key":"abc123","api_secret":"s3cret","api_passphrase":null,"position_mode":"one_way","is_testnet":false}"#
     }
 }
 
@@ -504,15 +468,156 @@ async fn trigger_reload(url: &str) -> anyhow::Result<()> {
 
 // ———————— 纯函数（单元测试覆盖） ————————
 
+/// migrate 的结果：迁移行数与原文件备份路径（no-op 时均空）。
+struct MigrateReport {
+    migrated: usize,
+    backup: Option<PathBuf>,
+}
+
+/// 旧宽表 account.csv → 新 7 列格式：逐行按 exchange 拼 credentials JSON，
+/// `--key` 提供时整串 `encrypt_if_plaintext` 加密；原文件备份 `.bak` 后
+/// 原子回写。已是新格式（表头无 api_key 列）→ no-op。文件不存在报错。
+fn migrate_csv(path: &Path, cipher: Option<&SecretCipher>) -> anyhow::Result<MigrateReport> {
+    if !path.exists() {
+        anyhow::bail!("account.csv 不存在：{}", path.display());
+    }
+    let (headers, rows) = read_csv_or_header(path, &ACCOUNT_CSV_HEADER)?;
+    let name_idx = headers
+        .iter()
+        .position(|h| h.trim() == "name")
+        .ok_or_else(|| anyhow::anyhow!("CSV 缺少 name 列"))?;
+    if !headers.iter().any(|h| h.trim() == "api_key") {
+        // 新格式（或空表）：无需迁移，也不做任何写动作。
+        return Ok(MigrateReport {
+            migrated: 0,
+            backup: None,
+        });
+    }
+
+    let mut new_rows: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let name = row
+            .get(name_idx)
+            .cloned()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            tracing::warn!("跳过缺少 name 的账户行");
+            continue;
+        }
+        let exchange = col_of(&headers, row, "exchange").unwrap_or_default();
+        let plain_json = legacy_row_credentials_json(cipher, &name, &headers, row)?;
+        // 整串归一化为密文（无 key 时保留明文，由调用方口径负责告警）。
+        let stored = match cipher {
+            Some(c) => c.encrypt_if_plaintext(&plain_json)?.0,
+            None => plain_json,
+        };
+        let updated_at = col_of(&headers, row, "updated_at")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        new_rows.push(
+            build_account_row(
+                &ACCOUNT_CSV_HEADER,
+                &AccountRowInput {
+                    name: &name,
+                    exchange: &exchange,
+                    credentials: &stored,
+                    updated_at,
+                },
+            )
+            .map_err(anyhow::Error::msg)?,
+        );
+    }
+
+    // 备份原文件 → 原子回写新 7 列 CSV。
+    let backup = path.with_extension("csv.bak");
+    std::fs::copy(path, &backup).with_context(|| format!("备份原文件失败 {}", path.display()))?;
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer.write_record(ACCOUNT_CSV_HEADER.iter())?;
+    for row in &new_rows {
+        writer.write_record(row.iter())?;
+    }
+    write_csv_atomic(path, &writer.into_inner()?)?;
+    Ok(MigrateReport {
+        migrated: new_rows.len(),
+        backup: Some(backup),
+    })
+}
+
+/// 按表头名取某列值（trim 后）。
+fn col_of(headers: &csv::StringRecord, row: &[String], col: &str) -> Option<String> {
+    headers
+        .iter()
+        .position(|h| h.trim() == col)
+        .and_then(|i| row.get(i))
+        .map(|v| v.trim().to_string())
+}
+
+/// 旧宽表行 → credentials JSON 明文（migrate 专用；映射口径与原 store 兼容层
+/// 一致）。CTP 行：`api_key`=user_id、`api_passphrase`=password（`api_secret`
+/// 空置）；REST 所三列直取。旧 `api_secret` 列若已是 `enc.v1.` 密文，
+/// 无主密钥时报错——JSON 内不存密文，整串由调用方统一加密。
+fn legacy_row_credentials_json(
+    cipher: Option<&SecretCipher>,
+    name: &str,
+    headers: &csv::StringRecord,
+    row: &[String],
+) -> anyhow::Result<String> {
+    let val = |k: &str| col_of(headers, row, k).unwrap_or_default();
+    if val("exchange").trim() == "ctp" {
+        let creds = trading_exchange::port::CtpCreds {
+            broker_id: val("broker_id"),
+            user_id: val("api_key"),
+            password: val("api_passphrase"),
+            app_id: val("app_id"),
+            auth_code: val("auth_code"),
+            investor_id: val("investor_id"),
+            front_address: val("front_address"),
+            is_production_mode: legacy_parse_bool(&val("ctp_production_mode")),
+        };
+        Ok(serde_json::to_string(&creds)?)
+    } else {
+        let raw_secret = val("api_secret");
+        let api_secret = match cipher {
+            Some(c) => c.decrypt(&raw_secret)?,
+            None if raw_secret.starts_with(trading_models::account::SECRET_PREFIX) => {
+                anyhow::bail!("账户 `{name}` 的旧 api_secret 列已是密文：迁移需要 --key 提供主密钥")
+            }
+            None => raw_secret,
+        };
+        let passphrase = val("api_passphrase");
+        let passphrase = passphrase.trim();
+        let creds = trading_exchange::port::ApiSecretCreds {
+            api_key: val("api_key"),
+            api_secret,
+            api_passphrase: (!passphrase.is_empty()).then(|| passphrase.to_string()),
+            position_mode: legacy_parse_position_mode(&val("position_mode")),
+            is_testnet: legacy_parse_bool(&val("is_testnet")),
+        };
+        Ok(serde_json::to_string(&creds)?)
+    }
+}
+
+/// 旧宽表 position_mode 列宽松解析（与原 store 兼容层同口径）；非法/缺省 one_way。
+fn legacy_parse_position_mode(raw: &str) -> trading_models::PositionMode {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "hedge" | "dual" | "true" | "1" => trading_models::PositionMode::Hedge,
+        _ => trading_models::PositionMode::OneWay,
+    }
+}
+
+/// 旧宽表布尔列解析：1/true 为真，其余为假。
+fn legacy_parse_bool(raw: &str) -> bool {
+    matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true")
+}
+
 /// add-account 的行输入（集中传参，便于纯函数测试）。
 struct AccountRowInput<'a> {
     name: &'a str,
     exchange: &'a str,
-    api_key: &'a str,
-    api_secret: &'a str,
-    api_passphrase: Option<&'a str>,
-    position_mode: &'a str,
-    is_testnet: bool,
+    /// credentials 整串（密文 `enc.v1.*` 或联调明文 JSON）。
+    credentials: &'a str,
     updated_at: u64,
 }
 
@@ -524,17 +629,16 @@ fn build_account_row(headers: &[&str], input: &AccountRowInput<'_>) -> Result<Ve
     if input.exchange.trim().is_empty() {
         return Err("交易所（--exchange）不能为空".to_string());
     }
+    if input.credentials.trim().is_empty() {
+        return Err("credentials JSON 不能为空".to_string());
+    }
     let mut row = vec![String::new(); headers.len()];
     for (i, h) in headers.iter().enumerate() {
         row[i] = match *h {
             "id" => "0".to_string(),
             "name" => input.name.trim().to_string(),
             "exchange" => input.exchange.trim().to_string(),
-            "api_key" => input.api_key.trim().to_string(),
-            "api_secret" => input.api_secret.to_string(),
-            "api_passphrase" => input.api_passphrase.unwrap_or("").to_string(),
-            "position_mode" => input.position_mode.to_string(),
-            "is_testnet" => (input.is_testnet as u8).to_string(),
+            "credentials" => input.credentials.to_string(),
             "deleted" => "0".to_string(),
             "created_at" => "0".to_string(),
             "updated_at" => input.updated_at.to_string(),
@@ -542,15 +646,6 @@ fn build_account_row(headers: &[&str], input: &AccountRowInput<'_>) -> Result<Ve
         };
     }
     Ok(row)
-}
-
-/// position_mode 宽松归一（与服务端 parse_position_mode 同口径）。
-fn normalize_position_mode(raw: &str) -> Option<&'static str> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "one_way" | "oneway" | "one-way" | "" => Some("one_way"),
-        "hedge" | "dual" => Some("hedge"),
-        _ => None,
-    }
 }
 
 /// 读 CSV 返回 (表头, 行集合)；文件不存在时用标准表头建空表。
@@ -637,7 +732,7 @@ fn load_cipher(path: &Path) -> anyhow::Result<SecretCipher> {
 mod tests {
     use super::*;
 
-    const HEADER: [&str; 11] = ACCOUNT_CSV_HEADER;
+    const HEADER: [&str; 7] = ACCOUNT_CSV_HEADER;
 
     #[test]
     fn default_data_dir_priority() {
@@ -658,17 +753,20 @@ mod tests {
         assert_eq!(default_data_dir(), fallback);
     }
 
-    fn sample_row(name: &str, secret: &str) -> Vec<String> {
+    #[test]
+    fn tool_header_matches_model_header() {
+        // 工具写入的表头必须与服务端模型常量逐列一致。
+        let model: Vec<&str> = trading_models::ACCOUNT_CSV_HEADER.split(',').collect();
+        assert_eq!(HEADER.to_vec(), model);
+    }
+
+    fn sample_row(name: &str, credentials: &str) -> Vec<String> {
         build_account_row(
             &HEADER,
             &AccountRowInput {
                 name,
                 exchange: "binance",
-                api_key: "KEY",
-                api_secret: secret,
-                api_passphrase: None,
-                position_mode: "one_way",
-                is_testnet: false,
+                credentials,
                 updated_at: 0,
             },
         )
@@ -684,38 +782,59 @@ mod tests {
             row[i].clone()
         };
         assert_eq!(get("name"), "acct_a");
-        assert_eq!(get("api_secret"), "enc.v1.x");
-        assert_eq!(get("is_testnet"), "0");
+        assert_eq!(get("exchange"), "binance");
+        assert_eq!(get("credentials"), "enc.v1.x");
         assert_eq!(get("deleted"), "0");
         assert_eq!(get("id"), "0");
-        assert_eq!(get("position_mode"), "one_way");
+        assert_eq!(get("updated_at"), "0");
     }
 
     #[test]
-    fn empty_name_or_exchange_rejected() {
+    fn empty_name_exchange_or_credentials_rejected() {
         let err = build_account_row(
             &HEADER,
             &AccountRowInput {
                 name: "  ",
                 exchange: "binance",
-                api_key: "K",
-                api_secret: "s",
-                api_passphrase: None,
-                position_mode: "one_way",
-                is_testnet: false,
+                credentials: "enc.v1.x",
                 updated_at: 0,
             },
         )
         .unwrap_err();
         assert!(err.contains("--name"));
+
+        let err = build_account_row(
+            &HEADER,
+            &AccountRowInput {
+                name: "a",
+                exchange: "binance",
+                credentials: "  ",
+                updated_at: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("credentials"));
     }
 
     #[test]
-    fn position_mode_normalization() {
-        assert_eq!(normalize_position_mode("HEDGE"), Some("hedge"));
-        assert_eq!(normalize_position_mode(" dual "), Some("hedge"));
-        assert_eq!(normalize_position_mode(""), Some("one_way"));
-        assert_eq!(normalize_position_mode("xxx"), None);
+    fn credentials_template_has_two_variants() {
+        // CTP 与 REST 所模板各一段；CTP 模板含看穿式字段，REST 模板含 api_key。
+        assert!(credentials_template("ctp").contains("broker_id"));
+        assert!(credentials_template("CTP").contains("broker_id"));
+        assert!(credentials_template("binance").contains("api_key"));
+        assert!(credentials_template("deribit").contains("api_key"));
+    }
+
+    #[test]
+    fn credentials_json_validated_before_write() {
+        // 写入前按 exchange 做 schema 校验：合法 JSON 通过，非法 JSON/错 schema 报错。
+        let ok = r#"{"api_key":"k","api_secret":"s"}"#;
+        assert!(credential_from_json("binance", ok).is_ok());
+        assert!(credential_from_json("binance", "not-json").is_err());
+        let ctp_ok = r#"{"broker_id":"9999","user_id":"u","password":"p","app_id":"a","auth_code":"c","front_address":"tcp://f:1"}"#;
+        assert!(credential_from_json("ctp", ctp_ok).is_ok());
+        // CTP 行误用 REST schema → 报错（防错列写入）。
+        assert!(credential_from_json("ctp", ok).is_err());
     }
 
     #[test]
@@ -745,7 +864,7 @@ mod tests {
         )
         .is_err());
         assert_eq!(rows[0][1], "acct_a");
-        assert_eq!(rows[0][4], "enc.v1.old");
+        assert_eq!(rows[0][3], "enc.v1.old");
 
         // 同名 + --update → 整行替换。
         let replaced = upsert_row(
@@ -757,7 +876,7 @@ mod tests {
         )
         .unwrap();
         assert!(replaced);
-        assert_eq!(rows[0][4], "enc.v1.new");
+        assert_eq!(rows[0][3], "enc.v1.new");
     }
 
     #[test]
@@ -773,15 +892,202 @@ mod tests {
     }
 
     #[test]
+    fn legacy_row_credentials_json_binance_maps_columns() {
+        // Arrange：旧宽表 binance 行（明文 secret + hedge + 测试网 + passphrase）。
+        let headers = csv::StringRecord::from(vec![
+            "id",
+            "name",
+            "exchange",
+            "api_key",
+            "api_secret",
+            "api_passphrase",
+            "position_mode",
+            "is_testnet",
+            "deleted",
+            "created_at",
+            "updated_at",
+        ]);
+        let row: Vec<String> = [
+            "0", "alice", "binance", "KEY-A", "secret-a", "pp", "hedge", "1", "0", "0", "0",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let cipher = SecretCipher::from_key_bytes(&SecretCipher::random_key()).unwrap();
+
+        // Act
+        let json = legacy_row_credentials_json(Some(&cipher), "alice", &headers, &row).unwrap();
+
+        // Assert：按 ApiSecretCreds schema 解析且字段逐一就位。
+        let creds: trading_exchange::port::ApiSecretCreds = serde_json::from_str(&json).unwrap();
+        assert_eq!(creds.api_key, "KEY-A");
+        assert_eq!(creds.api_secret, "secret-a");
+        assert_eq!(creds.api_passphrase.as_deref(), Some("pp"));
+        assert_eq!(creds.position_mode, trading_models::PositionMode::Hedge);
+        assert!(creds.is_testnet);
+    }
+
+    #[test]
+    fn legacy_row_credentials_json_ctp_maps_columns() {
+        // Arrange：旧宽表 CTP 全字段行（api_key=user_id、api_passphrase=password）。
+        let headers = csv::StringRecord::from(vec![
+            "id",
+            "name",
+            "exchange",
+            "api_key",
+            "api_secret",
+            "api_passphrase",
+            "position_mode",
+            "is_testnet",
+            "broker_id",
+            "app_id",
+            "auth_code",
+            "investor_id",
+            "front_address",
+            "ctp_production_mode",
+            "deleted",
+            "created_at",
+            "updated_at",
+        ]);
+        let row: Vec<String> = [
+            "0",
+            "ctp-acct",
+            "ctp",
+            "user999",
+            "",
+            "pwd123",
+            "one_way",
+            "0",
+            "9999",
+            "simnow_client",
+            "0000000000000000",
+            "",
+            "tcp://182.254.243.31:40001",
+            "1",
+            "0",
+            "0",
+            "0",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // Act
+        let json = legacy_row_credentials_json(None, "ctp-acct", &headers, &row).unwrap();
+
+        // Assert：按 CtpCreds schema 解析且看穿式字段就位。
+        let creds: trading_exchange::port::CtpCreds = serde_json::from_str(&json).unwrap();
+        assert_eq!(creds.broker_id, "9999");
+        assert_eq!(creds.user_id, "user999");
+        assert_eq!(creds.password, "pwd123");
+        assert_eq!(creds.app_id, "simnow_client");
+        assert_eq!(creds.auth_code, "0000000000000000");
+        assert_eq!(creds.front_address, "tcp://182.254.243.31:40001");
+        assert!(creds.is_production_mode);
+    }
+
+    #[test]
+    fn legacy_row_encrypted_secret_requires_key() {
+        // Arrange：旧 api_secret 列已是 enc.v1. 密文。
+        let headers = csv::StringRecord::from(vec![
+            "id",
+            "name",
+            "exchange",
+            "api_key",
+            "api_secret",
+            "api_passphrase",
+            "position_mode",
+            "is_testnet",
+            "deleted",
+            "created_at",
+            "updated_at",
+        ]);
+        let cipher = SecretCipher::from_key_bytes(&SecretCipher::random_key()).unwrap();
+        let enc = cipher.encrypt("topsecret").unwrap();
+        let mk_row = |secret: &str| -> Vec<String> {
+            [
+                "0", "carol", "binance", "K", secret, "", "one_way", "0", "0", "0", "0",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+        };
+
+        // Act / Assert：无 --key → 报错要求主密钥；有 key → 解出明文。
+        assert!(legacy_row_credentials_json(None, "carol", &headers, &mk_row(&enc)).is_err());
+        let json =
+            legacy_row_credentials_json(Some(&cipher), "carol", &headers, &mk_row(&enc)).unwrap();
+        let creds: trading_exchange::port::ApiSecretCreds = serde_json::from_str(&json).unwrap();
+        assert_eq!(creds.api_secret, "topsecret");
+    }
+
+    #[test]
+    fn migrate_csv_rewrites_with_backup_and_roundtrip() {
+        // Arrange：旧宽表 CSV（binance + deribit 两行），密钥已备。
+        let dir = std::env::temp_dir().join(format!("acct_mig_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("account.csv");
+        let cipher = SecretCipher::from_key_bytes(&SecretCipher::random_key()).unwrap();
+        let old = "id,name,exchange,api_key,api_secret,api_passphrase,position_mode,is_testnet,deleted,created_at,updated_at\n\
+                   0,alice,binance,KEY-A,secret-a,,hedge,1,0,0,0\n\
+                   0,d Dex,deribit,DK,ds,,one_way,0,0,0,0\n";
+        std::fs::write(&path, old).unwrap();
+
+        // Act
+        let report = migrate_csv(&path, Some(&cipher)).unwrap();
+
+        // Assert：迁移 2 行 + 原文件完整备份 .bak。
+        assert_eq!(report.migrated, 2);
+        let backup = report.backup.expect("应有 .bak 备份");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), old);
+
+        // 新文件为 7 列且 credentials 已整串加密，可解回原字段。
+        let (headers, rows) = read_csv_or_header(&path, &HEADER).unwrap();
+        assert_eq!(headers.len(), 7);
+        assert_eq!(rows.len(), 2);
+        let name_idx = headers.iter().position(|h| h.trim() == "name").unwrap();
+        let cred_idx = headers
+            .iter()
+            .position(|h| h.trim() == "credentials")
+            .unwrap();
+        let mut names: Vec<&str> = rows.iter().map(|r| r[name_idx].as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["alice", "d Dex"]);
+        for row in &rows {
+            let stored = &row[cred_idx];
+            assert!(stored.starts_with(trading_models::account::SECRET_PREFIX));
+            let plain = cipher.decrypt(stored).unwrap();
+            serde_json::from_str::<trading_exchange::port::ApiSecretCreds>(&plain).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_csv_noop_for_new_format() {
+        // Arrange：已是新 7 列格式的文件。
+        let dir = std::env::temp_dir().join(format!("acct_mig_new_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("account.csv");
+        let before = format!("{}\n0,alice,binance,enc.v1.x,0,0,0\n", HEADER.join(","));
+        std::fs::write(&path, &before).unwrap();
+
+        // Act
+        let report = migrate_csv(&path, None).unwrap();
+
+        // Assert：no-op（不迁移、不备份、原文件不动）。
+        assert_eq!(report.migrated, 0);
+        assert!(report.backup.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn read_missing_csv_yields_default_header() {
         let dir = std::env::temp_dir().join(format!("acct_tool_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("missing.csv");
         let (headers, rows) = read_csv_or_header(&path, &HEADER).unwrap();
-        assert_eq!(
-            headers.iter().collect::<Vec<_>>(),
-            HEADER.iter().copied().collect::<Vec<_>>()
-        );
+        assert_eq!(headers.iter().collect::<Vec<_>>(), HEADER.to_vec());
         assert!(rows.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -795,8 +1101,14 @@ mod tests {
         let headers = csv::StringRecord::from(HEADER.to_vec());
         let mut writer = csv::Writer::from_writer(Vec::new());
         writer.write_record(headers.iter()).unwrap();
-        for r in [sample_row("a", "enc.v1.1"), sample_row("b", "enc.v1.2")] {
-            writer.write_record(r.iter()).unwrap();
+        // credentials 为含逗号/引号的 JSON（csv writer 自动引号转义）。
+        let json_a = r#"{"api_key":"k1","api_secret":"s1"}"#;
+        let json_b = r#"{"broker_id":"9999","user_id":"u","password":"p","app_id":"a","auth_code":"c","front_address":"tcp://f:1"}"#;
+        for (n, c) in [
+            ("a", format!("enc.v1.{json_a}")),
+            ("b", format!("enc.v1.{json_b}")),
+        ] {
+            writer.write_record(sample_row(n, &c).iter()).unwrap();
         }
         write_csv_atomic(&path, &writer.into_inner().unwrap()).unwrap();
 
@@ -810,7 +1122,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(rows[0][4], "enc.v1.updated");
+        assert_eq!(rows[0][3], "enc.v1.updated");
         assert_eq!(rows.len(), 2);
 
         // 权限 0600（unix）。

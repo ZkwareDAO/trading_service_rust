@@ -46,12 +46,24 @@ impl CachedClient {
     fn new(rest: Arc<RestApi>, cred: &ExchangeCredential) -> Self {
         Self {
             rest,
-            fingerprint: (cred.api_key.clone(), cred.api_secret.clone()),
+            fingerprint: Self::fingerprint_of(cred),
         }
     }
 
     fn matches(&self, cred: &ExchangeCredential) -> bool {
-        self.fingerprint == (cred.api_key.clone(), cred.api_secret.clone())
+        self.fingerprint == Self::fingerprint_of(cred)
+    }
+
+    /// 缓存指纹：恒为 ApiSecret 形态（binance 只会缓存自己构造的 client）。
+    fn fingerprint_of(cred: &ExchangeCredential) -> (String, String) {
+        match cred {
+            ExchangeCredential::ApiSecret {
+                api_key,
+                api_secret,
+                ..
+            } => (api_key.clone(), api_secret.clone()),
+            ExchangeCredential::Ctp { .. } => (String::new(), String::new()),
+        }
     }
 }
 
@@ -77,14 +89,24 @@ impl BinanceFuturesClientCache {
         opts: BinanceFuturesOptions,
     ) -> anyhow::Result<Arc<RestApi>> {
         let key = (account.to_string(), opts.testnet);
+        let (api_key, api_secret) = match cred {
+            ExchangeCredential::ApiSecret {
+                api_key,
+                api_secret,
+                ..
+            } => (api_key.clone(), api_secret.clone()),
+            ExchangeCredential::Ctp { .. } => {
+                anyhow::bail!("binance 凭证形态错误：应为 ApiSecret")
+            }
+        };
         if let Some(existing) = self.inner.get(&key) {
             if existing.matches(cred) {
                 return Ok(Arc::clone(&existing.rest));
             }
         }
         let conf = ConfigurationRestApi::builder()
-            .api_key(cred.api_key.clone())
-            .api_secret(cred.api_secret.clone())
+            .api_key(api_key)
+            .api_secret(api_secret)
             // 请求超时与宿主 rest_timeout 一致：SDK 默认 1000ms 对实际下单/
             // get_positions 过短，会让长请求卡死、拉不到真值。
             .timeout(opts.timeout_ms.max(1))
@@ -114,7 +136,7 @@ mod tests {
     use trading_models::PositionMode;
 
     fn cred_full(api_key: &str, api_secret: &str, is_testnet: bool) -> ExchangeCredential {
-        ExchangeCredential {
+        ExchangeCredential::ApiSecret {
             api_key: api_key.to_string(),
             api_secret: api_secret.to_string(),
             api_passphrase: None,

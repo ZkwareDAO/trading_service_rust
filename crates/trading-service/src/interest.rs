@@ -29,6 +29,7 @@ fn venue_of(exchange: &str, itype: InstrumentType) -> Option<(Venue, MarketKind)
         ("binance", InstrumentType::Futures) => Some((Venue::BinanceFutures, MarketKind::Futures)),
         ("binance", InstrumentType::Spot) => Some((Venue::BinanceSpot, MarketKind::Spot)),
         ("hyperliquid", InstrumentType::Futures) => Some((Venue::Hyperliquid, MarketKind::Futures)),
+        ("ctp", InstrumentType::Futures) => Some((Venue::Ctp, MarketKind::Futures)),
         _ => None,
     }
 }
@@ -125,6 +126,8 @@ fn is_native_symbol(venue: Venue, kind: MarketKind, symbol: &str) -> bool {
         // Hyperliquid：原生为裸币名（BTC）。USDT 后缀属币安符号→异常；
         // USDC 后缀（内部统一名）与裸币放行，宁可保留也不误删；空符号异常。
         (Venue::Hyperliquid, MarketKind::Futures) => !s.is_empty() && !s.ends_with("USDT"),
+        // CTP：合约号字母数字组合（rb2510 / IF2412），无分隔符约束，放行非空即可。
+        (Venue::Ctp, MarketKind::Futures) => !s.is_empty(),
         // binance / 未知所：默认放行。
         _ => true,
     }

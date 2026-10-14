@@ -141,6 +141,9 @@ impl AppState {
             venue: venue.deribit,
             hyperliquid: venue.hyperliquid,
             market_interest: Some(Arc::clone(&market_interest)),
+            // CTP 运行参数：venue.toml [ctp] 段（venue_config 已回退 vendored 缺省）。
+            #[cfg(feature = "ctp")]
+            ctp: venue.ctp.clone(),
         };
         let exchanges = Arc::new(ExchangeRegistry::builtin(provider_deps));
         // 启动自检（fail-fast）：汇总各 provider 自描述的仓位档案装入引擎并校验，

@@ -11,10 +11,27 @@
 #       （同一 symbol 每 60s 最多发送一次）。
 close_spread_max = "0.005"
 
+# 市价开仓的「档位漂移」：以 mark 为基准、向有利方向漂移 N 个 tick
+# （买低 N tick / 卖高 N tick）挂限价被动单。限价开仓不使用此项。
+open_drift_ticks = 5
+
 [hyperliquid]
 # 市价单（IOC）相对中间价 mid 的滑点比率；0.05=5%。该段或字段缺失时缺省 0.05。
 slippage = "0.05"
 
-# 市价开仓的「档位漂移」：以 mark 为基准、向有利方向漂移 N 个 tick
-# （买低 N tick / 卖高 N tick）挂限价被动单。限价开仓不使用此项。
-open_drift_ticks = 5
+# ---- CTP 国内期货（feature="ctp" 编译时生效）----
+[ctp]
+# 柜台交易/行情 API 动态库路径；缺省用仓库内 vendored v6.7.13 linux64。
+# trader_so = "/path/to/thosttraderapi_se.so"
+# md_so = "/path/to/thostmduserapi_se.so"
+# 流文件目录（柜台 API 流水文件落盘处）；缺省系统临时目录。
+# flow_path = "/var/lib/trading-service/ctp-flow"
+# 前置环境开关（生产/仿真）已下沉账户级：account.csv credentials JSON 的 is_production_mode。
+# 行情前置（交易/行情端口分离；空则不启动 CTP 行情线程）。
+md_front = "tcp://101.226.250.133:42213"
+# 行情登录用账户名（account.csv 中的 name；交易所级行情不随用户区分）。
+md_account = "ctp-simnow"
+# 行情登录形态：匿名（标准 CTP 行情前置形态，BrokerID/UserID/Password 全空）。
+md_anon = false
+# 行情密码填认证码（部分柜台行情鉴权形态；与 md_anon 二选一）。
+md_pass_is_authcode = false

@@ -368,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn order_query_by_cid_falls_back_to_history() {
         // Arrange：内存无此单，历史日 CSV 里有。
-        let app = app_with_accounts("1,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("1,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let router = crate::api::router().with_state(app.state.clone());
         let cid = "0x000000000000000000000000000000aa";
         write_history_csv(
@@ -391,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn order_query_by_signal_falls_back_to_history() {
         // Arrange：内存无此单，历史日 CSV 里按 (strategy, signal) 可定位。
-        let app = app_with_accounts("1,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("1,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let router = crate::api::router().with_state(app.state.clone());
         let cid = "0x000000000000000000000000000000ab";
         let mut o = historical_order(cid, 9);
@@ -415,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn position_get_by_id_falls_back_to_history() {
         // Arrange：持仓只存在历史日、已软平。
-        let app = app_with_accounts("1,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("1,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let router = crate::api::router().with_state(app.state.clone());
         let mut p = Position::new(1, "binance", "BTCUSDT", Side::Buy);
         p.id = 13;
@@ -432,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn rule_query_by_id_falls_back_to_history() {
         // Arrange：规则只存历史日、已 retired。
-        let app = app_with_accounts("1,test_binance,binance,K,s,,one_way,0,0,0,0\n").await;
+        let app = app_with_accounts("1,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
         let router = crate::api::router().with_state(app.state.clone());
         let mut r = WatchRule::new_risk(
             1,
