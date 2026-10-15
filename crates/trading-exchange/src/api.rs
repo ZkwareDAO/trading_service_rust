@@ -53,6 +53,20 @@ impl OrderRef {
         self.exchange_order_id = Some(exchange_order_id.into());
         self
     }
+
+    /// 从内存订单行统一构造撤单/查单引用：cid 必带；若订单已有受理后的
+    /// 交易所单号（重启后定位的真相源）则一并装入。
+    ///
+    /// 宿主只把已知的号都放进 [`OrderRef`]，**用哪个号路由由各适配器内部
+    /// 决定**（CTP 同会话走 OrderRef 三元组、重启后走 OrderSysID+ExchangeID；
+    /// Binance 首选 cid、eid 兜底），宿主不写任何 `if exchange == ...` 分支。
+    pub fn from_order(order: &trading_models::Order) -> Self {
+        let mut r#ref = Self::new(order.client_order_id.clone());
+        if let Some(eid) = order.exchange_order_id.clone() {
+            r#ref = r#ref.with_exchange(eid);
+        }
+        r#ref
+    }
 }
 
 /// 逐单的持仓方向（仅 hedge 模式下显式发送；单向持仓用 [`OrderPositionSide::Both`]）。
@@ -386,6 +400,36 @@ pub trait MarketDataStream: Send + Sync {
 /// 需要完整能力（交易 + 账户事件回报）处使用的组合约束。
 pub trait UserVenue: ExchangeApi + AccountEventStream {}
 impl<T: ExchangeApi + AccountEventStream> UserVenue for T {}
+
+#[cfg(test)]
+mod order_ref_tests {
+    use super::OrderRef;
+    use trading_models::{Order, Side};
+
+    fn order_with(eid: Option<String>) -> Order {
+        let mut o = Order::new(1, "0xabc", "ctp", "rb2510", Side::Buy);
+        o.exchange_order_id = eid;
+        o
+    }
+
+    #[test]
+    fn from_order_carries_cid_always() {
+        // Arrange / Act：无交易所单号。
+        let r = OrderRef::from_order(&order_with(None));
+        // Assert：cid 必带，eid 缺省为 None。
+        assert_eq!(r.client_order_id, "0xabc");
+        assert_eq!(r.exchange_order_id, None);
+    }
+
+    #[test]
+    fn from_order_includes_exchange_id_when_present() {
+        // Arrange / Act：受理后已有交易所单号。
+        let r = OrderRef::from_order(&order_with(Some("20260101-7".into())));
+        // Assert：cid + eid 一并装入，供适配器内部单号路由。
+        assert_eq!(r.client_order_id, "0xabc");
+        assert_eq!(r.exchange_order_id.as_deref(), Some("20260101-7"));
+    }
+}
 
 #[cfg(test)]
 mod preflight_tests {

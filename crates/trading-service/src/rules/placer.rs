@@ -158,7 +158,9 @@ impl RuleOrderQuerier for ExchangeRuleOrderQuerier {
                 return OrderLookup::Unavailable;
             }
         };
-        let order_ref = OrderRef::new(order.client_order_id.clone());
+        // 单号路由是适配器内部职责：cid 必带，已知 eid 一并装入（重启后 CTP
+        // registry 为空时，兜底查单可凭 eid=OrderSysID 收敛），与撤单同范式。
+        let order_ref = OrderRef::from_order(order);
         let outcome = adapter.query_order(&order.instrument, &order_ref).await;
         if matches!(outcome, OrderLookup::Unavailable) {
             tracing::warn!(cid = %order.client_order_id, "rule order REST query unavailable");

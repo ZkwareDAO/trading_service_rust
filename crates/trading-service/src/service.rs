@@ -466,12 +466,9 @@ pub(crate) async fn submit_cancel_core(
     let instrument = order.instrument.clone();
     let connect_type = connect_hint(order.instrument_type);
     let account = input.account.unwrap_or_else(|| "default".to_string());
-    // 撤单统一以客户单号 cid 为准（调用方只传 cid 即可撤）；cid 必然存在。
-    // 交易所单号仅作适配器内部首选失败时的兜底（各 venue 路由自己决定）。
-    let mut order_ref = OrderRef::new(client_order_id.clone());
-    if let Some(exch_id) = order.exchange_order_id.clone() {
-        order_ref = order_ref.with_exchange(exch_id);
-    }
+    // 撤单统一以客户单号 cid 为准（cid 必带）；已知 eid 一并装入，由各适配器
+    // 内部决定首选/兜底单号（宿主不写交易所分支），与规则兜底查单同范式。
+    let order_ref = OrderRef::from_order(&order);
     let returned = order.clone();
 
     tokio::spawn(async move {
