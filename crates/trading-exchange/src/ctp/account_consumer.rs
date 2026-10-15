@@ -7,7 +7,8 @@ use std::time::Duration;
 use dashmap::DashMap;
 
 use crate::ctp::core::account::CtpAccount;
-use crate::ctp::mailbox::InsertMailbox;
+use crate::ctp::exchange_dir::ExchangeDir;
+use crate::ctp::mailbox::SessionMailbox;
 use crate::ctp::order_ref::OrderRefRegistry;
 use crate::ctp::venue::{
     run_session_loop, BridgeEvent, CtpUserHandle, EventContext, RequestFlags, SessionLoop,
@@ -28,8 +29,10 @@ pub struct AccountSession {
     pub shutdown: Arc<AtomicBool>,
     /// cid ↔ OrderRef 映射（本账户私有——多账户共享会串单）。
     pub order_refs: Arc<OrderRefRegistry>,
-    /// 下单请求信箱（本账户私有——共享会被别的账户会话线程取走串单）。
-    pub inserts: Arc<InsertMailbox>,
+    /// 会话请求信箱（下单/撤单/查询；本账户私有——共享会被别的账户线程取走串单）。
+    pub mailbox: Arc<SessionMailbox>,
+    /// 合约 → 交易所目录（本账户私有；跨会话撤单定位 ExchangeID，回报/重放预热）。
+    pub exchange_dir: Arc<ExchangeDir>,
 }
 
 /// 各账户当前会话注册表（**provider 级共享**，跨热加载存活）。
@@ -87,7 +90,8 @@ impl SessionRegistry {
         Arc::new(AccountSession {
             shutdown: Arc::new(AtomicBool::new(false)),
             order_refs: Arc::new(OrderRefRegistry::new()),
-            inserts: Arc::new(InsertMailbox::new()),
+            mailbox: Arc::new(SessionMailbox::new()),
+            exchange_dir: Arc::new(ExchangeDir::new()),
         })
     }
 }
@@ -185,7 +189,7 @@ impl CtpVenueConnector {
             session_epoch: Arc::new(AtomicU64::new(0)),
             shutdown,
             filled_by_sys_id: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            inserts: Arc::clone(&session.inserts),
+            mailbox: Arc::clone(&session.mailbox),
         });
         // 事件桥：有界队列 + 常驻消费任务（Sender 随会话线程退出而 drop）。
         let (tx, rx) = tokio::sync::mpsc::channel(1024);
@@ -215,6 +219,7 @@ impl CtpVenueConnector {
         let ctx = Arc::new(EventContext {
             account: account.to_string(),
             order_refs: Arc::clone(&session.order_refs),
+            exchange_dir: Arc::clone(&session.exchange_dir),
             tx,
             debouncer: Arc::new(Mutex::new(crate::reconcile::ReconcileDebouncer::new(
                 account_stream_millis(self.debounce),
@@ -268,14 +273,14 @@ mod tests {
         let a = reg.session("acctA");
         let b = reg.session("acctB");
 
-        // Assert：order_refs / inserts 每账户独立（CRITICAL 回归测试——
+        // Assert：order_refs / mailbox 每账户独立（CRITICAL 回归测试——
         // 曾为 provider 级单例，多账户会话线程互取信箱导致串单）。
         assert!(!std::sync::Arc::ptr_eq(&a.order_refs, &b.order_refs));
-        assert!(!std::sync::Arc::ptr_eq(&a.inserts, &b.inserts));
+        assert!(!std::sync::Arc::ptr_eq(&a.mailbox, &b.mailbox));
         // 同账户幂等：place_order 与会话线程拿到同一份。
         assert!(std::sync::Arc::ptr_eq(
-            &reg.session("acctA").inserts,
-            &a.inserts
+            &reg.session("acctA").mailbox,
+            &a.mailbox
         ));
     }
 

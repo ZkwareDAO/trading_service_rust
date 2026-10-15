@@ -184,8 +184,8 @@ pub struct CtpUserHandle {
     /// [`release_terminal_tables`]）；崩溃恢复不依赖本表——重连补快照的
     /// 委托回报自带柜台权威累计 `volume_traded`。
     pub(crate) filled_by_sys_id: Arc<Mutex<std::collections::HashMap<String, i64>>>,
-    /// 下单请求信箱（async 侧投递 → 本线程消费；provider 级共享）。
-    pub(crate) inserts: Arc<crate::ctp::mailbox::InsertMailbox>,
+    /// 会话请求信箱（下单/撤单/查询；async 侧投递 → 本线程消费；provider 级共享）。
+    pub(crate) mailbox: Arc<crate::ctp::mailbox::SessionMailbox>,
 }
 
 impl CtpUserHandle {
@@ -263,39 +263,176 @@ pub(crate) fn run_session_loop(
 /// * 订单/成交/持仓事件喂线程内去抖器（事件只当脏信号）。
 fn inner_loop(h: &mut TraderHandle, handle: &Arc<CtpUserHandle>, ctx: &EventContext) {
     use crate::ctp::core::event::CtpEvent;
-    // 持仓查询应答的线程内缓冲（QueryEnd 聚合，无锁无 channel）。
-    let mut position_buf: Vec<crate::ctp::core::event::PositionSnapshot> = Vec::new();
+    // 单在途查询闸门：None=空闲；Some=恰有一个查询待 QueryEnd（前台/后台四类互斥）。
+    let mut active: Option<ActiveQuery> = None;
     loop {
         if handle.shutdown.load(Ordering::SeqCst) {
             return;
         }
-        // 请求信箱（原子标志）在每次事件等待前检查：置位即串行执行。
-        if handle.flags.query_positions.swap(false, Ordering::SeqCst) {
-            h.query_positions();
+        // 每轮都服务请求：下单/撤单即使有查询在途也立即执行；后台查询与前台
+        // 查询的互斥由 issue_* 内部按 active 闸门 + 纯内核 plan_mailbox_drain 决定。
+        issue_background_or_mailbox(h, handle, ctx, &mut active);
+        match h.next_event(EVENT_POLL_TIMEOUT) {
+            // 断线：active 随 return drop，在途 oneshot 关闭，前台得 RecvError。
+            Some(CtpEvent::FrontDisconnected(_)) => return,
+            Some(ev) => dispatch_event(ev, handle, ctx, &mut active),
+            None => {
+                // 空闲且闸门空闲：去抖到点则触发后台持仓对账。
+                if active.is_none() && ctx.debouncer.lock().unwrap().poll(now_ms()).is_some() {
+                    issue_back_positions(h, &mut active);
+                }
+            }
         }
+    }
+}
+
+/// 当前唯一在途查询（单在途闸门的四态；前台 RPC 与后台对账共用，严格互斥）。
+/// 不派生 Debug：载荷含 oneshot::Sender。
+enum ActiveQuery {
+    /// 前台按需查单：缓冲当日委托行，QueryEnd 选定后回 OrderLookup。
+    FrontOrder {
+        /// 首选匹配值（OrderSysID / 受理态 OrderRef）。
+        exchange_order_id: String,
+        /// cid→registry 反查的 OrderRef 兜底。
+        hint: Option<String>,
+        /// 查询应答行缓冲。
+        rows: Vec<crate::ctp::core::event::OrderSnapshot>,
+        /// 三态结果回执（断线随枚举 drop 关闭 → 接收端 RecvError）。
+        reply: Option<tokio::sync::oneshot::Sender<crate::api::OrderLookup>>,
+    },
+    /// 前台按需查仓：映射后缓冲，QueryEnd 整批回执。
+    FrontPositions {
+        buf: Vec<crate::api::PositionInfo>,
+        reply: Option<tokio::sync::oneshot::Sender<anyhow::Result<Vec<crate::api::PositionInfo>>>>,
+    },
+    /// 后台委托重放（重连 query_orders("")）：查询行经订单桥恢复状态机并喂目录。
+    BackOrderReplay,
+    /// 后台持仓对账：原始持仓行缓冲，QueryEnd 聚合后经持仓桥。
+    BackPositions {
+        buf: Vec<crate::ctp::core::event::PositionSnapshot>,
+    },
+}
+
+/// 一轮"发起"调度：闸门空闲时后台脏标志（委托重放 → 持仓对账）优先；前台信箱
+/// **每轮**都经纯内核 [`plan_mailbox_drain`] 决策——下单/撤单即使有查询在途也
+/// 立即执行，仅前台查询受在途闸门约束（Defer 回塞队首）。任一查询受理码非 0
+/// （流控/未就绪）都不占位，下一轮重试。
+fn issue_background_or_mailbox(
+    h: &mut TraderHandle,
+    handle: &Arc<CtpUserHandle>,
+    ctx: &EventContext,
+    active: &mut Option<ActiveQuery>,
+) {
+    use crate::ctp::mailbox::{plan_mailbox_drain, MailboxAction};
+    // ①② 后台查询仅在闸门空闲时发起；在途时保留标志（不消费），下一轮再试。
+    if active.is_none() {
+        // ① 重连委托重放（优先，保证状态恢复先于持仓）。
         if handle.flags.query_orders.swap(false, Ordering::SeqCst) {
-            h.query_orders("");
+            if h.query_orders("") == 0 {
+                *active = Some(ActiveQuery::BackOrderReplay);
+            }
+            return;
         }
-        // 下单信箱：async 侧投递的待提交请求在本会话（已登录实例）内串行执行。
-        if let Some(p) = handle.inserts.take() {
+        // ② 去抖/全量持仓对账。
+        if handle.flags.query_positions.swap(false, Ordering::SeqCst) {
+            issue_back_positions(h, active);
+            return;
+        }
+    }
+    // ③ 前台信箱：传入真实在途状态，下单/撤单（Run）恒执行、查询按闸门 Issue/Defer。
+    match plan_mailbox_drain(handle.mailbox.take_next(), active.is_some()) {
+        MailboxAction::Run(req) => run_command(h, ctx, req),
+        MailboxAction::Issue(req) => issue_front_query(h, active, req),
+        MailboxAction::Defer(req) => handle.mailbox.requeue_front(req),
+        MailboxAction::Empty => {}
+    }
+}
+
+/// 立即执行非查询命令（下单/撤单）——不占 ActiveQuery、不被查询闸门阻塞。
+fn run_command(h: &mut TraderHandle, ctx: &EventContext, req: crate::ctp::mailbox::SessionRequest) {
+    use crate::ctp::mailbox::SessionRequest;
+    match req {
+        SessionRequest::Insert(p) => {
             // 受理码回执：校验/FFI 错误一并随 Result 传回 async 侧。
             let ret = h
                 .insert_order(&p.req, &p.order_ref)
                 .map_err(|e| anyhow::anyhow!("CTP 报单校验失败: {e}"));
             let _ = p.reply.send(ret);
         }
-        match h.next_event(EVENT_POLL_TIMEOUT) {
-            Some(CtpEvent::FrontDisconnected(_)) => return,
-            Some(ev) => dispatch_event(ev, handle, ctx, &mut position_buf),
-            None => {
-                // 空闲：去抖到点则触发持仓查询（定时全量兜底也由
-                // ReconcileDebouncer 的 full_interval 承担）。
-                let now = now_ms();
-                if let Some(_action) = ctx.debouncer.lock().unwrap().poll(now) {
-                    h.query_positions();
-                }
+        SessionRequest::Cancel(c) => {
+            // 撤单定位在线程内完成：三元组所需当前 FrontID/SessionID 只有会话状态掌握。
+            let resolved = resolve_cancel_target(
+                &ctx.order_refs,
+                &ctx.exchange_dir,
+                &c.instrument,
+                &c.order,
+                h.front_id(),
+                h.session_id(),
+            );
+            // 可观测证据：记录本次撤单实际寻址到的路由（本会话三元组 / 跨会话系统号）。
+            match &resolved {
+                Ok(target) => tracing::debug!(
+                    account = %ctx.account, cid = %c.order.client_order_id, route = ?target,
+                    "CTP 撤单寻址命中"
+                ),
+                Err(e) => tracing::warn!(
+                    account = %ctx.account, cid = %c.order.client_order_id, error = %e,
+                    "CTP 撤单寻址失败"
+                ),
+            }
+            let ret = resolved.map(|target| h.cancel_order(&c.instrument, &target));
+            let _ = c.reply.send(ret);
+        }
+        // 查询类走 issue_front_query，不会进入这里。
+        SessionRequest::QueryOrder(_) | SessionRequest::QueryPositions(_) => {}
+    }
+}
+
+/// 发起后台持仓对账；受理码非 0（流控/未就绪）不占位，下一轮重试。
+/// 调用方须保证当前无在途查询（active 为 None）。
+fn issue_back_positions(h: &mut TraderHandle, active: &mut Option<ActiveQuery>) {
+    if h.query_positions() == 0 {
+        *active = Some(ActiveQuery::BackPositions { buf: Vec::new() });
+    }
+}
+
+/// 发起前台查询并占位（受理码非 0 立即失败回执、不占位，下一轮可重试）。
+fn issue_front_query(
+    h: &mut TraderHandle,
+    active: &mut Option<ActiveQuery>,
+    req: crate::ctp::mailbox::SessionRequest,
+) {
+    use crate::ctp::mailbox::{QueryOrderJob, QueryPositionsJob, SessionRequest};
+    match req {
+        SessionRequest::QueryOrder(QueryOrderJob {
+            instrument,
+            exchange_order_id,
+            order_ref_hint,
+            reply,
+        }) => {
+            if h.query_orders(&instrument) == 0 {
+                *active = Some(ActiveQuery::FrontOrder {
+                    exchange_order_id,
+                    hint: order_ref_hint,
+                    rows: Vec::new(),
+                    reply: Some(reply),
+                });
+            } else {
+                // 流控/未就绪：查询本身失败 ≠ 订单不存在，回 Unavailable。
+                let _ = reply.send(crate::api::OrderLookup::Unavailable);
             }
         }
+        SessionRequest::QueryPositions(QueryPositionsJob { reply }) => {
+            if h.query_positions() == 0 {
+                *active = Some(ActiveQuery::FrontPositions {
+                    buf: Vec::new(),
+                    reply: Some(reply),
+                });
+            } else {
+                let _ = reply.send(Err(anyhow::anyhow!("CTP 持仓查询受理失败（流控/未就绪）")));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -317,8 +454,10 @@ pub(crate) enum BridgeEvent {
 /// 事件分发的共享上下文（事件桥发送端 + 去抖器），由连接器构造后传入线程。
 pub(crate) struct EventContext {
     pub account: String,
-    /// cid ↔ OrderRef 映射（回报反查长 cid；与下单短会话共享）。
+    /// cid ↔ OrderRef 映射（回报反查长 cid；撤单时 cid→OrderRef 反查也用它）。
     pub order_refs: Arc<crate::ctp::order_ref::OrderRefRegistry>,
+    /// 合约 → 交易所代码目录（委托回报/查询行喂入；跨会话撤单定位 ExchangeID）。
+    pub exchange_dir: Arc<crate::ctp::exchange_dir::ExchangeDir>,
     /// 事件桥发送端；随会话线程结束（EventContext drop）而关闭，消费任务随之退出。
     pub tx: tokio::sync::mpsc::Sender<BridgeEvent>,
     /// 线程内去抖器（复用跨所通用纯决策内核）。
@@ -367,37 +506,33 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 单事件分发：读到即推端口，无跨帧积压。
+/// 单事件分发：实时回报始终透传；查询行进在途闸门 [`ActiveQuery`] 的对应缓冲，
+/// `QueryEnd` 按前台 oneshot / 后台桥分流收尾。
 fn dispatch_event(
     ev: crate::ctp::core::event::CtpEvent,
     handle: &Arc<CtpUserHandle>,
     ctx: &EventContext,
-    position_buf: &mut Vec<crate::ctp::core::event::PositionSnapshot>,
+    active: &mut Option<ActiveQuery>,
 ) {
     use crate::ctp::core::event::CtpEvent;
     match ev {
+        // 实时委托回报：永远透传订单端口（即便有查询在途，也绝不被查询缓冲吞掉），
+        // 并顺手喂合约→交易所目录（跨会话撤单/将来 SHFE 路由复用，零额外请求）。
         CtpEvent::Order(s) => {
-            // 委托回报：映射后经事件桥投订单端口；同时喂脏信号。
-            let state = crate::ctp::mapping::order_state_from_snapshot(&s);
-            // 回报反查：OrderRef → 本地长 cid（未命中保留原值，宿主 fallback 兜底）。
-            let mut event = crate::translate::order_event(&state);
-            event.client_order_id = resolve_event_cid(ctx, &s.order_ref);
-            // 终态清理钩子：反查完成后回收两张会话表（cid↔OrderRef 映射与
-            // 成交累计），防会话内无限增长；迟到/重放回报经宿主 fallback 兜底。
-            release_terminal_tables(&ctx.order_refs, &handle.filled_by_sys_id, &s);
-            // 阻塞线程 → async 端口经有界队列投递（满则阻塞背压，不丢单）。
-            if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Order(Box::new(event))) {
-                tracing::warn!(account = %ctx.account, "事件桥已关闭，订单事件丢弃：{e}");
-            }
-            ctx.debouncer.lock().unwrap().note_dirty(
-                &crate::api::AccountDirty {
-                    instruments: vec![s.instrument.clone()],
-                },
-                now_ms(),
-            );
+            ctx.exchange_dir.remember(&s.instrument, &s.exchange_id);
+            forward_order_snapshot(ctx, handle, s);
         }
+        // 当日报单查询行：按在途闸门分流——前台查单缓冲，后台重放走订单桥。
+        CtpEvent::OrderQuery(s) => match active {
+            Some(ActiveQuery::FrontOrder { rows, .. }) => rows.push(s),
+            // 后台重放（或无在途查询的防御情形）：与实时回报同路径透传 + 喂目录。
+            _ => {
+                ctx.exchange_dir.remember(&s.instrument, &s.exchange_id);
+                forward_order_snapshot(ctx, handle, s);
+            }
+        },
         CtpEvent::Trade(t) => {
-            // 成交回报：按 OrderRef 累计成交量后推订单端口。
+            // 成交回报：按 OrderSysID 累计成交量后推订单端口。
             let key = t.order_sys_id.clone();
             let cum = {
                 let mut m = handle.filled_by_sys_id.lock().unwrap();
@@ -421,27 +556,100 @@ fn dispatch_event(
                 now_ms(),
             );
         }
-        CtpEvent::Position(p) => {
-            // 持仓应答逐条缓冲（数量为 0 的行也保留，由映射层过滤）。
-            position_buf.push(p);
+        CtpEvent::Position(p) => match active {
+            // 前台查仓：边映射边缓冲（数量为 0 的行由 mapper 过滤），QueryEnd 整批 oneshot。
+            Some(ActiveQuery::FrontPositions { buf, .. }) => {
+                if let Some(info) = crate::ctp::mapping::position_info_from_snapshot(&p) {
+                    buf.push(info);
+                }
+            }
+            // 后台对账：保留原始行，QueryEnd 聚合后经持仓桥。
+            Some(ActiveQuery::BackPositions { buf }) => buf.push(p),
+            // 无在途持仓查询却收到持仓行：不属于本轮，忽略（不污染任何缓冲）。
+            _ => tracing::debug!(account = %ctx.account, instrument = %p.instrument,
+                "收到无在途查询的持仓行，已忽略"),
+        },
+        CtpEvent::QueryEnd => finish_active_query(ctx, active),
+        CtpEvent::Error { code, msg } => {
+            // 报单拒/撤单异步拒绝（24/25/26 等）：终态以 on_rtn_order 为准，
+            // 此处仅中文 warn 可诊断（不据错误码臆测收敛订单状态）。
+            tracing::warn!(account = %ctx.account, code, %msg, "CTP 错误回报");
         }
-        CtpEvent::QueryEnd => {
-            // 一次查询收齐：聚合为快照经事件桥投仓位端口。
-            let positions: Vec<crate::api::PositionInfo> = position_buf
-                .drain(..)
-                .filter_map(|p| crate::ctp::mapping::position_info_from_snapshot(&p))
+        // 连接/登录/合约事件由会话状态机或后续规则同步处理。
+        _ => {}
+    }
+}
+
+/// 委托快照 → 订单端口（实时回报与后台重放共用同一路径）：映射、cid 反查、
+/// 终态表回收、事件桥投递、喂去抖脏信号。
+fn forward_order_snapshot(
+    ctx: &EventContext,
+    handle: &Arc<CtpUserHandle>,
+    s: crate::ctp::core::event::OrderSnapshot,
+) {
+    let state = crate::ctp::mapping::order_state_from_snapshot(&s);
+    // 回报反查：OrderRef → 本地长 cid（未命中保留原值，宿主 fallback 兜底）。
+    let mut event = crate::translate::order_event(&state);
+    event.client_order_id = resolve_event_cid(ctx, &s.order_ref);
+    // 终态清理钩子：反查完成后回收两张会话表（cid↔OrderRef 映射与成交累计），
+    // 防会话内无限增长；迟到/重放回报经宿主 fallback 兜底。
+    release_terminal_tables(&ctx.account, &ctx.order_refs, &handle.filled_by_sys_id, &s);
+    // 阻塞线程 → async 端口经有界队列投递（满则阻塞背压，不丢单）。
+    if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Order(Box::new(event))) {
+        tracing::warn!(account = %ctx.account, "事件桥已关闭，订单事件丢弃：{e}");
+    }
+    ctx.debouncer.lock().unwrap().note_dirty(
+        &crate::api::AccountDirty {
+            instruments: vec![s.instrument.clone()],
+        },
+        now_ms(),
+    );
+}
+
+/// 一次查询收齐（QueryEnd）：按在途查询种类前台 oneshot / 后台桥收尾，并清空闸门。
+fn finish_active_query(ctx: &EventContext, active: &mut Option<ActiveQuery>) {
+    let Some(current) = active.take() else {
+        return;
+    };
+    match current {
+        ActiveQuery::FrontOrder {
+            exchange_order_id,
+            hint,
+            rows,
+            reply,
+        } => {
+            // 纯匹配：系统号优先，其次受理态 OrderRef，再次 registry 反查 hint。
+            let lookup = match select_order(&rows, &exchange_order_id, hint.as_deref()) {
+                Some(s) => crate::api::OrderLookup::Found(
+                    crate::ctp::mapping::order_state_from_snapshot(s),
+                ),
+                // 空/不匹配/只查当日：一律 Unavailable，绝不判 NotExists（避免把
+                // UNKNOWN 单错误收敛成 REJECTED）。
+                None => crate::api::OrderLookup::Unavailable,
+            };
+            if let Some(reply) = reply {
+                let _ = reply.send(lookup);
+            }
+        }
+        ActiveQuery::FrontPositions { buf, reply } => {
+            // 合法空仓 = Ok(空)；断线场景由 Sender drop 传递，不在此伪造错误。
+            if let Some(reply) = reply {
+                let _ = reply.send(Ok(buf));
+            }
+        }
+        ActiveQuery::BackOrderReplay => {
+            // 重放行已在 OrderQuery 分支逐条透传订单桥，QueryEnd 仅释放闸门。
+        }
+        ActiveQuery::BackPositions { buf } => {
+            // 后台对账：聚合为快照经事件桥投仓位端口（与前台查仓同一 mapper）。
+            let positions: Vec<crate::api::PositionInfo> = buf
+                .iter()
+                .filter_map(crate::ctp::mapping::position_info_from_snapshot)
                 .collect();
             if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Positions(positions)) {
                 tracing::warn!(account = %ctx.account, "事件桥已关闭，持仓快照丢弃：{e}");
             }
         }
-        CtpEvent::Error { code, msg } => {
-            // 报单拒/错误回报：保守按 Unknown 推进（状态机等查单收敛），
-            // 仅记录日志（对应自检项"不确定错误保守 Indeterminate"）。
-            tracing::warn!(account = %ctx.account, code, %msg, "CTP 错误回报");
-        }
-        // 连接/登录/合约事件由会话状态机或后续规则同步处理。
-        _ => {}
     }
 }
 
@@ -450,6 +658,7 @@ fn dispatch_event(
 /// 两表均为"丢得起、可重建"的会话态：迟到/重放的回报经宿主
 /// `exchange_order_id` 回查 fallback 与补快照重放兜底，表不是真相源。
 fn release_terminal_tables(
+    account: &str,
     order_refs: &crate::ctp::order_ref::OrderRefRegistry,
     filled_by_sys_id: &Mutex<std::collections::HashMap<String, i64>>,
     s: &crate::ctp::core::event::OrderSnapshot,
@@ -459,8 +668,116 @@ fn release_terminal_tables(
     }
     // 映射表项的价值窗口 = 本单在途期间；终态之后留着是纯泄漏。
     // AllTraded 单必有成交累计表项；Cancelled 单多半缺席，remove 天然 no-op。
+    // 回收前先取证：该 OrderRef 是否确在 registry 中（回收后即不可反查）。
+    let present_before = order_refs.cid_of(&s.order_ref).is_some();
     order_refs.remove(&s.order_ref);
-    filled_by_sys_id.lock().unwrap().remove(&s.order_sys_id);
+    let present_after = order_refs.cid_of(&s.order_ref).is_some();
+    let filled_removed = filled_by_sys_id
+        .lock()
+        .unwrap()
+        .remove(&s.order_sys_id)
+        .is_some();
+    // 可观测证据：终态（Filled/Canceled）后回收本会话表项，给出 OrderRef/OrderSysID、
+    // 回收前后反查结果（true→false 证明 cid↔OrderRef 映射确已释放）与成交累计项是否移除。
+    tracing::debug!(
+        account, order_ref = %s.order_ref, order_sys_id = %s.order_sys_id.trim(),
+        ref_present_before = present_before, ref_present_after = present_after,
+        filled_acc_removed = filled_removed,
+        "CTP 终态回收：cid↔OrderRef 映射与成交累计表项已释放"
+    );
+}
+
+/// 撤单定位路由（纯函数；单号路由收口在适配器内，宿主不写 CTP 分支）。
+///
+/// 两路定位（与计划"重启后单号路由"定论一致）：
+/// 1. **本会话三元组**：cid 经 registry 反查到本会话自产 OrderRef →
+///    `FrontID+SessionID+OrderRef`（Front/Session 取线程当前 SessionState）；
+/// 2. **跨会话系统号**：registry 未命中（重启后表空）→ `ExchangeID+OrderSysID`，
+///    OrderSysID 取受理后升级的 `exchange_order_id`，ExchangeID 取 ExchangeDir 缓存。
+///
+/// 无法定位（无 eid 或 ExchangeDir 未预热）时返回错误——绝不凭猜测撤单。
+fn resolve_cancel_target(
+    registry: &crate::ctp::order_ref::OrderRefRegistry,
+    dir: &crate::ctp::exchange_dir::ExchangeDir,
+    instrument: &str,
+    order: &crate::api::OrderRef,
+    front_id: i32,
+    session_id: i32,
+) -> anyhow::Result<crate::ctp::mailbox::CancelTarget> {
+    use crate::ctp::mailbox::CancelTarget;
+    // ⓪ 入参防线：空合约绝不下发柜台（三元组不读目录，可能误装空 InstrumentID）。
+    if instrument.trim().is_empty() {
+        anyhow::bail!(
+            "CTP 撤单无法定位：instrument 为空（cid={}）",
+            order.client_order_id
+        );
+    }
+    // ① 本会话：cid 反查到自产 OrderRef → FrontID+SessionID+OrderRef 三元组。
+    if let Some(order_ref) = registry.order_ref_of_cid(&order.client_order_id) {
+        return Ok(CancelTarget::ByOrderRef {
+            front_id,
+            session_id,
+            order_ref,
+        });
+    }
+    // ② 跨会话（重启后 registry 为空）：必须有受理后升级的交易所系统号。
+    let Some(order_sys_id) = order.exchange_order_id.as_deref() else {
+        anyhow::bail!(
+            "CTP 撤单无法定位：cid={} 非本会话映射且缺少 exchange_order_id（OrderSysID）",
+            order.client_order_id
+        );
+    };
+    if order_sys_id.trim().is_empty() {
+        anyhow::bail!(
+            "CTP 撤单无法定位：exchange_order_id 为空（委托尚未取得 OrderSysID），instrument={instrument}"
+        );
+    }
+    // ExchangeID 取自会话态目录（重连重放/实时回报预热，零额外请求）。
+    let Some(exchange_id) = dir.get(instrument) else {
+        anyhow::bail!(
+            "CTP 撤单跨会话定位失败：instrument={instrument} 的交易所目录尚未预热，\
+             请待重连当日委托重放后重试"
+        );
+    };
+    Ok(CancelTarget::ByOrderSysId {
+        exchange_id,
+        order_sys_id: order_sys_id.trim().to_string(),
+    })
+}
+
+/// 查单行匹配（纯函数；柜台只支持按 InstrumentID 拉当日全部委托，客户端匹配）。
+///
+/// 全局优先级（先系统号、后 OrderRef）：
+/// 1. `order_sys_id == exchange_order_id`（首回报后/重启后的权威定位）；
+/// 2. `order_ref == exchange_order_id`（受理态：此时 eid 还是自产 OrderRef）；
+/// 3. `order_ref == order_ref_hint`（同进程 cid→registry 反查值）。
+///
+/// 查无（空/不匹配/只查当日）由调用方判 `Unavailable`，不判 NotExists。
+fn select_order<'a>(
+    rows: &'a [crate::ctp::core::event::OrderSnapshot],
+    exchange_order_id: &str,
+    order_ref_hint: Option<&str>,
+) -> Option<&'a crate::ctp::core::event::OrderSnapshot> {
+    use crate::ctp::core::event::OrderSnapshot;
+    // ① 系统号优先（受理后/重启后的权威定位）；空系统号不参与等值（eid 非空）。
+    let by_sys = |r: &&OrderSnapshot| {
+        !r.order_sys_id.trim().is_empty() && r.order_sys_id == exchange_order_id
+    };
+    if let Some(hit) = rows.iter().find(by_sys) {
+        return Some(hit);
+    }
+    // ② 受理态：eid 仍是自产 OrderRef（尚无系统号）。
+    if let Some(hit) = rows
+        .iter()
+        .find(|r| !r.order_ref.trim().is_empty() && r.order_ref == exchange_order_id)
+    {
+        return Some(hit);
+    }
+    // ③ 同进程：cid→registry 反查出的 OrderRef 兜底。
+    order_ref_hint.and_then(|hint| {
+        rows.iter()
+            .find(|r| !hint.trim().is_empty() && r.order_ref == hint)
+    })
 }
 
 #[cfg(test)]
@@ -486,7 +803,7 @@ mod tests {
 
     fn handle() -> Arc<CtpUserHandle> {
         Arc::new(CtpUserHandle {
-            inserts: Arc::new(crate::ctp::mailbox::InsertMailbox::new()),
+            mailbox: Arc::new(crate::ctp::mailbox::SessionMailbox::new()),
             account: "acct".into(),
             flags: Arc::new(RequestFlags::default()),
             session_epoch: Arc::new(AtomicU64::new(0)),
@@ -567,6 +884,7 @@ mod tests {
 
         // Act：全部成交（终态）——钩子回收两张表。
         release_terminal_tables(
+            "test",
             &refs,
             &filled,
             &snapshot(OrderStatus::AllTraded, &order_ref, sys_id),
@@ -595,6 +913,7 @@ mod tests {
 
         // Act：未成交排队回报——钩子不得误清。
         release_terminal_tables(
+            "test",
             &refs,
             &filled,
             &snapshot(OrderStatus::NoTradeQueueing, &order_ref, sys_id),
@@ -622,6 +941,7 @@ mod tests {
 
         // Act
         release_terminal_tables(
+            "test",
             &refs,
             &filled,
             &snapshot(OrderStatus::Cancelled, &order_ref, sys_id),
@@ -650,6 +970,383 @@ mod tests {
         );
         // Act / Assert：建连在边界校验即失败，不触碰 .so。
         assert!(session.connect_and_login().is_err());
+    }
+
+    // ---- 撤单定位路由 / 查单行匹配（纯函数）----
+
+    use crate::api::OrderRef;
+    use crate::ctp::exchange_dir::ExchangeDir;
+    use crate::ctp::mailbox::CancelTarget;
+
+    fn long_cid(tag: &str) -> String {
+        format!("0x{}", tag.repeat(32))
+    }
+
+    /// 构造查询行（仅路由相关字段参与匹配）。
+    fn qrow(order_ref: &str, sys_id: &str, exchange: &str, instrument: &str) -> OrderSnapshot {
+        OrderSnapshot {
+            order_ref: order_ref.into(),
+            instrument: instrument.into(),
+            exchange_id: exchange.into(),
+            order_sys_id: sys_id.into(),
+            insert_time: String::new(),
+            direction: Direction::Buy,
+            status: OrderStatus::NoTradeQueueing,
+            limit_price: 3500.0,
+            volume_total: 1,
+            volume_traded: 0,
+            status_msg: String::new(),
+            front_id: 0,
+            session_id: 0,
+        }
+    }
+
+    #[test]
+    fn cancel_routes_by_triple_when_registry_hits_this_session() {
+        // Arrange：长 cid 在本会话分配过 OrderRef；即使带了 eid 也优先三元组。
+        let registry = OrderRefRegistry::new();
+        let cid = long_cid("A");
+        let order_ref = registry.allocate(&cid);
+        let dir = ExchangeDir::new();
+        let order = OrderRef::new(cid.clone()).with_exchange("20260101-9");
+
+        // Act
+        let target = resolve_cancel_target(&registry, &dir, "rb2510", &order, 3, 9001).unwrap();
+
+        // Assert：本会话三元组，Front/Session 取当前会话。
+        assert_eq!(
+            target,
+            CancelTarget::ByOrderRef {
+                front_id: 3,
+                session_id: 9001,
+                order_ref,
+            }
+        );
+    }
+
+    #[test]
+    fn cancel_routes_by_sys_id_after_restart_when_registry_cold() {
+        // Arrange：重启后 registry 为空（cid 反查未命中），目录已预热该合约交易所。
+        let registry = OrderRefRegistry::new();
+        let dir = ExchangeDir::new();
+        dir.remember("rb2510", "SHFE");
+        let order = OrderRef::new(long_cid("R")).with_exchange("20260101-7");
+
+        // Act
+        let target = resolve_cancel_target(&registry, &dir, "rb2510", &order, 9, 9999).unwrap();
+
+        // Assert：跨会话走 ExchangeID+OrderSysID（旧 Front/Session 已失效但不用）。
+        assert_eq!(
+            target,
+            CancelTarget::ByOrderSysId {
+                exchange_id: "SHFE".into(),
+                order_sys_id: "20260101-7".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn cancel_errors_when_exchange_dir_not_warmed() {
+        // Arrange：registry 未命中且目录未预热（重放前就撤重启旧单）。
+        let registry = OrderRefRegistry::new();
+        let dir = ExchangeDir::new();
+        let order = OrderRef::new(long_cid("R")).with_exchange("20260101-7");
+
+        // Act / Assert：显式报错，绝不猜测 ExchangeID。
+        assert!(resolve_cancel_target(&registry, &dir, "rb2510", &order, 1, 1).is_err());
+    }
+
+    #[test]
+    fn cancel_errors_when_no_exchange_order_id_after_restart() {
+        // Arrange：registry 未命中（重启）且手里没有任何交易所单号（受理态孤儿）。
+        let registry = OrderRefRegistry::new();
+        let dir = ExchangeDir::new();
+        dir.remember("rb2510", "SHFE");
+        let order = OrderRef::new(long_cid("R"));
+
+        // Act / Assert：无法定位，报错而非猜测。
+        assert!(resolve_cancel_target(&registry, &dir, "rb2510", &order, 1, 1).is_err());
+    }
+
+    #[test]
+    fn cancel_errors_when_instrument_blank() {
+        // Arrange：即使 cid 在本会话映射命中（三元组不读目录），空合约也必须 fail-fast。
+        let registry = OrderRefRegistry::new();
+        let cid = long_cid("A");
+        let _ = registry.allocate(&cid);
+        let dir = ExchangeDir::new();
+        let order = OrderRef::new(cid);
+
+        // Act / Assert：空/纯空白 instrument 在装配柜台结构前即拒绝（两路都拦）。
+        assert!(resolve_cancel_target(&registry, &dir, "", &order, 1, 1).is_err());
+        assert!(resolve_cancel_target(&registry, &dir, "   ", &order, 1, 1).is_err());
+    }
+
+    #[test]
+    fn select_matches_by_order_sys_id_first() {
+        // Arrange：当日多行，目标行系统号 == eid（OrderRef 与 cid 完全不同）。
+        let rows = vec![
+            qrow("100", "20260101-1", "SHFE", "rb2510"),
+            qrow("101", "20260101-2", "SHFE", "rb2510"),
+        ];
+
+        // Act
+        let hit = select_order(&rows, "20260101-2", None).unwrap();
+
+        // Assert：按系统号命中正确行。
+        assert_eq!(hit.order_ref, "101");
+    }
+
+    #[test]
+    fn select_matches_by_order_ref_when_still_accepted_state() {
+        // Arrange：受理态尚无系统号（空），此时 eid 仍是自产 OrderRef。
+        let rows = vec![
+            qrow("100", "", "SHFE", "rb2510"),
+            qrow("101", "", "SHFE", "rb2510"),
+        ];
+
+        // Act / Assert：order_ref == eid 命中。
+        assert_eq!(select_order(&rows, "101", None).unwrap().order_sys_id, "");
+        assert_eq!(select_order(&rows, "101", None).unwrap().order_ref, "101");
+    }
+
+    #[test]
+    fn select_matches_by_registry_hint() {
+        // Arrange：同进程 cid→registry 反查出的 OrderRef 作 hint，eid 可能已升级。
+        let rows = vec![qrow("100", "20260101-1", "SHFE", "rb2510")];
+
+        // Act / Assert：eid 不匹配任何系统号时，回退用 hint 命中。
+        let hit = select_order(&rows, "0xdeadbeef", Some("100")).unwrap();
+        assert_eq!(hit.order_sys_id, "20260101-1");
+    }
+
+    #[test]
+    fn select_prefers_sys_id_over_ref_and_hint() {
+        // Arrange：构造一行 order_ref==eid（候选 2）且另一行 sys_id==eid（候选 1）。
+        let rows = vec![
+            qrow("777", "", "SHFE", "rb2510"),
+            qrow("777", "SAME", "DCE", "m2509"),
+        ];
+
+        // Act：eid 同时等于某行 order_ref 与另一行 sys_id——系统号优先。
+        let hit = select_order(&rows, "SAME", Some("777")).unwrap();
+
+        // Assert：命中系统号那一行（权威定位优先）。
+        assert_eq!(hit.order_sys_id, "SAME");
+        assert_eq!(hit.instrument, "m2509");
+    }
+
+    #[test]
+    fn select_returns_none_when_empty_or_no_match() {
+        // Arrange / Act / Assert：空结果或无匹配均为 None（调用方判 Unavailable，非 NotExists）。
+        assert!(select_order(&[], "x", None).is_none());
+        let rows = vec![qrow("100", "20260101-1", "SHFE", "rb2510")];
+        assert!(select_order(&rows, "nope", Some("other")).is_none());
+    }
+
+    // ---- ActiveQuery 单在途闸门：前台/后台分流、QueryEnd 收尾、断线回执 ----
+
+    use crate::ctp::core::event::{CtpEvent, PositionSnapshot};
+    use tokio::sync::mpsc;
+    use tokio::sync::oneshot::{error::TryRecvError, Receiver as OneRx};
+
+    /// 构造不触 FFI 的事件上下文 + 桥接收端。
+    fn ctx_and_rx() -> (Arc<EventContext>, mpsc::Receiver<BridgeEvent>) {
+        let (tx, rx) = mpsc::channel(16);
+        let ctx = Arc::new(EventContext {
+            account: "acct".into(),
+            order_refs: Arc::new(OrderRefRegistry::new()),
+            exchange_dir: Arc::new(ExchangeDir::new()),
+            tx,
+            debouncer: Arc::new(Mutex::new(crate::reconcile::ReconcileDebouncer::new(
+                500, 60_000,
+            ))),
+        });
+        (ctx, rx)
+    }
+
+    fn long_position() -> PositionSnapshot {
+        PositionSnapshot {
+            instrument: "rb2510".into(),
+            direction: '2',
+            position: 3,
+            yd_position: 1,
+            today_position: 2,
+            position_cost: 9615.0,
+            use_margin: 1000.0,
+            position_profit: 55.0,
+        }
+    }
+
+    fn front_order_active(
+        eid: &str,
+        hint: Option<&str>,
+    ) -> (Option<ActiveQuery>, OneRx<crate::api::OrderLookup>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (
+            Some(ActiveQuery::FrontOrder {
+                exchange_order_id: eid.into(),
+                hint: hint.map(str::to_string),
+                rows: Vec::new(),
+                reply: Some(tx),
+            }),
+            rx,
+        )
+    }
+
+    #[test]
+    fn front_order_buffers_query_rows_and_queryend_replies_found() {
+        // Arrange：前台查单在途，喂一行系统号匹配的查询行。
+        let (ctx, mut bridge_rx) = ctx_and_rx();
+        let h = handle();
+        let (mut active, mut lookup_rx) = front_order_active("20260101-2", None);
+        dispatch_event(
+            CtpEvent::OrderQuery(qrow("101", "20260101-2", "SHFE", "rb2510")),
+            &h,
+            &ctx,
+            &mut active,
+        );
+
+        // Act：QueryEnd 收尾。
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+
+        // Assert：查询行未泄漏到订单桥；oneshot 收到 Found 且闸门已清。
+        assert!(bridge_rx.try_recv().is_err(), "查询行不得透传订单桥");
+        match lookup_rx.try_recv() {
+            Ok(crate::api::OrderLookup::Found(st)) => {
+                assert_eq!(st.exchange_order_id.as_deref(), Some("20260101-2"))
+            }
+            other => panic!("期望 Found，实际 {other:?}"),
+        }
+        assert!(active.is_none(), "QueryEnd 必须清空在途闸门");
+    }
+
+    #[test]
+    fn front_order_no_match_replies_unavailable_not_notexists() {
+        // Arrange：查询返回的行无一匹配。
+        let (ctx, _rx) = ctx_and_rx();
+        let h = handle();
+        let (mut active, mut lookup_rx) = front_order_active("missing", None);
+        dispatch_event(
+            CtpEvent::OrderQuery(qrow("101", "20260101-9", "SHFE", "rb2510")),
+            &h,
+            &ctx,
+            &mut active,
+        );
+
+        // Act
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+
+        // Assert：查无 = Unavailable（绝不判 NotExists，避免把 UNKNOWN 收敛成 REJECTED）。
+        assert!(matches!(
+            lookup_rx.try_recv(),
+            Ok(crate::api::OrderLookup::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn front_positions_queryend_replies_mapped_batch() {
+        // Arrange：前台查仓在途，喂一条多头持仓行。
+        let (ctx, _rx) = ctx_and_rx();
+        let h = handle();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut active = Some(ActiveQuery::FrontPositions {
+            buf: Vec::new(),
+            reply: Some(tx),
+        });
+        dispatch_event(CtpEvent::Position(long_position()), &h, &ctx, &mut active);
+
+        // Act
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+
+        // Assert：整批映射后 oneshot 回执（3 手多头）。
+        let positions = rx.try_recv().unwrap().unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].signed_quantity, rust_decimal::Decimal::from(3));
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn back_order_replay_forwards_query_rows_to_bridge_and_warms_dir() {
+        // Arrange：后台重连委托重放在途。
+        let (ctx, mut bridge_rx) = ctx_and_rx();
+        let h = handle();
+        let mut active = Some(ActiveQuery::BackOrderReplay);
+
+        // Act：查询行应像实时回报一样透传订单桥（恢复状态机）并喂交易所目录。
+        dispatch_event(
+            CtpEvent::OrderQuery(qrow("101", "20260101-2", "SHFE", "rb2510")),
+            &h,
+            &ctx,
+            &mut active,
+        );
+
+        // Assert：订单桥收到一帧；目录已预热（供跨会话撤单）；闸门仍在（等 QueryEnd）。
+        assert!(matches!(bridge_rx.try_recv(), Ok(BridgeEvent::Order(_))));
+        assert_eq!(ctx.exchange_dir.get("rb2510").as_deref(), Some("SHFE"));
+        assert!(active.is_some());
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+        assert!(active.is_none(), "重放 QueryEnd 释放闸门");
+    }
+
+    #[test]
+    fn back_positions_queryend_forwards_snapshot_to_bridge() {
+        // Arrange：后台持仓对账在途。
+        let (ctx, mut bridge_rx) = ctx_and_rx();
+        let h = handle();
+        let mut active = Some(ActiveQuery::BackPositions { buf: Vec::new() });
+        dispatch_event(CtpEvent::Position(long_position()), &h, &ctx, &mut active);
+
+        // Act
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+
+        // Assert：聚合后经持仓桥投递（与前台查仓同一 mapper）。
+        assert!(matches!(
+            bridge_rx.try_recv(),
+            Ok(BridgeEvent::Positions(ps)) if ps.len() == 1
+        ));
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn realtime_order_is_never_swallowed_during_front_query() {
+        // Arrange：前台查单在途（查询行进缓冲），此时来一帧**实时**委托回报。
+        let (ctx, mut bridge_rx) = ctx_and_rx();
+        let h = handle();
+        let (mut active, _lookup_rx) = front_order_active("20260101-2", None);
+
+        // Act：先发查询行（被缓冲），再发实时回报（必须透传）。
+        dispatch_event(
+            CtpEvent::OrderQuery(qrow("101", "20260101-2", "SHFE", "rb2510")),
+            &h,
+            &ctx,
+            &mut active,
+        );
+        dispatch_event(
+            CtpEvent::Order(qrow("101", "20260101-2", "SHFE", "rb2510")),
+            &h,
+            &ctx,
+            &mut active,
+        );
+
+        // Assert：实时回报未被查询缓冲吞掉，订单桥收到且目录被喂。
+        assert!(matches!(bridge_rx.try_recv(), Ok(BridgeEvent::Order(_))));
+        assert_eq!(ctx.exchange_dir.get("rb2510").as_deref(), Some("SHFE"));
+    }
+
+    #[test]
+    fn disconnect_drops_inflight_query_with_closed_receipt() {
+        // Arrange：前台查单在途，持有未回执 oneshot。
+        let (ctx, _rx) = ctx_and_rx();
+        let h = handle();
+        let (active, mut lookup_rx) = front_order_active("20260101-2", None);
+
+        // Act：模拟断线/循环退出——inner_loop return 时 active 被 drop（发送端关闭）。
+        drop(active);
+        let _ = (&ctx, &h);
+
+        // Assert：接收端立即得到 Closed（门面映射为"会话断开"），无悬挂回执。
+        assert!(matches!(lookup_rx.try_recv(), Err(TryRecvError::Closed)));
     }
 }
 

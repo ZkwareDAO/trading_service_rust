@@ -13,6 +13,7 @@ pub mod account_consumer;
 pub mod api;
 pub mod config;
 pub mod core;
+pub mod exchange_dir;
 pub mod gateway;
 pub mod mailbox;
 pub mod mapping;

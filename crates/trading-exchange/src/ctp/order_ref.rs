@@ -67,6 +67,20 @@ impl OrderRefRegistry {
         self.map.lock().unwrap().get(order_ref).cloned()
     }
 
+    /// 撤单路由反查：本地长 cid → 本会话分配的 OrderRef。
+    ///
+    /// 仅长 cid（>13B，分配过数字短号）会入表，故只有它们能命中；≤13B 的
+    /// 透传 cid 不占表（其 OrderRef 即 cid 自身），此处返回 None，调用方按
+    /// 「非本会话映射」走系统号兜底路径。重启后表为空，恒返回 None。
+    pub fn order_ref_of_cid(&self, cid: &str) -> Option<String> {
+        // 表为 OrderRef→cid，反查即遍历等值匹配（会话内表项规模=在途单数，量级很小）。
+        self.map
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|(order_ref, mapped_cid)| (mapped_cid == cid).then(|| order_ref.clone()))
+    }
+
     /// 移除映射（柜台受理失败时清脏表：未受理的 OrderRef 不会有回报）。
     pub fn remove(&self, order_ref: &str) {
         self.map.lock().unwrap().remove(order_ref);
@@ -132,6 +146,31 @@ mod tests {
         // Assert：原样返回且不占表（cid_of 本身也是它自己，翻译自然成立）。
         assert_eq!(a, "12345678");
         assert!(r.cid_of("12345678").is_none());
+    }
+
+    #[test]
+    fn order_ref_of_cid_reverses_allocation_for_long_cid() {
+        // Arrange：为长 cid 分配短号。
+        let r = OrderRefRegistry::new();
+        let cid = long_cid("C");
+        let order_ref = r.allocate(&cid);
+
+        // Act / Assert：cid 可反查回本会话分配的 OrderRef。
+        assert_eq!(
+            r.order_ref_of_cid(&cid).as_deref(),
+            Some(order_ref.as_str())
+        );
+    }
+
+    #[test]
+    fn order_ref_of_cid_misses_for_unknown_or_passthrough_cid() {
+        // Arrange：未知长 cid；以及 ≤13B 透传 cid（不占表）。
+        let r = OrderRefRegistry::new();
+        let _ = r.allocate(&long_cid("A"));
+
+        // Act / Assert：重启后表空 / 非本会话 / 透传 cid 均未命中（走系统号兜底）。
+        assert!(r.order_ref_of_cid(&long_cid("Z")).is_none());
+        assert!(r.order_ref_of_cid("12345678").is_none());
     }
 
     #[test]

@@ -88,6 +88,10 @@ pub enum CtpEvent {
     SettlementConfirmed,
     /// 报单回报（委托状态变化）。
     Order(OrderSnapshot),
+    /// 当日报单**查询应答行**（`on_rsp_qry_order`），区别于实时回报 [`CtpEvent::Order`]：
+    /// 查询行进前台 oneshot 缓冲或后台重放桥，实时回报始终透传订单端口，二者
+    /// 不可混用——否则按需查单的行污染状态机，或实时回报被查询缓冲吞掉。
+    OrderQuery(OrderSnapshot),
     /// 成交回报。
     Trade(TradeSnapshot),
     /// 报单被拒/错误回报。

@@ -116,7 +116,7 @@ impl VenueProvider for CtpProvider {
         Ok(Arc::new(CtpApi::new(
             account.to_string(),
             Arc::clone(&session.order_refs),
-            Arc::clone(&session.inserts),
+            Arc::clone(&session.mailbox),
         )))
     }
 

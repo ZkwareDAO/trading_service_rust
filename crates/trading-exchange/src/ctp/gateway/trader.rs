@@ -178,6 +178,37 @@ impl TraderHandle {
         self.api.req_qry_order(&mut req, id)
     }
 
+    /// 发起撤单，返回柜台受理码（0=受理；非 0 如 24/25/26 见错误表）。
+    ///
+    /// 受理码 0 只代表请求被接收，真正撤成以 `on_rtn_order` 撤单终态为准；
+    /// 异步拒绝经 `on_err_rtn_order_action`（`CtpEvent::Error`）回灌。
+    /// 定位二选一与字段装配见 [`crate::ctp::gateway::convert::order::build_order_action`]。
+    pub fn cancel_order(
+        &mut self,
+        instrument: &str,
+        target: &crate::ctp::mailbox::CancelTarget,
+    ) -> i32 {
+        let action_ref = self.session.order_action_ref();
+        let mut field = crate::ctp::gateway::convert::order::build_order_action(
+            &self.account,
+            instrument,
+            target,
+            action_ref,
+        );
+        let id = self.session.request_id();
+        self.api.req_order_action(&mut field, id)
+    }
+
+    /// 当前会话前置编号（登录后填充；跨会话撤单定位三元组时由上层取用）。
+    pub fn front_id(&self) -> i32 {
+        self.session.front_id()
+    }
+
+    /// 当前会话编号。
+    pub fn session_id(&self) -> i32 {
+        self.session.session_id()
+    }
+
     /// 显式释放底层连接。
     pub fn release(&self) {
         self.api.release();

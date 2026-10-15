@@ -164,12 +164,37 @@ impl TraderSpi for EventTraderSpi {
         _request_id: i32,
         is_last: bool,
     ) {
+        // 查询应答行（非实时回报）：发 OrderQuery 变体，供前台 oneshot 缓冲或
+        // 后台重放走订单桥——与 on_rtn_order 的实时 Order 严格区分，避免互相污染。
         if let Some(o) = order {
-            self.emit(CtpEvent::Order(order_snapshot(o)));
+            self.emit(CtpEvent::OrderQuery(order_snapshot(o)));
         }
         if is_last {
             self.emit(CtpEvent::QueryEnd);
         }
+    }
+
+    fn on_rsp_order_action(
+        &mut self,
+        _action: Option<&ctp2rs::v1alpha1::CThostFtdcInputOrderActionField>,
+        info: Option<&CThostFtdcRspInfoField>,
+        _request_id: i32,
+        _is_last: bool,
+    ) {
+        // 撤单请求的同步应答：受理码 0 只代表"请求被受理"，真正撤成以
+        // on_rtn_order 的撤单终态为准；非 0（如 24 重复撤单）此处上抛可诊断。
+        self.emit_error_if_any(info);
+    }
+
+    fn on_err_rtn_order_action(
+        &mut self,
+        _action: Option<&ctp2rs::v1alpha1::CThostFtdcOrderActionField>,
+        info: Option<&CThostFtdcRspInfoField>,
+    ) {
+        // 撤单被柜台异步拒绝（25 ORDER_NOT_FOUND / 26 状态不适宜等）：
+        // 上抛错误事件（中文 msg 已在 read_rsp 解码），终态仍以 on_rtn_order 为准。
+        let (code, msg) = read_rsp(info);
+        self.emit(CtpEvent::Error { code, msg });
     }
 
     fn on_err_rtn_order_insert(
@@ -241,5 +266,69 @@ mod tests {
         let rsp = ctp2rs::v1alpha1::CThostFtdcRspInfoField::default();
         spi.on_err_rtn_order_insert(None, Some(&rsp));
         assert!(matches!(rx.try_recv(), Ok(CtpEvent::Error { .. })));
+    }
+
+    #[test]
+    fn rsp_qry_order_emits_order_query_then_query_end() {
+        // Arrange：查询应答行必须区别于实时回报（OrderQuery，而非 Order）。
+        let (mut spi, rx) = setup();
+
+        // Act：一行 + is_last。
+        spi.on_rsp_qry_order(Some(&Default::default()), None, 1, false);
+        spi.on_rsp_qry_order(None, None, 1, true);
+
+        // Assert
+        assert!(matches!(rx.try_recv(), Ok(CtpEvent::OrderQuery(_))));
+        assert!(matches!(rx.try_recv(), Ok(CtpEvent::QueryEnd)));
+    }
+
+    #[test]
+    fn rsp_order_action_nonzero_emits_error_with_code() {
+        // Arrange：撤单同步应答带错误码 24（重复撤单）。
+        let (mut spi, rx) = setup();
+        let rsp = ctp2rs::v1alpha1::CThostFtdcRspInfoField {
+            ErrorID: 24,
+            ..Default::default()
+        };
+
+        // Act
+        spi.on_rsp_order_action(None, Some(&rsp), 1, true);
+
+        // Assert：错误码可诊断。
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(CtpEvent::Error { code: 24, .. })
+        ));
+    }
+
+    #[test]
+    fn rsp_order_action_accepted_emits_nothing() {
+        // Arrange：受理成功（无错误）不应制造事件——撤成与否以 on_rtn_order 终态为准。
+        let (mut spi, rx) = setup();
+
+        // Act
+        spi.on_rsp_order_action(None, None, 1, true);
+
+        // Assert：通道空。
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn err_rtn_order_action_emits_error_with_code() {
+        // Arrange：异步撤单拒绝 25（ORDER_NOT_FOUND，找不到/跨日）。
+        let (mut spi, rx) = setup();
+        let rsp = ctp2rs::v1alpha1::CThostFtdcRspInfoField {
+            ErrorID: 25,
+            ..Default::default()
+        };
+
+        // Act
+        spi.on_err_rtn_order_action(None, Some(&rsp));
+
+        // Assert
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(CtpEvent::Error { code: 25, .. })
+        ));
     }
 }

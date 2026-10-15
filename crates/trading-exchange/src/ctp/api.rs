@@ -9,7 +9,9 @@ use crate::api::{
     ExchangeApi, OrderAck, OrderLookup, OrderRef, PlaceErrorKind, PlaceOrderRequest, PositionInfo,
     ReferencePrice,
 };
-use crate::ctp::mailbox::{InsertMailbox, PendingInsert};
+use crate::ctp::mailbox::{
+    CancelJob, PendingInsert, QueryOrderJob, QueryPositionsJob, SessionMailbox, SessionRequest,
+};
 use crate::ctp::order_ref::OrderRefRegistry;
 use crate::ctp::prep;
 
@@ -38,6 +40,10 @@ fn make_ack(
 
 /// 下单等待长会话线程回执的超时（会话断开/线程退出时以此兜底）。
 const SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// 撤单/查单等待回执超时（受 2s 事件轮询粒度 + 柜台查询流控影响，给 5s）。
+const CANCEL_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// 查仓等待回执超时（按需直调方可能赶上对账在途，放宽到 10s）。
+const POSITIONS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// CTP 下单/查询门面（tokio 侧持有；实际执行在阻塞会话内）。
 pub struct CtpApi {
@@ -46,20 +52,20 @@ pub struct CtpApi {
     account: String,
     /// cid ↔ OrderRef 映射（与账户流长会话共享；回报反查同一份表）。
     order_refs: std::sync::Arc<OrderRefRegistry>,
-    /// 下单请求信箱（与账户流长会话线程共享同一份）。
-    inserts: std::sync::Arc<InsertMailbox>,
+    /// 会话请求信箱（下单/撤单/查询；与账户流长会话线程共享同一份）。
+    mailbox: std::sync::Arc<SessionMailbox>,
 }
 
 impl CtpApi {
     pub fn new(
         account: String,
         order_refs: std::sync::Arc<OrderRefRegistry>,
-        inserts: std::sync::Arc<InsertMailbox>,
+        mailbox: std::sync::Arc<SessionMailbox>,
     ) -> Self {
         Self {
             account,
             order_refs,
-            inserts,
+            mailbox,
         }
     }
 }
@@ -90,17 +96,17 @@ impl ExchangeApi for CtpApi {
         let client_order_id = req.client_order_id.clone();
         // 提交锁**跨回执持有**：同一账户同一时刻至多一笔在飞——单槽信箱下
         // 并发提交会互相覆盖（后写覆盖先取，首笔请求永久丢失）。
-        let _guard = self.inserts.lock_submission().await;
+        let _guard = self.mailbox.lock_submission().await;
         // OrderRef 客户端自填、柜台原样回传：锁内分配（分配顺序=提交顺序）
         // 并登记映射；受理成功即回填 OrderAck.exchange_order_id（宿主落订单行，
         // 重启恢复的真相源）。投递到长会话线程：复用已登录 API 实例，毫秒级提交。
         let order_ref = self.order_refs.allocate(&client_order_id);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.inserts.submit(PendingInsert {
+        self.mailbox.submit(SessionRequest::Insert(PendingInsert {
             req: order_req,
             order_ref: order_ref.clone(),
             reply: reply_tx,
-        });
+        }));
         let code = match tokio::time::timeout(SUBMIT_TIMEOUT, reply_rx).await {
             Ok(Ok(ret)) => ret.map_err(|e| anyhow::anyhow!("CTP 报单校验失败: {e}"))?,
             Ok(Err(_)) => anyhow::bail!("CTP 会话线程已退出，下单结果不确定"),
@@ -120,19 +126,76 @@ impl ExchangeApi for CtpApi {
         ))
     }
 
-    /// 撤单未封装（方案 R1：ReqOrderAction 待补），显式报不支持。
-    async fn cancel_order(&self, _instrument: &str, _order: &OrderRef) -> anyhow::Result<OrderAck> {
-        anyhow::bail!("CTP 撤单暂未接入（ReqOrderAction 待封装）")
+    /// 撤单：投递信箱，定位（三元组/系统号）在会话线程内完成。
+    ///
+    /// 受理码 0 仅代表柜台受理撤单请求，真正撤成以后续 `on_rtn_order` 撤单
+    /// 终态为准（宿主乐观 apply_canceled 幂等）；25/26 等异步拒绝经错误回报可诊断。
+    async fn cancel_order(&self, instrument: &str, order: &OrderRef) -> anyhow::Result<OrderAck> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        // 撤单不占下单提交锁（与下单是不同的柜台动作，串行由会话线程保证）。
+        self.mailbox.submit(SessionRequest::Cancel(CancelJob {
+            instrument: instrument.to_string(),
+            order: order.clone(),
+            reply: reply_tx,
+        }));
+        let code = match tokio::time::timeout(CANCEL_QUERY_TIMEOUT, reply_rx).await {
+            Ok(Ok(ret)) => ret?,
+            Ok(Err(_)) => anyhow::bail!("CTP 会话线程已退出，撤单结果不确定"),
+            Err(_) => anyhow::bail!("CTP 撤单等待会话线程超时（5s）"),
+        };
+        let accepted = code == 0;
+        Ok(OrderAck {
+            accepted,
+            client_order_id: order.client_order_id.clone(),
+            exchange_order_id: None,
+            status: if accepted {
+                trading_models::OrderStatus::Canceled
+            } else {
+                trading_models::OrderStatus::Rejected
+            },
+            message: (!accepted).then(|| format!("CTP 撤单受理码 {code}")),
+            placed_type: None,
+            placed_price: None,
+            placed_quantity: None,
+        })
     }
 
-    /// 查单经账户流回报收敛，本口径返回不可用。
-    async fn query_order(&self, _instrument: &str, _order: &OrderRef) -> OrderLookup {
-        OrderLookup::Unavailable
+    /// 查单：柜台只支持按 InstrumentID 拉当日全部委托，会话线程拉回后客户端匹配。
+    ///
+    /// 重启后以 exchange_order_id（OrderSysID）为准；同进程附 cid→registry
+    /// 反查出的 OrderRef 兜底。空/不匹配/断线/超时一律 Unavailable（不判 NotExists）。
+    async fn query_order(&self, instrument: &str, order: &OrderRef) -> OrderLookup {
+        // 同进程：cid 反查本会话 OrderRef 作兜底匹配值（重启后 registry 空 → None）。
+        let hint = self.order_refs.order_ref_of_cid(&order.client_order_id);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.mailbox
+            .submit(SessionRequest::QueryOrder(QueryOrderJob {
+                instrument: instrument.to_string(),
+                exchange_order_id: order.exchange_order_id.clone().unwrap_or_default(),
+                order_ref_hint: hint,
+                reply: reply_tx,
+            }));
+        match tokio::time::timeout(CANCEL_QUERY_TIMEOUT, reply_rx).await {
+            // 会话线程已在 QueryEnd 给出三态结论。
+            Ok(Ok(lookup)) => lookup,
+            // 断线（Sender drop）或超时：查询本身失败 ≠ 订单不存在，一律 Unavailable。
+            _ => OrderLookup::Unavailable,
+        }
     }
 
-    /// 持仓真值经账户流对账拉取（CTP 无 REST 语义），本口径不适用。
+    /// 查仓：复用长会话线程的 ReqQryInvestorPosition + 同一 mapper，经信箱
+    /// oneshot 回真实快照（CTP 无 REST；与后台去抖对账共用同一查询路径）。
     async fn get_positions(&self) -> anyhow::Result<Vec<PositionInfo>> {
-        anyhow::bail!("CTP 持仓经账户流对账拉取（无 REST 语义）")
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.mailbox
+            .submit(SessionRequest::QueryPositions(QueryPositionsJob {
+                reply: reply_tx,
+            }));
+        match tokio::time::timeout(POSITIONS_TIMEOUT, reply_rx).await {
+            Ok(Ok(ret)) => ret,
+            Ok(Err(_)) => anyhow::bail!("CTP 会话线程已退出，持仓查询失败（会话断开）"),
+            Err(_) => anyhow::bail!("CTP 持仓查询等待会话线程超时（10s）"),
+        }
     }
 
     /// CTP 无程序化杠杆设置语义（保证金率由柜台/交易所规定）。
@@ -171,15 +234,17 @@ mod tests {
     async fn place_order_submits_via_mailbox_and_stamps_order_ref() {
         // Arrange：模拟长会话线程——从信箱取单并回执受理码 0（无 FFI）。
         let registry = std::sync::Arc::new(crate::ctp::order_ref::OrderRefRegistry::new());
-        let inserts = std::sync::Arc::new(crate::ctp::mailbox::InsertMailbox::new());
+        let mailbox = std::sync::Arc::new(crate::ctp::mailbox::SessionMailbox::new());
         let api = CtpApi::new(
             "acct".into(),
             std::sync::Arc::clone(&registry),
-            std::sync::Arc::clone(&inserts),
+            std::sync::Arc::clone(&mailbox),
         );
         let responder = tokio::spawn(async move {
+            use crate::ctp::mailbox::SessionRequest;
             loop {
-                if let Some(p) = inserts.take() {
+                // 模拟长会话线程：取到 Insert 即回执受理码 0（其余变体本期不出现）。
+                if let Some(SessionRequest::Insert(p)) = mailbox.take_next() {
                     let _ = p.reply.send(Ok(0));
                     break;
                 }
@@ -208,7 +273,7 @@ mod tests {
         let api = CtpApi::new(
             "acct".into(),
             std::sync::Arc::new(crate::ctp::order_ref::OrderRefRegistry::new()),
-            std::sync::Arc::new(crate::ctp::mailbox::InsertMailbox::new()),
+            std::sync::Arc::new(crate::ctp::mailbox::SessionMailbox::new()),
         );
         assert_eq!(api.exchange(), "ctp");
     }
@@ -217,5 +282,251 @@ mod tests {
     fn place_req_template_is_valid() {
         // 防御性：模板请求始终可被 prep 装配（保证测试模板不腐化）。
         assert!(prep::build_open_or_close(&place_req(), None).is_ok());
+    }
+
+    // ---- 撤单 / 查单 / 查仓（假线程应答信箱，不触 FFI）----
+
+    use crate::api::OrderState;
+    use crate::ctp::mailbox::{CancelJob, QueryPositionsJob, SessionMailbox, SessionRequest};
+
+    fn api_with_mailbox() -> (CtpApi, std::sync::Arc<SessionMailbox>) {
+        let mailbox = std::sync::Arc::new(SessionMailbox::new());
+        let api = CtpApi::new(
+            "acct".into(),
+            std::sync::Arc::new(crate::ctp::order_ref::OrderRefRegistry::new()),
+            std::sync::Arc::clone(&mailbox),
+        );
+        (api, mailbox)
+    }
+
+    fn found_state() -> OrderState {
+        OrderState {
+            client_order_id: Some("101".into()),
+            exchange_order_id: Some("20260101-2".into()),
+            instrument: "rb2510".into(),
+            status: trading_models::OrderStatus::New,
+            filled_quantity: Decimal::ZERO,
+            average_price: None,
+            position_side: OrderPositionSide::Both,
+            venue_extra: None,
+        }
+    }
+
+    /// 假线程：取到第一笔请求后按变体应答（模拟专用 OS 线程）。
+    fn spawn_worker(
+        mailbox: std::sync::Arc<SessionMailbox>,
+        reply: impl FnOnce(SessionRequest) + Send + 'static,
+    ) {
+        tokio::spawn(async move {
+            loop {
+                if let Some(req) = mailbox.take_next() {
+                    reply(req);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn cancel_accepted_returns_canceled_ack() {
+        // Arrange：假线程对撤单回执受理码 0。
+        let (api, mailbox) = api_with_mailbox();
+        spawn_worker(mailbox, |req| match req {
+            SessionRequest::Cancel(CancelJob { reply, .. }) => {
+                let _ = reply.send(Ok(0));
+            }
+            _ => panic!("期望撤单请求"),
+        });
+
+        // Act
+        let ack = api
+            .cancel_order(
+                "rb2510",
+                &OrderRef::new("0xcid").with_exchange("20260101-2"),
+            )
+            .await
+            .unwrap();
+
+        // Assert：受理 + 乐观 Canceled（终态以后续 on_rtn_order 为准）。
+        assert!(ack.accepted);
+        assert_eq!(ack.status, trading_models::OrderStatus::Canceled);
+        assert_eq!(ack.client_order_id, "0xcid");
+    }
+
+    #[tokio::test]
+    async fn cancel_thread_reject_or_drop_returns_error() {
+        // Arrange：假线程回执无法定位错误（Err）——门面必须上抛而非误标撤销。
+        let (api, mailbox) = api_with_mailbox();
+        spawn_worker(mailbox, |req| match req {
+            SessionRequest::Cancel(CancelJob { reply, .. }) => {
+                let _ = reply.send(Err(anyhow::anyhow!("交易所目录未预热")));
+            }
+            _ => panic!("期望撤单请求"),
+        });
+        // Act / Assert
+        assert!(api
+            .cancel_order("rb2510", &OrderRef::new("0xcid"))
+            .await
+            .is_err());
+
+        // Arrange：线程退出（reply 直接 drop）——立即 RecvError，不等 5s。
+        let (api2, mailbox2) = api_with_mailbox();
+        spawn_worker(mailbox2, |req| match req {
+            SessionRequest::Cancel(CancelJob { reply, .. }) => drop(reply),
+            _ => panic!("期望撤单请求"),
+        });
+        let start = std::time::Instant::now();
+        // Act / Assert：快速失败（远小于 5s 超时）。
+        assert!(api2
+            .cancel_order("rb2510", &OrderRef::new("0xcid"))
+            .await
+            .is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn query_order_hit_returns_found() {
+        // Arrange：假线程对查单回 Found。
+        let (api, mailbox) = api_with_mailbox();
+        spawn_worker(mailbox, |req| match req {
+            SessionRequest::QueryOrder(q) => {
+                let _ = q.reply.send(OrderLookup::Found(found_state()));
+            }
+            _ => panic!("期望查单请求"),
+        });
+
+        // Act
+        let out = api
+            .query_order(
+                "rb2510",
+                &OrderRef::new("0xcid").with_exchange("20260101-2"),
+            )
+            .await;
+
+        // Assert
+        match out {
+            OrderLookup::Found(st) => {
+                assert_eq!(st.exchange_order_id.as_deref(), Some("20260101-2"))
+            }
+            other => panic!("期望 Found，实际 {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn query_order_empty_or_disconnected_returns_unavailable() {
+        // Arrange：空结果 → Unavailable（绝不 NotExists）。
+        let (api, mailbox) = api_with_mailbox();
+        spawn_worker(mailbox, |req| match req {
+            SessionRequest::QueryOrder(q) => {
+                let _ = q.reply.send(OrderLookup::Unavailable);
+            }
+            _ => panic!("期望查单请求"),
+        });
+        // Act / Assert
+        assert!(matches!(
+            api.query_order("rb2510", &OrderRef::new("0xcid")).await,
+            OrderLookup::Unavailable
+        ));
+
+        // Arrange：线程退出（reply drop）——同样 Unavailable，不代表订单不存在。
+        let (api2, mailbox2) = api_with_mailbox();
+        spawn_worker(mailbox2, |req| match req {
+            SessionRequest::QueryOrder(q) => drop(q.reply),
+            _ => panic!("期望查单请求"),
+        });
+        // Act / Assert
+        assert!(matches!(
+            api2.query_order("rb2510", &OrderRef::new("0xcid")).await,
+            OrderLookup::Unavailable
+        ));
+    }
+
+    #[tokio::test]
+    async fn query_order_passes_eid_and_registry_hint() {
+        // Arrange：长 cid 经 registry 分配过 OrderRef；假线程断言收到 eid + hint。
+        let registry = std::sync::Arc::new(crate::ctp::order_ref::OrderRefRegistry::new());
+        let mailbox = std::sync::Arc::new(SessionMailbox::new());
+        let cid = format!("0x{}", "a".repeat(32));
+        let hint = registry.allocate(&cid);
+        let api = CtpApi::new(
+            "acct".into(),
+            std::sync::Arc::clone(&registry),
+            std::sync::Arc::clone(&mailbox),
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        spawn_worker(mailbox, move |req| match req {
+            SessionRequest::QueryOrder(q) => {
+                let _ = tx.send((q.exchange_order_id, q.order_ref_hint));
+                let _ = q.reply.send(OrderLookup::Unavailable);
+            }
+            _ => panic!("期望查单请求"),
+        });
+
+        // Act
+        let _ = api
+            .query_order("rb2510", &OrderRef::new(cid).with_exchange("20260101-2"))
+            .await;
+
+        // Assert：线程收到首选 eid 与 registry 反查 hint。
+        let (eid, got_hint) = rx.await.unwrap();
+        assert_eq!(eid, "20260101-2");
+        assert_eq!(got_hint.as_deref(), Some(hint.as_str()));
+    }
+
+    fn one_position() -> crate::api::PositionInfo {
+        crate::api::PositionInfo {
+            instrument: "rb2510".into(),
+            instrument_type: trading_models::InstrumentType::Futures,
+            position_side: OrderPositionSide::Both,
+            signed_quantity: Decimal::from(3),
+            entry_price: Decimal::from(3205),
+            mark_price: None,
+            unrealized_pnl: None,
+            leverage: None,
+            notional: None,
+            margin: None,
+            update_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_positions_returns_batch() {
+        // Arrange：假线程聚合后回一批持仓（含 1 条多头）。
+        let (api, mailbox) = api_with_mailbox();
+        spawn_worker(mailbox, |req| match req {
+            SessionRequest::QueryPositions(QueryPositionsJob { reply }) => {
+                let _ = reply.send(Ok(vec![one_position()]));
+            }
+            _ => panic!("期望查仓请求"),
+        });
+        // Act
+        let ps = api.get_positions().await.unwrap();
+        // Assert：整批透传。
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].signed_quantity, Decimal::from(3));
+    }
+
+    #[tokio::test]
+    async fn get_positions_flow_control_or_disconnect_errors() {
+        // Arrange：受理失败（流控）→ Err（区别于合法空仓）。
+        let (api, mailbox) = api_with_mailbox();
+        spawn_worker(mailbox, |req| match req {
+            SessionRequest::QueryPositions(QueryPositionsJob { reply }) => {
+                let _ = reply.send(Err(anyhow::anyhow!("受理失败")));
+            }
+            _ => panic!("期望查仓请求"),
+        });
+        assert!(api.get_positions().await.is_err());
+
+        // Arrange：线程退出（reply drop）→ Err（RecvError 映射会话断开）。
+        let (api2, mailbox2) = api_with_mailbox();
+        spawn_worker(mailbox2, |req| match req {
+            SessionRequest::QueryPositions(QueryPositionsJob { reply }) => drop(reply),
+            _ => panic!("期望查仓请求"),
+        });
+        let start = std::time::Instant::now();
+        assert!(api2.get_positions().await.is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 }

@@ -10,6 +10,8 @@ pub struct SessionState {
     next_request_id: i32,
     /// 下一报单引用数值（登录前从 1 起，登录后对齐 MaxOrderRef）。
     next_order_ref: i32,
+    /// 下一报单操作引用（撤单 ReqOrderAction 用；与 OrderRef 独立的柜台序列，从 1 起）。
+    next_order_action_ref: i32,
     /// 前置编号（登录后填充）。
     front_id: i32,
     /// 会话编号（登录后填充）。
@@ -24,6 +26,7 @@ impl SessionState {
         Self {
             next_request_id: 1,
             next_order_ref: 1,
+            next_order_action_ref: 1,
             ..Default::default()
         }
     }
@@ -40,6 +43,16 @@ impl SessionState {
         let r#ref = self.next_order_ref;
         self.next_order_ref += 1;
         r#ref.to_string()
+    }
+
+    /// 取下一报单操作引用（撤单 ReqOrderAction 用）并自增。
+    ///
+    /// 与 OrderRef 是独立的柜台序列：撤单不消耗 OrderRef，故不复用
+    /// `next_order_ref`；登录不重置（OrderActionRef 无 Max 对齐语义）。
+    pub fn order_action_ref(&mut self) -> i32 {
+        let r#ref = self.next_order_action_ref;
+        self.next_order_action_ref += 1;
+        r#ref
     }
 
     /// 登录成功：记录会话要素，并把下一 OrderRef 对齐到 MaxOrderRef 之后。
@@ -124,5 +137,29 @@ mod tests {
         s.on_login(1, 1, "5");
         s.on_disconnect();
         assert!(!s.is_logged_in());
+    }
+
+    #[test]
+    fn order_action_ref_increments_independently_from_order_ref() {
+        // Arrange：撤单操作引用与报单引用是两条独立柜台序列。
+        let mut s = SessionState::new();
+
+        // Act / Assert：各自从 1 起单调递增，互不消耗。
+        assert_eq!(s.order_action_ref(), 1);
+        assert_eq!(s.order_ref(), "1");
+        assert_eq!(s.order_action_ref(), 2);
+        assert_eq!(s.order_action_ref(), 3);
+        assert_eq!(s.order_ref(), "2");
+    }
+
+    #[test]
+    fn order_action_ref_not_affected_by_login_max_order_ref() {
+        // Arrange：登录把下一 OrderRef 对齐到 MaxOrderRef 之后。
+        let mut s = SessionState::new();
+        s.on_login(1, 9001, "12");
+
+        // Act / Assert：撤单操作引用不参与 MaxOrderRef 对齐，仍从 1 起。
+        assert_eq!(s.order_action_ref(), 1);
+        assert_eq!(s.order_ref(), "13");
     }
 }
