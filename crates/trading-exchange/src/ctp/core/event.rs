@@ -143,6 +143,8 @@ pub struct InstrumentInfo {
     pub is_trading: bool,
     /// 合约乘数（每手对应的标的数量；持仓成本折算单价必需）。
     pub volume_multiple: i32,
+    /// 最小变动价位（SHFE 市价单转穿价限价时按其取整；缺失/非正为 0.0）。
+    pub price_tick: f64,
 }
 
 /// 登录成功后从柜台取得的会话信息。

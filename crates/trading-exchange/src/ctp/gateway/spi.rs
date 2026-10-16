@@ -139,6 +139,8 @@ impl TraderSpi for EventTraderSpi {
                 product_id: decode_fixed(&i.ProductID),
                 is_trading: i.IsTrading != 0,
                 volume_multiple: i.VolumeMultiple,
+                // 最小变动价位（SHFE 市价转穿价限价取整用）；柜台缺省 0.0 时预检判未就绪。
+                price_tick: i.PriceTick,
             }));
         }
         // 与持仓/委托查询一致：分页末条须发 QueryEnd，否则合约预热闸门永不释放。

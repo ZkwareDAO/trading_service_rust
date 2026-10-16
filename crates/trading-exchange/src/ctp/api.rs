@@ -54,18 +54,31 @@ pub struct CtpApi {
     order_refs: std::sync::Arc<OrderRefRegistry>,
     /// 会话请求信箱（下单/撤单/查询；与账户流长会话线程共享同一份）。
     mailbox: std::sync::Arc<SessionMailbox>,
+    /// 进程级共享合约静态目录（SHFE 市价转限价判交易所/取 tick；与规则引擎同源）。
+    instrument_dir: std::sync::Arc<crate::ctp::instrument_dir::InstrumentDir>,
+    /// 共享行情表（SHFE 市价转限价读 best bid/ask）。
+    quotes: std::sync::Arc<trading_core::quote::QuoteTable>,
+    /// SHFE 市价开仓穿价漂移档数（CTP 独立配置）。
+    shfe_drift_ticks: i64,
 }
 
 impl CtpApi {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         account: String,
         order_refs: std::sync::Arc<OrderRefRegistry>,
         mailbox: std::sync::Arc<SessionMailbox>,
+        instrument_dir: std::sync::Arc<crate::ctp::instrument_dir::InstrumentDir>,
+        quotes: std::sync::Arc<trading_core::quote::QuoteTable>,
+        shfe_drift_ticks: i64,
     ) -> Self {
         Self {
             account,
             order_refs,
             mailbox,
+            instrument_dir,
+            quotes,
+            shfe_drift_ticks,
         }
     }
 }
@@ -81,11 +94,40 @@ impl ExchangeApi for CtpApi {
     /// 纯内存装配失败（手数非法/价格缺失）即拒单；柜台受理码 != 0
     /// 视为同步拒单；受理成功返回 New，后续状态由账户流回报推进（P3）。
     async fn place_order(&self, req: &PlaceOrderRequest) -> anyhow::Result<OrderAck> {
-        let order_req = match prep::build_open_or_close(req, None) {
+        // 手动下单与规则引擎走同一套 SHFE 市价→穿价限价转换（单一事实源）：
+        // 非市价/非 SHFE 原样；SHFE 合约或盘口未就绪（DataNotReady）时不挂起重试
+        // （同步请求无保活语义），直接回 rejected ACK，由调用方稍后重试。
+        let req = match prep::prepare_ctp_market(
+            &self.instrument_dir,
+            &self.quotes,
+            self.shfe_drift_ticks,
+            req.clone(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(crate::api::PlaceDefer::DataNotReady) => {
+                return Ok(make_ack(
+                    req,
+                    false,
+                    None,
+                    Some("CTP 合约/行情尚未就绪，SHFE 市价无法定价，请稍后重试".into()),
+                ));
+            }
+            // 当前 check_close_spread 恒放行（价差闸门为预留位），此臂暂不可达；
+            // 保留是为将来启用闸门时手动路径有与规则引擎一致的兜底，勿当死代码删除。
+            Err(crate::api::PlaceDefer::SpreadTooWide { .. }) => {
+                return Ok(make_ack(
+                    req,
+                    false,
+                    None,
+                    Some("CTP 盘口价差过宽，暂不接受市价转限价".into()),
+                ));
+            }
+        };
+        let order_req = match prep::build_open_or_close(&req, None) {
             Ok(r) => r,
             Err(PlaceErrorKind::Rejected) => {
                 return Ok(make_ack(
-                    req,
+                    &req,
                     false,
                     None,
                     Some("下单要素非法（手数须为正整数/价格缺失）".into()),
@@ -119,7 +161,7 @@ impl ExchangeApi for CtpApi {
             self.order_refs.remove(&order_ref);
         }
         Ok(make_ack(
-            req,
+            &req,
             accepted,
             accepted.then_some(order_ref),
             (!accepted).then(|| format!("CTP 报单受理码 {code}")),
@@ -230,15 +272,204 @@ mod tests {
         }
     }
 
+    /// 测试用 CtpApi：可注入合约目录/行情表（漂移 1 档）。
+    fn test_api(
+        order_refs: std::sync::Arc<crate::ctp::order_ref::OrderRefRegistry>,
+        mailbox: std::sync::Arc<SessionMailbox>,
+        instrument_dir: std::sync::Arc<crate::ctp::instrument_dir::InstrumentDir>,
+        quotes: std::sync::Arc<trading_core::quote::QuoteTable>,
+    ) -> CtpApi {
+        CtpApi::new(
+            "acct".into(),
+            order_refs,
+            mailbox,
+            instrument_dir,
+            quotes,
+            1,
+        )
+    }
+
+    /// 构造带 SHFE 合约（tick）与双边盘口的手动下单 API。
+    fn shfe_api_with_book(
+        bid: f64,
+        ask: f64,
+    ) -> (
+        CtpApi,
+        std::sync::Arc<SessionMailbox>,
+        std::sync::Arc<crate::ctp::instrument_dir::InstrumentDir>,
+    ) {
+        use crate::ctp::core::event::InstrumentInfo;
+        let registry = std::sync::Arc::new(crate::ctp::order_ref::OrderRefRegistry::new());
+        let mailbox = std::sync::Arc::new(SessionMailbox::new());
+        let dir = std::sync::Arc::new(crate::ctp::instrument_dir::InstrumentDir::new());
+        dir.remember(InstrumentInfo {
+            instrument: "rb2510".into(),
+            exchange_id: "SHFE".into(),
+            product_id: "rb".into(),
+            is_trading: true,
+            volume_multiple: 10,
+            price_tick: 1.0,
+        });
+        let quotes = std::sync::Arc::new(trading_core::quote::QuoteTable::new());
+        use trading_models::{Instrument, MarketKind, TopOfBook, Venue};
+        let mut u = trading_core::quote::QuoteUpdate::new(1);
+        u.book = Some(TopOfBook::new(
+            Some(Decimal::try_from(bid).unwrap()),
+            Some(Decimal::try_from(ask).unwrap()),
+        ));
+        quotes.apply(
+            &Instrument::new(Venue::Ctp, MarketKind::Futures, "rb2510"),
+            u,
+        );
+        let api = test_api(registry, mailbox.clone(), dir.clone(), quotes);
+        (api, mailbox, dir)
+    }
+
+    fn market_req(side: Side, reduce_only: bool) -> PlaceOrderRequest {
+        PlaceOrderRequest {
+            instrument: "rb2510".into(),
+            instrument_type: InstrumentType::Futures,
+            side,
+            order_type: OrderType::Market,
+            price: None,
+            quantity: Decimal::from(2),
+            reduce_only,
+            position_side: OrderPositionSide::Both,
+            time_in_force: Some(TimeInForce::Ioc),
+            client_order_id: format!("0x{}", "b".repeat(32)),
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_shfe_market_buy_open_converts_to_cross_limit_like_rule_engine() {
+        // Arrange：SHFE 市价买开，bid3204/ask3205，drift=1 → 3206 穿价限价。
+        let (api, mailbox, _dir) = shfe_api_with_book(3204.0, 3205.0);
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let cap2 = captured.clone();
+        let responder = tokio::spawn(async move {
+            loop {
+                if let Some(SessionRequest::Insert(p)) = mailbox.take_next() {
+                    *cap2.lock().await =
+                        Some((p.req.price_type, p.req.time_condition, p.req.price));
+                    let _ = p.reply.send(Ok(0));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        // Act
+        let ack = api
+            .place_order(&market_req(Side::Buy, false))
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        // Assert：受理成功；柜台收到的是限价 GFD、3206（与规则引擎同口径）。
+        assert!(ack.accepted, "SHFE 市价应转限价后受理");
+        let (pt, tc, price) = captured.lock().await.unwrap();
+        use crate::ctp::core::types::{PriceType, TimeCondition};
+        assert_eq!(pt, PriceType::LimitPrice);
+        assert_eq!(tc, TimeCondition::Gfd);
+        assert_eq!(price, 3206.0);
+    }
+
+    #[tokio::test]
+    async fn manual_shfe_market_close_long_uses_best_bid_no_drift() {
+        // 平多（sell+reduce_only）：best bid 3204，不漂移。
+        let (api, mailbox, _dir) = shfe_api_with_book(3204.0, 3205.0);
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let cap2 = captured.clone();
+        let responder = tokio::spawn(async move {
+            loop {
+                if let Some(SessionRequest::Insert(p)) = mailbox.take_next() {
+                    *cap2.lock().await = Some(p.req.price);
+                    let _ = p.reply.send(Ok(0));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        let _ = api
+            .place_order(&market_req(Side::Sell, true))
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        assert_eq!(*captured.lock().await, Some(3204.0));
+    }
+
+    #[tokio::test]
+    async fn manual_non_shfe_market_stays_native_anyprice_ioc() {
+        // DCE 市价：不转限价，柜台收到 AnyPrice+IOC。
+        use crate::ctp::core::event::InstrumentInfo;
+        let registry = std::sync::Arc::new(crate::ctp::order_ref::OrderRefRegistry::new());
+        let mailbox = std::sync::Arc::new(SessionMailbox::new());
+        let dir = std::sync::Arc::new(crate::ctp::instrument_dir::InstrumentDir::new());
+        dir.remember(InstrumentInfo {
+            instrument: "rb2510".into(),
+            exchange_id: "DCE".into(),
+            product_id: "i".into(),
+            is_trading: true,
+            volume_multiple: 100,
+            price_tick: 0.5,
+        });
+        let req = market_req(Side::Buy, false);
+        let api = test_api(
+            registry,
+            mailbox.clone(),
+            dir,
+            std::sync::Arc::new(trading_core::quote::QuoteTable::new()),
+        );
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let cap2 = captured.clone();
+        let responder = tokio::spawn(async move {
+            loop {
+                if let Some(SessionRequest::Insert(p)) = mailbox.take_next() {
+                    *cap2.lock().await = Some((p.req.price_type, p.req.time_condition));
+                    let _ = p.reply.send(Ok(0));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        let _ = api.place_order(&req).await.unwrap();
+        responder.await.unwrap();
+        use crate::ctp::core::types::{PriceType, TimeCondition};
+        assert_eq!(
+            *captured.lock().await,
+            Some((PriceType::AnyPrice, TimeCondition::Ioc))
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_shfe_market_without_contract_returns_rejected_ack_not_pending() {
+        // 合约目录未预热（空）：手动同步请求不挂起，直接 rejected ACK，且不投信箱。
+        let registry = std::sync::Arc::new(crate::ctp::order_ref::OrderRefRegistry::new());
+        let mailbox = std::sync::Arc::new(SessionMailbox::new());
+        let api = test_api(
+            registry,
+            mailbox.clone(),
+            std::sync::Arc::new(crate::ctp::instrument_dir::InstrumentDir::new()),
+            std::sync::Arc::new(trading_core::quote::QuoteTable::new()),
+        );
+        let ack = api
+            .place_order(&market_req(Side::Buy, false))
+            .await
+            .unwrap();
+        assert!(!ack.accepted, "未就绪应 rejected");
+        assert!(ack.message.unwrap().contains("尚未就绪"));
+        // 不应有任何请求进入信箱（take_next 应保持空）。
+        assert!(mailbox.take_next().is_none());
+    }
+
     #[tokio::test]
     async fn place_order_submits_via_mailbox_and_stamps_order_ref() {
         // Arrange：模拟长会话线程——从信箱取单并回执受理码 0（无 FFI）。
         let registry = std::sync::Arc::new(crate::ctp::order_ref::OrderRefRegistry::new());
         let mailbox = std::sync::Arc::new(crate::ctp::mailbox::SessionMailbox::new());
-        let api = CtpApi::new(
-            "acct".into(),
+        let api = test_api(
             std::sync::Arc::clone(&registry),
             std::sync::Arc::clone(&mailbox),
+            std::sync::Arc::new(crate::ctp::instrument_dir::InstrumentDir::new()),
+            std::sync::Arc::new(trading_core::quote::QuoteTable::new()),
         );
         let responder = tokio::spawn(async move {
             use crate::ctp::mailbox::SessionRequest;
@@ -270,10 +501,11 @@ mod tests {
 
     #[test]
     fn exchange_name_is_ctp() {
-        let api = CtpApi::new(
-            "acct".into(),
+        let api = test_api(
             std::sync::Arc::new(crate::ctp::order_ref::OrderRefRegistry::new()),
             std::sync::Arc::new(crate::ctp::mailbox::SessionMailbox::new()),
+            std::sync::Arc::new(crate::ctp::instrument_dir::InstrumentDir::new()),
+            std::sync::Arc::new(trading_core::quote::QuoteTable::new()),
         );
         assert_eq!(api.exchange(), "ctp");
     }
@@ -291,10 +523,11 @@ mod tests {
 
     fn api_with_mailbox() -> (CtpApi, std::sync::Arc<SessionMailbox>) {
         let mailbox = std::sync::Arc::new(SessionMailbox::new());
-        let api = CtpApi::new(
-            "acct".into(),
+        let api = test_api(
             std::sync::Arc::new(crate::ctp::order_ref::OrderRefRegistry::new()),
             std::sync::Arc::clone(&mailbox),
+            std::sync::Arc::new(crate::ctp::instrument_dir::InstrumentDir::new()),
+            std::sync::Arc::new(trading_core::quote::QuoteTable::new()),
         );
         (api, mailbox)
     }
@@ -449,10 +682,11 @@ mod tests {
         let mailbox = std::sync::Arc::new(SessionMailbox::new());
         let cid = format!("0x{}", "a".repeat(32));
         let hint = registry.allocate(&cid);
-        let api = CtpApi::new(
-            "acct".into(),
+        let api = test_api(
             std::sync::Arc::clone(&registry),
             std::sync::Arc::clone(&mailbox),
+            std::sync::Arc::new(crate::ctp::instrument_dir::InstrumentDir::new()),
+            std::sync::Arc::new(trading_core::quote::QuoteTable::new()),
         );
         let (tx, rx) = tokio::sync::oneshot::channel();
         spawn_worker(mailbox, move |req| match req {

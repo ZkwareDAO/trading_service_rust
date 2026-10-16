@@ -42,7 +42,7 @@ pub enum CancelTarget {
     },
     /// 跨会话系统号定位。
     ByOrderSysId {
-        /// 交易所代码（取自会话态 ExchangeDir 缓存）。
+        /// 交易所代码（取自共享 InstrumentDir）。
         exchange_id: String,
         /// 交易所系统号 OrderSysID。
         order_sys_id: String,

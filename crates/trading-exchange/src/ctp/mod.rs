@@ -12,10 +12,9 @@
 pub mod account_consumer;
 pub mod api;
 pub mod config;
-pub mod contract_dir;
 pub mod core;
-pub mod exchange_dir;
 pub mod gateway;
+pub mod instrument_dir;
 pub mod leg_table;
 pub mod mailbox;
 pub mod mapping;
@@ -26,4 +25,4 @@ pub mod prep;
 pub mod provider;
 pub mod venue;
 
-pub use config::{from_values, CtpConfig};
+pub use config::{from_values, CtpConfig, DEFAULT_SHFE_MARKET_DRIFT_TICKS};

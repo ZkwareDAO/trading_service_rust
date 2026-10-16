@@ -6,9 +6,8 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 
-use crate::ctp::contract_dir::ContractDir;
 use crate::ctp::core::account::CtpAccount;
-use crate::ctp::exchange_dir::ExchangeDir;
+use crate::ctp::instrument_dir::InstrumentDir;
 use crate::ctp::mailbox::SessionMailbox;
 use crate::ctp::order_ref::OrderRefRegistry;
 use crate::ctp::position_dir::PositionDir;
@@ -33,11 +32,9 @@ pub struct AccountSession {
     pub order_refs: Arc<OrderRefRegistry>,
     /// 会话请求信箱（下单/撤单/查询；本账户私有——共享会被别的账户线程取走串单）。
     pub mailbox: Arc<SessionMailbox>,
-    /// 合约 → 交易所目录（本账户私有；跨会话撤单定位 ExchangeID，回报/重放预热）。
-    pub exchange_dir: Arc<ExchangeDir>,
-    /// 合约 → 乘数目录（本账户私有；登录后合约查询预热，持仓成本折算单价）。
-    pub contract_dir: Arc<ContractDir>,
     /// (合约,持仓方向) → (今,昨) 会话内存路由表（本账户私有；SHFE 平今/平昨路由，不落盘）。
+    /// 合约静态信息（交易所/乘数/最小变动价位）是全局一致数据，由 provider 级共享
+    /// `InstrumentDir` 承载，不放在本账户套件里。
     pub position_dir: Arc<PositionDir>,
 }
 
@@ -97,8 +94,6 @@ impl SessionRegistry {
             shutdown: Arc::new(AtomicBool::new(false)),
             order_refs: Arc::new(OrderRefRegistry::new()),
             mailbox: Arc::new(SessionMailbox::new()),
-            exchange_dir: Arc::new(ExchangeDir::new()),
-            contract_dir: Arc::new(ContractDir::new()),
             position_dir: Arc::new(PositionDir::new()),
         })
     }
@@ -151,9 +146,12 @@ pub struct CtpVenueConnector {
     config: CtpConfig,
     /// 本账户的会话私有套件（由 provider 经 `take_over` 分配）。
     session: Arc<AccountSession>,
+    /// 进程级共享的合约静态目录（provider 持有；合约规格全局一致，多账户共用一份）。
+    instrument_dir: Arc<InstrumentDir>,
 }
 
 impl CtpVenueConnector {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sink: Arc<dyn OrderEventSink>,
         position_sink: Arc<dyn crate::port::PositionSnapshotSink>,
@@ -161,6 +159,7 @@ impl CtpVenueConnector {
         full_interval: Duration,
         config: CtpConfig,
         session: Arc<AccountSession>,
+        instrument_dir: Arc<InstrumentDir>,
     ) -> Self {
         Self {
             sink,
@@ -169,6 +168,7 @@ impl CtpVenueConnector {
             full_interval,
             config,
             session,
+            instrument_dir,
         }
     }
 
@@ -227,8 +227,7 @@ impl CtpVenueConnector {
         let ctx = Arc::new(EventContext {
             account: account.to_string(),
             order_refs: Arc::clone(&session.order_refs),
-            exchange_dir: Arc::clone(&session.exchange_dir),
-            contract_dir: Arc::clone(&session.contract_dir),
+            instrument_dir: Arc::clone(&self.instrument_dir),
             position_dir: Arc::clone(&session.position_dir),
             leg_table: Arc::new(crate::ctp::leg_table::LegTable::new()),
             tx,

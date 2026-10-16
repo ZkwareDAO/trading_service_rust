@@ -9,13 +9,23 @@
 //! 由调用方传入 [`TodayYdSplit`] 决定；非上期所统一传 [`Option::None`]
 //! 走柜台自动路由。
 
+use rust_decimal::prelude::Zero;
 use rust_decimal::Decimal;
 
-use crate::api::{PlaceErrorKind, PlaceOrderRequest};
+use crate::api::{PlaceDefer, PlaceErrorKind, PlaceOrderRequest};
 use crate::ctp::core::order::OrderRequest;
 use crate::ctp::core::types::{Offset, PriceType, TimeCondition};
 use crate::ctp::mapping::{direction_from_side, price_to_f64, volume_to_i32};
-use trading_models::OrderType;
+use trading_models::{OrderType, Side};
+
+/// SHFE 市价转限价所需的盘口（best bid/ask，调用方从 QuoteTable 读出后注入）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MarketRef {
+    /// 买一价（平多 sell 取它）。
+    pub bid: Decimal,
+    /// 卖一价（平空 buy 取它；买开在其上加漂移）。
+    pub ask: Decimal,
+}
 
 /// 本地今/昨仓分布（决定上期所平仓的 Offset 细分）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -26,13 +36,79 @@ pub struct TodayYdSplit {
     pub yesterday: i32,
 }
 
+/// SHFE 平仓价差闸门（预留扩展位）：本期不启用——恒放行，未来需要时在此对
+/// best bid/ask 宽度设阈值（参照 deribit `check_spread`），返回 `PlaceDefer`。
+#[allow(clippy::unnecessary_wraps)]
+fn check_close_spread(_book: MarketRef) -> Result<(), PlaceDefer> {
+    Ok(())
+}
+
+/// 把价格按 tick 网格**按方向**取整：买单向上（ceil）、卖单向下（floor），
+/// 保证穿价限价不被取整削弱成交确定性。注意与限价单的 [`align_price`]（一律 floor，
+/// 对齐到不劣于用户所报的合法价位）用途不同，二者不要混用。
+fn snap_to_tick(price: Decimal, tick: Decimal, side: Side) -> Decimal {
+    let units = price / tick;
+    let snapped_units = match side {
+        Side::Buy => units.ceil(),
+        Side::Sell => units.floor(),
+    };
+    snapped_units * tick
+}
+
+/// SHFE 市价单 → 穿价限价（GFD）纯转换：仅处理**调用方已判定为 SHFE** 的请求。
+///
+/// * 限价单（开/平）原样返回，不读盘口/tick；
+/// * 市价**开仓**：买开 = `ask + drift_ticks×tick`、卖开 = `bid − drift_ticks×tick`
+///   （drift_ticks 为 CTP 独立配置，与 deribit 无关），按方向取整到 tick；
+/// * 市价**平仓**：平多(sell+reduce_only)=`best bid`、平空(buy+reduce_only)=`best ask`，
+///   **不漂移**；本期无价差闸门（[`check_close_spread`] 恒放行，预留扩展）；
+/// * 无盘口 / tick 非正 / 算出价 ≤0 → [`PlaceDefer::DataNotReady`]（不 claim、下轮重试）。
+///
+/// 转换结果仅改 `order_type=Limit` 与 `price`，数量/方向/reduce_only 不变；
+/// 有效期沿用限价分支的 GFD（build_open_or_close 产出 LimitPrice+GFD）。
+pub fn prepare_shfe_market_limit(
+    mut req: PlaceOrderRequest,
+    book: Option<MarketRef>,
+    tick: Decimal,
+    drift_ticks: i64,
+) -> Result<PlaceOrderRequest, PlaceDefer> {
+    if req.order_type != OrderType::Market {
+        return Ok(req);
+    }
+    let Some(book) = book else {
+        return Err(PlaceDefer::DataNotReady);
+    };
+    if tick <= Decimal::ZERO {
+        return Err(PlaceDefer::DataNotReady);
+    }
+    // 平仓先过（预留的）价差闸门。
+    if req.reduce_only {
+        check_close_spread(book)?;
+    }
+    let drift = tick * Decimal::from(drift_ticks.max(0));
+    let raw = match (req.side, req.reduce_only) {
+        // 市价平仓取对手 best 价、不漂移。
+        (Side::Sell, true) => book.bid,
+        (Side::Buy, true) => book.ask,
+        // 市价开仓按方向穿价漂移。
+        (Side::Buy, false) => book.ask + drift,
+        (Side::Sell, false) => book.bid - drift,
+    };
+    if raw <= Decimal::zero() {
+        return Err(PlaceDefer::DataNotReady);
+    }
+    req.price = Some(snap_to_tick(raw, tick, req.side));
+    req.order_type = OrderType::Limit;
+    Ok(req)
+}
+
 /// 上期所路由结果：一次平仓请求需要的 (Offset, 手数) 序列。
 ///
-/// 上期所平仓必须显式区分今/昨：
-/// * 平 `n` 手且今仓足够 → 一笔 `CloseToday`；
-/// * 今仓不足 → 先平完今仓（`CloseToday`），剩余平昨仓（`CloseYesterday`）；
-/// * 今仓为 0 → 全部 `CloseYesterday`；
-/// * 总量不足 → 返回错误（拒单，不下部分仓位的半截单）。
+/// **先平昨、不足再平今**（上期所平今手续费远高于平昨，省费优先）：
+/// * 平仓量 ≤ 昨仓 → 仅一笔 `CloseYesterday`，完全不碰今仓；
+/// * 平仓量 > 昨仓 → 先平完全部昨仓（`CloseYesterday`），剩余平今仓（`CloseToday`）；
+/// * 昨仓为 0 → 全部 `CloseToday`；
+/// * 总量不足/非正手数 → 返回错误（拒单，不下部分仓位的半截单）。
 ///
 /// 非上期所（`split=None`）恒为单笔 `Offset::Close`，由柜台路由今/昨。
 pub fn close_offsets(
@@ -51,13 +127,15 @@ pub fn close_offsets(
         return Err(Rejected);
     }
     let mut out = Vec::with_capacity(2);
-    if split.today > 0 {
-        let n = volume.min(split.today);
-        out.push((Offset::CloseToday, n));
+    // 1) 先平昨（平量与昨仓取小）。
+    let yd = volume.min(split.yesterday);
+    if yd > 0 {
+        out.push((Offset::CloseYesterday, yd));
     }
-    let rest = volume - out.iter().map(|(_, n)| *n).sum::<i32>();
+    // 2) 超出昨仓的部分才平今（昨仓已在上方 min 钳制，rest≥0）。
+    let rest = volume - yd;
     if rest > 0 {
-        out.push((Offset::CloseYesterday, rest));
+        out.push((Offset::CloseToday, rest));
     }
     Ok(out)
 }
@@ -118,6 +196,50 @@ pub fn build_open_or_close(
         volume,
         time_condition,
     })
+}
+
+/// 从共享行情表读 CTP 期货某合约的 best bid/ask；无行情行或缺任一侧盘口 → None。
+///
+/// 涨跌停封板可能只有单边盘口，此时保守判未就绪（调用方拒绝/保活），不在本层用
+/// 涨跌停价猜测替代——需要时由后续行情补齐或显式接入上下限价字段。
+pub(crate) fn read_ctp_book(
+    quotes: &trading_core::quote::QuoteTable,
+    symbol: &str,
+) -> Option<MarketRef> {
+    let key = trading_models::Instrument::new(
+        trading_models::Venue::Ctp,
+        trading_models::MarketKind::Futures,
+        symbol,
+    );
+    let book = quotes.get(&key)?.book?;
+    Some(MarketRef {
+        bid: book.bid?,
+        ask: book.ask?,
+    })
+}
+
+/// CTP 市价单的统一预检（**规则引擎与手动 API 共用同一组件**）：
+/// 非市价/限价原样透传；合约静态信息未预热 → DataNotReady；**非 SHFE 原样**
+/// （DCE 等走原生 AnyPrice+IOC）；SHFE 读盘口+最小变动价位交
+/// [`prepare_shfe_market_limit`] 转穿价限价 GFD。
+pub(crate) fn prepare_ctp_market(
+    dir: &crate::ctp::instrument_dir::InstrumentDir,
+    quotes: &trading_core::quote::QuoteTable,
+    drift_ticks: i64,
+    request: PlaceOrderRequest,
+) -> Result<PlaceOrderRequest, PlaceDefer> {
+    if request.order_type != OrderType::Market {
+        return Ok(request);
+    }
+    let Some(info) = dir.get(&request.instrument) else {
+        return Err(PlaceDefer::DataNotReady);
+    };
+    if info.exchange_id.trim() != crate::ctp::venue::SHFE_EXCHANGE_ID {
+        return Ok(request);
+    }
+    let book = read_ctp_book(quotes, &request.instrument);
+    let tick = Decimal::try_from(info.price_tick).unwrap_or(Decimal::ZERO);
+    prepare_shfe_market_limit(request, book, tick, drift_ticks)
 }
 
 #[cfg(test)]
@@ -268,22 +390,46 @@ mod tests {
     }
 
     #[test]
-    fn shfe_close_today_first_then_yesterday() {
+    fn shfe_close_yesterday_first_then_today() {
+        // 平今手续费远高于平昨：先平昨 3，不足的 1 手才平今。
         let split = TodayYdSplit {
             today: 2,
             yesterday: 3,
         };
         assert_eq!(
-            close_offsets(3, Some(split)).unwrap(),
-            vec![(Offset::CloseToday, 2), (Offset::CloseYesterday, 1)]
+            close_offsets(4, Some(split)).unwrap(),
+            vec![(Offset::CloseYesterday, 3), (Offset::CloseToday, 1)]
         );
     }
 
     #[test]
-    fn shfe_close_all_today() {
+    fn shfe_close_within_yesterday_never_touches_today() {
+        // 平仓量 ≤ 昨仓：只发平昨，完全不碰今仓。
         let split = TodayYdSplit {
             today: 2,
             yesterday: 3,
+        };
+        assert_eq!(
+            close_offsets(2, Some(split)).unwrap(),
+            vec![(Offset::CloseYesterday, 2)]
+        );
+        // 昨仓足够时即使今仓更多，也只平昨。
+        let split = TodayYdSplit {
+            today: 5,
+            yesterday: 3,
+        };
+        assert_eq!(
+            close_offsets(3, Some(split)).unwrap(),
+            vec![(Offset::CloseYesterday, 3)]
+        );
+    }
+
+    #[test]
+    fn shfe_close_today_only_when_no_yesterday() {
+        // 昨仓为 0：退化为单笔平今。
+        let split = TodayYdSplit {
+            today: 2,
+            yesterday: 0,
         };
         assert_eq!(
             close_offsets(2, Some(split)).unwrap(),
@@ -319,5 +465,146 @@ mod tests {
             yesterday: 1,
         };
         assert_eq!(close_offsets(0, Some(split)), Err(PlaceErrorKind::Rejected));
+    }
+
+    // ---- SHFE 市价单 → 穿价限价（GFD）----
+
+    use crate::api::PlaceDefer;
+
+    fn market_req(side: Side, reduce_only: bool) -> PlaceOrderRequest {
+        PlaceOrderRequest {
+            order_type: OrderType::Market,
+            price: None,
+            side,
+            reduce_only,
+            ..place_req()
+        }
+    }
+
+    #[test]
+    fn shfe_market_buy_open_uses_ask_plus_drift_ceiled_to_tick() {
+        // 买开：ask 3205 + 1 tick（tick=1）= 3206，向上取整不劣于穿价。
+        let req = market_req(Side::Buy, false);
+        let out = prepare_shfe_market_limit(
+            req,
+            Some(MarketRef {
+                bid: d(3204.0),
+                ask: d(3205.0),
+            }),
+            d(1.0),
+            1,
+        )
+        .unwrap();
+        assert_eq!(out.order_type, OrderType::Limit);
+        assert_eq!(out.price, Some(d(3206.0)));
+        assert_eq!(out.quantity, Decimal::from(2));
+    }
+
+    #[test]
+    fn shfe_market_sell_open_uses_bid_minus_drift_floored_to_tick() {
+        // 卖开：bid 3204 − 2 tick（tick=0.5）= 3203，向下取整。
+        let req = market_req(Side::Sell, false);
+        let out = prepare_shfe_market_limit(
+            req,
+            Some(MarketRef {
+                bid: d(3204.0),
+                ask: d(3205.0),
+            }),
+            d(0.5),
+            2,
+        )
+        .unwrap();
+        assert_eq!(out.price, Some(d(3203.0)));
+    }
+
+    #[test]
+    fn shfe_market_close_long_uses_best_bid_no_drift() {
+        // 平多 = sell+reduce_only：best bid，不漂移（漂移只作用于开仓）。
+        let req = market_req(Side::Sell, true);
+        let out = prepare_shfe_market_limit(
+            req,
+            Some(MarketRef {
+                bid: d(3204.0),
+                ask: d(3205.0),
+            }),
+            d(1.0),
+            5,
+        )
+        .unwrap();
+        assert_eq!(out.price, Some(d(3204.0)));
+    }
+
+    #[test]
+    fn shfe_market_close_short_uses_best_ask_no_drift() {
+        // 平空 = buy+reduce_only：best ask，不漂移。
+        let req = market_req(Side::Buy, true);
+        let out = prepare_shfe_market_limit(
+            req,
+            Some(MarketRef {
+                bid: d(3204.0),
+                ask: d(3205.0),
+            }),
+            d(1.0),
+            5,
+        )
+        .unwrap();
+        assert_eq!(out.price, Some(d(3205.0)));
+    }
+
+    #[test]
+    fn shfe_market_price_snaps_to_tick_grid() {
+        // ask=3205.3、tick=1、漂移 0：买单向上取整到 3206（保证穿价不被取整削弱）。
+        let req = market_req(Side::Buy, false);
+        let out = prepare_shfe_market_limit(
+            req,
+            Some(MarketRef {
+                bid: d(3204.7),
+                ask: d(3205.3),
+            }),
+            d(1.0),
+            0,
+        )
+        .unwrap();
+        assert_eq!(out.price, Some(d(3206.0)));
+    }
+
+    #[test]
+    fn shfe_market_without_book_defers() {
+        let req = market_req(Side::Buy, false);
+        assert_eq!(
+            prepare_shfe_market_limit(req, None, d(1.0), 1).unwrap_err(),
+            PlaceDefer::DataNotReady
+        );
+    }
+
+    #[test]
+    fn shfe_market_with_nonpositive_tick_defers() {
+        let req = market_req(Side::Buy, false);
+        assert_eq!(
+            prepare_shfe_market_limit(
+                req,
+                Some(MarketRef {
+                    bid: d(1.0),
+                    ask: d(1.0)
+                }),
+                d(0.0),
+                1
+            )
+            .unwrap_err(),
+            PlaceDefer::DataNotReady
+        );
+    }
+
+    #[test]
+    fn shfe_limit_request_passes_through() {
+        // 限价单（开或平）原样返回，不读盘口/tick。
+        let req = place_req();
+        let out = prepare_shfe_market_limit(req, None, d(0.0), 9).unwrap();
+        assert_eq!(out.order_type, OrderType::Limit);
+        assert_eq!(out.price, Some(d(3205.0)));
+    }
+
+    fn d(x: f64) -> Decimal {
+        Decimal::try_from(x).unwrap()
     }
 }

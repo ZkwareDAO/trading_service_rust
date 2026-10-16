@@ -286,8 +286,8 @@ fn inner_loop(h: &mut TraderHandle, handle: &Arc<CtpUserHandle>, ctx: &EventCont
                 contracts_loaded = true;
                 tracing::debug!(
                     account = %ctx.account,
-                    count = ctx.contract_dir.len(),
-                    "CTP 合约表预热完成（乘数已缓存）"
+                    count = ctx.instrument_dir.len(),
+                    "CTP 合约表预热完成（交易所/乘数/最小变动价位已缓存）"
                 );
                 dispatch_event(CtpEvent::QueryEnd, handle, ctx, &mut active);
             }
@@ -305,7 +305,7 @@ fn inner_loop(h: &mut TraderHandle, handle: &Arc<CtpUserHandle>, ctx: &EventCont
 /// 当前唯一在途查询（单在途闸门的状态；前台 RPC 与后台对账共用，严格互斥）。
 /// 不派生 Debug：载荷含 oneshot::Sender。
 enum ActiveQuery {
-    /// 建连后合约表预热：Instrument 行写入 ContractDir（乘数），QueryEnd 仅释放闸门。
+    /// 建连后合约表预热：Instrument 行写入共享 InstrumentDir（交易所/乘数/tick），QueryEnd 仅释放闸门。
     /// 由 [`ensure_contracts_loaded`] 保证先于任何持仓查询完成。
     Contracts,
     /// 前台按需查单：缓冲当日委托行，QueryEnd 选定后回 OrderLookup。
@@ -335,7 +335,7 @@ enum ActiveQuery {
 }
 
 /// 建连后合约表预热（仅本连接一次）：发起全量合约查询，Instrument 行经
-/// `dispatch_event` 写入 [`ContractDir`]，QueryEnd 释放闸门后才放行持仓查询。
+/// `dispatch_event` 写入 [`InstrumentDir`]，QueryEnd 释放闸门后才放行持仓查询。
 ///
 /// 受理码非 0（流控/未就绪）不占位也不翻 `loaded`，下一轮 2s 后重试；在途时
 /// （`active=Contracts`）等待 QueryEnd。这样保证首笔持仓快照到达时乘数已就绪。
@@ -397,7 +397,7 @@ fn issue_background_or_mailbox(
 /// 上期所交易所代码：只有 SHFE 强制显式平今/平昨。
 ///
 /// 能源中心 INE 规则类似但首版不纳入（柜台实测后再扩成集合常量，见 plan 风险表）。
-const SHFE_EXCHANGE_ID: &str = "SHFE";
+pub(crate) const SHFE_EXCHANGE_ID: &str = "SHFE";
 
 /// 一笔平仓单的物理路由决策（纯内核，不触 FFI/目录）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,9 +406,10 @@ enum ClosePlan {
     GenericClose,
     /// 上期所单笔显式腿（纯平今或纯平昨）。
     ShfeSingle(crate::ctp::core::types::Offset, i32),
-    /// 上期所跨今昨一单两腿：先平今 `today_n` 手、再平昨 `yesterday_n` 手，
-    /// 两物理报单共享同一 cid（成交/终态由 leg_table 按 cid 聚合）。
-    ShfeTwo { today_n: i32, yesterday_n: i32 },
+    /// 上期所跨今昨一单两腿：**先平昨 `yesterday_n` 手、再平今 `today_n` 手**
+    /// （平今手续费高，省费优先），两物理报单共享同一 cid
+    /// （成交/终态由 leg_table 按 cid 聚合）。
+    ShfeTwo { yesterday_n: i32, today_n: i32 },
 }
 
 /// 平仓路由决策失败原因（全部 fail-closed，绝不猜测发 Close）。
@@ -425,8 +426,9 @@ enum ClosePlanError {
 /// * `exchange != Some("SHFE")`（含目录未预热到的 None）→
 ///   [`ClosePlan::GenericClose`]，保持非上期所路径零变化；
 /// * SHFE：`split=None`（路由表未就绪）→ [`ClosePlanError::SplitNotReady`]；
-///   复用 [`prep::close_offsets`] 得 1~2 腿——今够→单笔 CloseToday、今 0→单笔
-///   CloseYesterday、跨今昨→[`ClosePlan::ShfeTwo`]；总量不足→拒。
+///   复用 [`prep::close_offsets`] 得 1~2 腿（**先平昨**）——平量 ≤ 昨仓→单笔
+///   CloseYesterday、昨仓为 0→单笔 CloseToday、跨今昨→[`ClosePlan::ShfeTwo`]
+///   （先 CloseYesterday 后 CloseToday）；总量不足→拒。
 fn plan_close(
     volume: i32,
     exchange: Option<&str>,
@@ -445,10 +447,11 @@ fn plan_close(
     // 异常形态（未来改动引入 0/3+ 腿）fail-closed 拒单而非崩溃。
     match legs.as_slice() {
         [(offset, n)] => Ok(ClosePlan::ShfeSingle(*offset, *n)),
-        [(Offset::CloseToday, today_n), (Offset::CloseYesterday, yesterday_n)] => {
+        // close_offsets 现按「先平昨、不足再平今」产出，腿序固定为昨腿在前。
+        [(Offset::CloseYesterday, yesterday_n), (Offset::CloseToday, today_n)] => {
             Ok(ClosePlan::ShfeTwo {
-                today_n: *today_n,
                 yesterday_n: *yesterday_n,
+                today_n: *today_n,
             })
         }
         // 腿序/数量不符 prep 契约：不下单（理论不可达）。
@@ -492,10 +495,10 @@ fn run_command(h: &mut TraderHandle, ctx: &EventContext, req: crate::ctp::mailbo
 enum RoutedInsert<'a> {
     Single(std::borrow::Cow<'a, crate::ctp::core::order::OrderRequest>),
     Two {
-        /// 先平今腿。
-        today: crate::ctp::core::order::OrderRequest,
-        /// 再平昨腿。
+        /// 先平昨腿（省费优先）。
         yesterday: crate::ctp::core::order::OrderRequest,
+        /// 再平今腿。
+        today: crate::ctp::core::order::OrderRequest,
     },
 }
 
@@ -523,10 +526,10 @@ fn routed_insert<'a>(
             routed.offset = offset;
             Ok(RoutedInsert::Single(Cow::Owned(routed)))
         }
-        // 跨今昨两腿：同价/同方向，仅开平标志与手数不同。
+        // 跨今昨两腿：同价/同方向，仅开平标志与手数不同；昨腿在前（先平昨省费）。
         Ok(ClosePlan::ShfeTwo {
-            today_n,
             yesterday_n,
+            today_n,
         }) => {
             let make_leg = |offset: Offset, volume: i32| {
                 let mut leg = req.clone();
@@ -535,8 +538,8 @@ fn routed_insert<'a>(
                 leg
             };
             Ok(RoutedInsert::Two {
-                today: make_leg(Offset::CloseToday, today_n),
                 yesterday: make_leg(Offset::CloseYesterday, yesterday_n),
+                today: make_leg(Offset::CloseToday, today_n),
             })
         }
         Err(e) => Err(e),
@@ -584,7 +587,7 @@ fn submit_insert(
         Direction::Sell => PositionSide::Long,
         Direction::Buy => PositionSide::Short,
     };
-    let exchange = ctx.exchange_dir.get(&req.instrument);
+    let exchange = ctx.instrument_dir.exchange(&req.instrument);
     let split = ctx.position_dir.get(&req.instrument, holding);
     let routed = match routed_insert(req, exchange.as_deref(), split) {
         Ok(r) => r,
@@ -605,8 +608,8 @@ fn submit_insert(
             }
             insert_one_leg(h, ctx, &effective, order_ref, "单腿").map(|()| 0)
         }
-        RoutedInsert::Two { today, yesterday } => {
-            submit_two_legs(h, ctx, req, order_ref, today, yesterday)
+        RoutedInsert::Two { yesterday, today } => {
+            submit_two_legs(h, ctx, req, order_ref, yesterday, today)
         }
     }
 }
@@ -632,14 +635,14 @@ fn insert_one_leg(
     }
 }
 
-/// 跨今昨两腿提交：同 cid、两个不同 OrderRef，先平今后平昨。
+/// 跨今昨两腿提交：同 cid、两个不同 OrderRef，**先平昨、再平今**（省平今高手续费）。
 fn submit_two_legs(
     h: &mut TraderHandle,
     ctx: &EventContext,
     req: &crate::ctp::core::order::OrderRequest,
     first_ref: &str,
-    today: crate::ctp::core::order::OrderRequest,
     yesterday: crate::ctp::core::order::OrderRequest,
+    today: crate::ctp::core::order::OrderRequest,
 ) -> anyhow::Result<i32> {
     // 第二腿需要本会话第二个唯一 OrderRef；只有长 cid（在 registry 有映射）能分配。
     // 短 cid（≤13B 透传）allocate 会原样返回同一串，无法支撑两腿，fail-closed。
@@ -653,19 +656,19 @@ fn submit_two_legs(
     let second_ref = ctx.order_refs.allocate(&cid);
     tracing::info!(
         account = %ctx.account, instrument = %req.instrument, cid = %cid,
-        today_n = today.volume, yesterday_n = yesterday.volume,
-        first_ref, second_ref,
-        "CTP SHFE 平仓路由：Close → 一单两腿（平今 + 平昨）"
+        yesterday_n = yesterday.volume, today_n = today.volume,
+        yesterday_ref = first_ref, today_ref = second_ref,
+        "CTP SHFE 平仓路由：Close → 一单两腿（先平昨 + 再平今）"
     );
-    // 第一腿失败：第二腿未发，两个 ref 都是脏数据。
-    if let Err(e) = insert_one_leg(h, ctx, &today, first_ref, "平今腿") {
+    // 第一腿（平昨）失败：第二腿未发，两个 ref 都是脏数据。
+    if let Err(e) = insert_one_leg(h, ctx, &yesterday, first_ref, "平昨腿") {
         ctx.order_refs.remove(&second_ref);
         return Err(e);
     }
-    // 第一腿已受理：第二腿失败只清第二腿映射，第一腿保留（靠回报/对账收敛，不静默）。
-    if let Err(e) = insert_one_leg(h, ctx, &yesterday, &second_ref, "平昨腿") {
+    // 昨腿已受理：今腿失败只清第二腿映射，昨腿保留（靠回报/对账收敛，不静默）。
+    if let Err(e) = insert_one_leg(h, ctx, &today, &second_ref, "平今腿") {
         return Err(anyhow::anyhow!(
-            "CTP 一单两腿：平今腿已受理、平昨腿失败（{e}）；整体判失败，已受理腿靠成交回报/对账收敛"
+            "CTP 一单两腿：平昨腿已受理、平今腿失败（{e}）；整体判失败，已受理腿靠成交回报/对账收敛"
         ));
     }
     Ok(0)
@@ -727,7 +730,7 @@ fn submit_cancel(
     // 单腿/跨会话：既有寻址（registry 三元组或 ExchangeID+OrderSysID）。
     let target = resolve_cancel_target(
         &ctx.order_refs,
-        &ctx.exchange_dir,
+        &ctx.instrument_dir,
         &c.instrument,
         &c.order,
         h.front_id(),
@@ -804,11 +807,10 @@ pub(crate) struct EventContext {
     pub account: String,
     /// cid ↔ OrderRef 映射（回报反查长 cid；撤单时 cid→OrderRef 反查也用它）。
     pub order_refs: Arc<crate::ctp::order_ref::OrderRefRegistry>,
-    /// 合约 → 交易所代码目录（委托回报/查询行喂入；跨会话撤单定位 ExchangeID）。
-    pub exchange_dir: Arc<crate::ctp::exchange_dir::ExchangeDir>,
-    /// 合约 → 乘数目录（建连后合约查询预热；持仓成本折算单价用）。
-    pub contract_dir: Arc<crate::ctp::contract_dir::ContractDir>,
-    /// (合约,持仓方向) → (今,昨) 会话内存路由表（SHFE 平今/平昨路由；不落盘）。
+    /// 进程级共享合约静态目录（交易所/乘数/最小变动价位；合约查询预热）。
+    /// SHFE 平仓路由判交易所、持仓聚合取乘数、市价转限价取 tick 都用它。
+    pub instrument_dir: Arc<crate::ctp::instrument_dir::InstrumentDir>,
+    /// (合约,持仓方向) → (今,昨) 会话内存路由表（本账户私有；SHFE 平今/平昨路由；不落盘）。
     pub position_dir: Arc<crate::ctp::position_dir::PositionDir>,
     /// cid → 物理腿委托快照（跨今昨一单两腿的成交/终态聚合；仅会话线程用）。
     pub leg_table: Arc<crate::ctp::leg_table::LegTable>,
@@ -870,20 +872,17 @@ fn dispatch_event(
 ) {
     use crate::ctp::core::event::CtpEvent;
     match ev {
-        // 实时委托回报：永远透传订单端口（即便有查询在途，也绝不被查询缓冲吞掉），
-        // 并顺手喂合约→交易所目录（跨会话撤单/将来 SHFE 路由复用，零额外请求）。
+        // 实时委托回报：永远透传订单端口（即便有查询在途，也绝不被查询缓冲吞掉）。
+        // 合约静态信息（含交易所）由建连后最高优先的合约预热统一写入共享 InstrumentDir，
+        // 这里不再用回报单独喂交易所目录（回报缺乘数/最小变动价位，无法构成完整静态信息）。
         CtpEvent::Order(s) => {
-            ctx.exchange_dir.remember(&s.instrument, &s.exchange_id);
             forward_order_snapshot(ctx, handle, s);
         }
         // 当日报单查询行：按在途闸门分流——前台查单缓冲，后台重放走订单桥。
         CtpEvent::OrderQuery(s) => match active {
             Some(ActiveQuery::FrontOrder { rows, .. }) => rows.push(s),
-            // 后台重放（或无在途查询的防御情形）：与实时回报同路径透传 + 喂目录。
-            _ => {
-                ctx.exchange_dir.remember(&s.instrument, &s.exchange_id);
-                forward_order_snapshot(ctx, handle, s);
-            }
+            // 后台重放（或无在途查询的防御情形）：与实时回报同路径透传。
+            _ => forward_order_snapshot(ctx, handle, s),
         },
         CtpEvent::Trade(t) => {
             // 回报反查：OrderRef → 本地长 cid（未命中保留原值，宿主 fallback 兜底）。
@@ -925,10 +924,11 @@ fn dispatch_event(
                 now_ms(),
             );
         }
-        // 合约预热行：喂入合约→乘数目录（仅在合约查询在途时；其余情形忽略）。
+        // 合约预热行：写进程级共享静态目录（交易所/乘数/最小变动价位），
+        // 仅在合约查询在途时接收（其余情形忽略，避免无在途查询的杂散行污染）。
         CtpEvent::Instrument(i) => {
             if matches!(active, Some(ActiveQuery::Contracts)) {
-                ctx.contract_dir.remember(&i.instrument, i.volume_multiple);
+                ctx.instrument_dir.remember(i);
             }
         }
         CtpEvent::Position(p) => {
@@ -1063,7 +1063,7 @@ fn finalize_position_batch(
         let Some(side) = PositionSide::from_position_char(dir_char) else {
             continue;
         };
-        let mult = ctx.contract_dir.get(&instrument).unwrap_or(0);
+        let mult = ctx.instrument_dir.multiple(&instrument);
         match merge_position_snapshots(&group, mult) {
             Some(merged) => {
                 // 快照是真相源：整批覆盖该 (合约,方向) 的今/昨。
@@ -1130,7 +1130,7 @@ fn finish_active_query(ctx: &EventContext, active: &mut Option<ActiveQuery>) {
         return;
     };
     match current {
-        // 合约预热收尾：Instrument 行已逐条写入 ContractDir，这里仅释放闸门。
+        // 合约预热收尾：Instrument 行已逐条写入共享 InstrumentDir，这里仅释放闸门。
         ActiveQuery::Contracts => {}
         ActiveQuery::FrontOrder {
             exchange_order_id,
@@ -1178,12 +1178,12 @@ fn finish_active_query(ctx: &EventContext, active: &mut Option<ActiveQuery>) {
 /// 1. **本会话三元组**：cid 经 registry 反查到本会话自产 OrderRef →
 ///    `FrontID+SessionID+OrderRef`（Front/Session 取线程当前 SessionState）；
 /// 2. **跨会话系统号**：registry 未命中（重启后表空）→ `ExchangeID+OrderSysID`，
-///    OrderSysID 取受理后升级的 `exchange_order_id`，ExchangeID 取 ExchangeDir 缓存。
+///    OrderSysID 取受理后升级的 `exchange_order_id`，ExchangeID 取共享 InstrumentDir。
 ///
-/// 无法定位（无 eid 或 ExchangeDir 未预热）时返回错误——绝不凭猜测撤单。
+/// 无法定位（无 eid 或 InstrumentDir 未预热）时返回错误——绝不凭猜测撤单。
 fn resolve_cancel_target(
     registry: &crate::ctp::order_ref::OrderRefRegistry,
-    dir: &crate::ctp::exchange_dir::ExchangeDir,
+    dir: &crate::ctp::instrument_dir::InstrumentDir,
     instrument: &str,
     order: &crate::api::OrderRef,
     front_id: i32,
@@ -1217,8 +1217,8 @@ fn resolve_cancel_target(
             "CTP 撤单无法定位：exchange_order_id 为空（委托尚未取得 OrderSysID），instrument={instrument}"
         );
     }
-    // ExchangeID 取自会话态目录（重连重放/实时回报预热，零额外请求）。
-    let Some(exchange_id) = dir.get(instrument) else {
+    // ExchangeID 取自共享合约目录（合约查询/回报预热，零额外请求）。
+    let Some(exchange_id) = dir.exchange(instrument) else {
         anyhow::bail!(
             "CTP 撤单跨会话定位失败：instrument={instrument} 的交易所目录尚未预热，\
              请待重连当日委托重放后重试"
@@ -1580,7 +1580,7 @@ mod tests {
     // ---- 撤单定位路由 / 查单行匹配（纯函数）----
 
     use crate::api::OrderRef;
-    use crate::ctp::exchange_dir::ExchangeDir;
+    use crate::ctp::core::event::InstrumentInfo;
     use crate::ctp::mailbox::CancelTarget;
 
     fn long_cid(tag: &str) -> String {
@@ -1606,13 +1606,29 @@ mod tests {
         }
     }
 
+    /// 测试用共享合约目录：可选预热一个 SHFE 合约（含交易所/乘数/tick）。
+    fn instrument_dir_warmed(warm: bool) -> crate::ctp::instrument_dir::InstrumentDir {
+        let dir = crate::ctp::instrument_dir::InstrumentDir::new();
+        if warm {
+            dir.remember(InstrumentInfo {
+                instrument: "rb2510".into(),
+                exchange_id: "SHFE".into(),
+                product_id: "rb".into(),
+                is_trading: true,
+                volume_multiple: 10,
+                price_tick: 1.0,
+            });
+        }
+        dir
+    }
+
     #[test]
     fn cancel_routes_by_triple_when_registry_hits_this_session() {
         // Arrange：长 cid 在本会话分配过 OrderRef；即使带了 eid 也优先三元组。
         let registry = OrderRefRegistry::new();
         let cid = long_cid("A");
         let order_ref = registry.allocate(&cid);
-        let dir = ExchangeDir::new();
+        let dir = instrument_dir_warmed(false);
         let order = OrderRef::new(cid.clone()).with_exchange("20260101-9");
 
         // Act
@@ -1633,8 +1649,7 @@ mod tests {
     fn cancel_routes_by_sys_id_after_restart_when_registry_cold() {
         // Arrange：重启后 registry 为空（cid 反查未命中），目录已预热该合约交易所。
         let registry = OrderRefRegistry::new();
-        let dir = ExchangeDir::new();
-        dir.remember("rb2510", "SHFE");
+        let dir = instrument_dir_warmed(true);
         let order = OrderRef::new(long_cid("R")).with_exchange("20260101-7");
 
         // Act
@@ -1654,7 +1669,7 @@ mod tests {
     fn cancel_errors_when_exchange_dir_not_warmed() {
         // Arrange：registry 未命中且目录未预热（重放前就撤重启旧单）。
         let registry = OrderRefRegistry::new();
-        let dir = ExchangeDir::new();
+        let dir = instrument_dir_warmed(false);
         let order = OrderRef::new(long_cid("R")).with_exchange("20260101-7");
 
         // Act / Assert：显式报错，绝不猜测 ExchangeID。
@@ -1665,8 +1680,7 @@ mod tests {
     fn cancel_errors_when_no_exchange_order_id_after_restart() {
         // Arrange：registry 未命中（重启）且手里没有任何交易所单号（受理态孤儿）。
         let registry = OrderRefRegistry::new();
-        let dir = ExchangeDir::new();
-        dir.remember("rb2510", "SHFE");
+        let dir = instrument_dir_warmed(true);
         let order = OrderRef::new(long_cid("R"));
 
         // Act / Assert：无法定位，报错而非猜测。
@@ -1679,7 +1693,7 @@ mod tests {
         let registry = OrderRefRegistry::new();
         let cid = long_cid("A");
         let _ = registry.allocate(&cid);
-        let dir = ExchangeDir::new();
+        let dir = instrument_dir_warmed(false);
         let order = OrderRef::new(cid);
 
         // Act / Assert：空/纯空白 instrument 在装配柜台结构前即拒绝（两路都拦）。
@@ -1766,37 +1780,42 @@ mod tests {
     }
 
     #[test]
-    fn close_route_shfe_today_sufficient_is_single_close_today() {
-        // 今 5 昨 3，平 3 → 单笔平今。
+    fn close_route_shfe_yesterday_sufficient_is_single_close_yesterday() {
+        // 今 5 昨 3，平 3 ≤ 昨仓 → 单笔平昨，完全不碰今仓（省平今手续费）。
         assert_eq!(
             plan_close(3, Some("SHFE"), Some((5, 3))).unwrap(),
-            ClosePlan::ShfeSingle(Offset::CloseToday, 3)
+            ClosePlan::ShfeSingle(Offset::CloseYesterday, 3)
         );
-        // 恰好平完全部今仓仍是单腿平今。
+        // 恰好平完全部昨仓仍是单腿平昨。
         assert_eq!(
-            plan_close(5, Some("SHFE"), Some((5, 3))).unwrap(),
-            ClosePlan::ShfeSingle(Offset::CloseToday, 5)
+            plan_close(3, Some("SHFE"), Some((5, 3))).unwrap(),
+            ClosePlan::ShfeSingle(Offset::CloseYesterday, 3)
         );
     }
 
     #[test]
-    fn close_route_shfe_no_today_is_single_close_yesterday() {
-        // 今 0 昨 3，平 2 → 单笔平昨。
+    fn close_route_shfe_no_yesterday_is_single_close_today() {
+        // 昨 0 今 2，平 2 → 退化为单笔平今。
         assert_eq!(
-            plan_close(2, Some("SHFE"), Some((0, 3))).unwrap(),
-            ClosePlan::ShfeSingle(Offset::CloseYesterday, 2)
+            plan_close(2, Some("SHFE"), Some((2, 0))).unwrap(),
+            ClosePlan::ShfeSingle(Offset::CloseToday, 2)
         );
     }
 
     #[test]
-    fn close_route_shfe_cross_split_is_two_legs() {
-        // 今 2 昨 3，平 3 → 一单两腿：先平今 2、再平昨 1。
+    fn close_route_shfe_cross_split_is_two_legs_yesterday_first() {
+        // 今 2 昨 3，平 4 → 一单两腿：先平昨 3、再平今 1。
+        assert_eq!(
+            plan_close(4, Some("SHFE"), Some((2, 3))).unwrap(),
+            ClosePlan::ShfeTwo {
+                yesterday_n: 3,
+                today_n: 1
+            }
+        );
+        // 平量 ≤ 昨仓时绝不出两腿（今 2 昨 3 平 3 只平昨）。
         assert_eq!(
             plan_close(3, Some("SHFE"), Some((2, 3))).unwrap(),
-            ClosePlan::ShfeTwo {
-                today_n: 2,
-                yesterday_n: 1
-            }
+            ClosePlan::ShfeSingle(Offset::CloseYesterday, 3)
         );
     }
 
@@ -1850,12 +1869,12 @@ mod tests {
     }
 
     #[test]
-    fn routed_insert_shfe_close_today_rewrites_offset_only() {
-        // 卖平多头、今仓足够：Close → CloseToday，量/价/方向不变。
+    fn routed_insert_shfe_close_within_yesterday_rewrites_to_close_yesterday() {
+        // 卖平多头、平量 ≤ 昨仓：Close → CloseYesterday（不碰今仓），量/价/方向不变。
         let req = close_req(Direction::Sell, 3);
         let out = routed_insert(&req, Some("SHFE"), Some((5, 3))).unwrap();
         let r = single_routed(&out);
-        assert_eq!(r.offset, Offset::CloseToday);
+        assert_eq!(r.offset, Offset::CloseYesterday);
         assert_eq!(r.volume, 3);
         assert_eq!(r.direction, Direction::Sell);
         assert_eq!(r.price, 3300.0);
@@ -1864,11 +1883,12 @@ mod tests {
     }
 
     #[test]
-    fn routed_insert_shfe_close_yesterday_when_no_today() {
+    fn routed_insert_shfe_close_today_when_no_yesterday() {
+        // 昨仓为 0：退化为单笔平今。
         let req = close_req(Direction::Buy, 2);
-        let out = routed_insert(&req, Some("SHFE"), Some((0, 4))).unwrap();
+        let out = routed_insert(&req, Some("SHFE"), Some((4, 0))).unwrap();
         let r = single_routed(&out);
-        assert_eq!(r.offset, Offset::CloseYesterday);
+        assert_eq!(r.offset, Offset::CloseToday);
         assert_eq!(r.volume, 2);
     }
 
@@ -1883,19 +1903,19 @@ mod tests {
     }
 
     #[test]
-    fn routed_insert_shfe_cross_split_produces_two_legs() {
-        // 今 2 昨 3 平 3 → 两腿：平今 2 + 平昨 1，同价同方向。
-        let req = close_req(Direction::Sell, 3);
+    fn routed_insert_shfe_cross_split_produces_two_legs_yesterday_first() {
+        // 今 2 昨 3 平 4 → 两腿：先平昨 3、再平今 1，同价同方向，昨腿在前。
+        let req = close_req(Direction::Sell, 4);
         let out = routed_insert(&req, Some("SHFE"), Some((2, 3))).unwrap();
         match out {
-            RoutedInsert::Two { today, yesterday } => {
-                assert_eq!(today.offset, Offset::CloseToday);
-                assert_eq!(today.volume, 2);
+            RoutedInsert::Two { yesterday, today } => {
                 assert_eq!(yesterday.offset, Offset::CloseYesterday);
-                assert_eq!(yesterday.volume, 1);
-                assert_eq!(today.direction, Direction::Sell);
-                assert_eq!(today.price, 3300.0);
+                assert_eq!(yesterday.volume, 3);
+                assert_eq!(today.offset, Offset::CloseToday);
+                assert_eq!(today.volume, 1);
+                assert_eq!(yesterday.direction, Direction::Sell);
                 assert_eq!(yesterday.price, 3300.0);
+                assert_eq!(today.price, 3300.0);
             }
             _ => panic!("期望跨今昨两腿"),
         }
@@ -1927,8 +1947,7 @@ mod tests {
         let ctx = Arc::new(EventContext {
             account: "acct".into(),
             order_refs: Arc::new(OrderRefRegistry::new()),
-            exchange_dir: Arc::new(ExchangeDir::new()),
-            contract_dir: Arc::new(crate::ctp::contract_dir::ContractDir::new()),
+            instrument_dir: Arc::new(crate::ctp::instrument_dir::InstrumentDir::new()),
             position_dir: Arc::new(crate::ctp::position_dir::PositionDir::new()),
             leg_table: Arc::new(crate::ctp::leg_table::LegTable::new()),
             tx,
@@ -1953,9 +1972,16 @@ mod tests {
         }
     }
 
-    /// 给合约目录预热 rb2510 乘数 10（模拟建连后合约表预热完成）。
+    /// 给共享合约目录预热 rb2510（SHFE/乘数10/最小变动价位1，模拟合约表预热完成）。
     fn warm_rb_multiple(ctx: &EventContext) {
-        ctx.contract_dir.remember("rb2510", 10);
+        ctx.instrument_dir.remember(InstrumentInfo {
+            instrument: "rb2510".into(),
+            exchange_id: "SHFE".into(),
+            product_id: "rb".into(),
+            is_trading: true,
+            volume_multiple: 10,
+            price_tick: 1.0,
+        });
     }
 
     fn front_order_active(
@@ -2074,7 +2100,7 @@ mod tests {
 
     #[test]
     fn contracts_query_warms_multiple_dir_and_releases_gate() {
-        // 合约预热：Instrument 行经 Contracts 在途写入 ContractDir，QueryEnd 释放闸门。
+        // 合约预热：Instrument 行经 Contracts 在途写入共享 InstrumentDir，QueryEnd 释放闸门。
         let (ctx, _rx) = ctx_and_rx();
         let h = handle();
         let mut active = Some(ActiveQuery::Contracts);
@@ -2085,24 +2111,25 @@ mod tests {
                 product_id: "rb".into(),
                 is_trading: true,
                 volume_multiple: 10,
+                price_tick: 1.0,
             }),
             &h,
             &ctx,
             &mut active,
         );
-        assert_eq!(ctx.contract_dir.get("rb2510"), Some(10));
+        assert_eq!(ctx.instrument_dir.multiple("rb2510"), 10);
         dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
         assert!(active.is_none(), "合约预热 QueryEnd 释放闸门");
     }
 
     #[test]
-    fn back_order_replay_forwards_query_rows_to_bridge_and_warms_dir() {
+    fn back_order_replay_forwards_query_rows_to_bridge() {
         // Arrange：后台重连委托重放在途。
         let (ctx, mut bridge_rx) = ctx_and_rx();
         let h = handle();
         let mut active = Some(ActiveQuery::BackOrderReplay);
 
-        // Act：查询行应像实时回报一样透传订单桥（恢复状态机）并喂交易所目录。
+        // Act：查询行像实时回报一样透传订单桥（恢复状态机）。
         dispatch_event(
             CtpEvent::OrderQuery(qrow("101", "20260101-2", "SHFE", "rb2510")),
             &h,
@@ -2110,9 +2137,9 @@ mod tests {
             &mut active,
         );
 
-        // Assert：订单桥收到一帧；目录已预热（供跨会话撤单）；闸门仍在（等 QueryEnd）。
+        // Assert：订单桥收到一帧；闸门仍在（等 QueryEnd）。交易所目录由合约预热
+        // 负责（见 contracts_query_warms_*），委托回报不再喂目录。
         assert!(matches!(bridge_rx.try_recv(), Ok(BridgeEvent::Order(_))));
-        assert_eq!(ctx.exchange_dir.get("rb2510").as_deref(), Some("SHFE"));
         assert!(active.is_some());
         dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
         assert!(active.is_none(), "重放 QueryEnd 释放闸门");
@@ -2372,9 +2399,8 @@ mod tests {
             &mut active,
         );
 
-        // Assert：实时回报未被查询缓冲吞掉，订单桥收到且目录被喂。
+        // Assert：实时回报未被查询缓冲吞掉，订单桥收到。
         assert!(matches!(bridge_rx.try_recv(), Ok(BridgeEvent::Order(_))));
-        assert_eq!(ctx.exchange_dir.get("rb2510").as_deref(), Some("SHFE"));
     }
 
     #[test]

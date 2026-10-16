@@ -101,6 +101,8 @@ struct CtpSection {
     md_account: Option<String>,
     md_anon: Option<bool>,
     md_pass_is_authcode: Option<bool>,
+    /// SHFE 市价开仓穿价漂移档数（缺省用 trading-exchange 内置默认 1）。
+    shfe_market_drift_ticks: Option<i64>,
 }
 
 /// 加载 venue 配置：文件不存在 → 全默认；存在则按字段补默认。
@@ -129,6 +131,7 @@ pub fn load(path: &Path) -> anyhow::Result<LoadedVenueConfigs> {
             parsed.ctp.md_account,
             parsed.ctp.md_anon,
             parsed.ctp.md_pass_is_authcode,
+            parsed.ctp.shfe_market_drift_ticks,
         ),
     })
 }
@@ -144,7 +147,7 @@ pub fn default_configs() -> LoadedVenueConfigs {
             slippage: default_slippage(),
         },
         #[cfg(feature = "ctp")]
-        ctp: trading_exchange::ctp::from_values(None, None, None, None, None, None, None),
+        ctp: trading_exchange::ctp::from_values(None, None, None, None, None, None, None, None),
     }
 }
 
@@ -186,6 +189,35 @@ mod tests {
         assert_eq!(cfg.deribit.drift_ticks, 8);
         assert_eq!(cfg.deribit.spread_threshold, "0.01".parse().unwrap());
         assert_eq!(cfg.hyperliquid.slippage, "0.1".parse().unwrap());
+    }
+
+    #[cfg(feature = "ctp")]
+    #[test]
+    fn parses_ctp_shfe_drift_ticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("venue.toml");
+        std::fs::write(
+            &path,
+            "[ctp]\nmd_front = \"tcp://x:1\"\nshfe_market_drift_ticks = 4\n",
+        )
+        .unwrap();
+        let cfg = load(&path).expect("ok");
+        assert_eq!(cfg.ctp.shfe_market_drift_ticks, 4);
+        // 其他字段缺省仍成立。
+        assert_eq!(cfg.ctp.md_front, "tcp://x:1");
+    }
+
+    #[cfg(feature = "ctp")]
+    #[test]
+    fn ctp_drift_defaults_to_one_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("venue.toml");
+        std::fs::write(&path, "[ctp]\n").unwrap();
+        let cfg = load(&path).expect("ok");
+        assert_eq!(
+            cfg.ctp.shfe_market_drift_ticks,
+            trading_exchange::ctp::DEFAULT_SHFE_MARKET_DRIFT_TICKS
+        );
     }
 
     #[test]
