@@ -1,0 +1,44 @@
+# ctp-mock：面向 CTP 全生命周期的「前置事件模拟器」嵌套 workspace。
+#
+# 独立于主 workspace（自带 target / Cargo.lock），复用同一 libclang 工具链与
+# vendored ctp2rs 绑定。根 manifest 同时是 harness 包：承载 L2 dlopen ABI 冒烟
+# 测试（tests/abi_e2e.rs），四个真正的产物在 members 中。
+[package]
+name = "ctp-mock"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "CTP 前置事件模拟器（ABI 替身 .so + 最小自洽台账 + 控制面）"
+
+[workspace]
+resolver = "2"
+members = [
+    "ctp-mock-core",
+    "ctp-mock-td",
+    "ctp-mock-md",
+    "ctp-mock-ctl",
+]
+
+[workspace.dependencies]
+# 复用仓库内 vendored ctp2rs：bindgen 结构体/vtable 单一来源，字段位宽零漂移。
+ctp2rs = { path = "../ctp2rs/ctp-dyn" }
+ctp-mock-core = { path = "ctp-mock-core" }
+ctp-mock-td = { path = "ctp-mock-td" }
+ctp-mock-md = { path = "ctp-mock-md" }
+libloading = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+encoding_rs = "0.8"
+
+[lib]
+# 根包只承载集成测试；lib 目标保留为空壳以便 tests/ 正常构建。
+path = "src/lib.rs"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+ctp2rs = { workspace = true }
+libloading = { workspace = true }
+# 以 rlib 形态依赖，确保 `cargo test --test abi_e2e` 时两个 .so 已先行构建。
+ctp-mock-td = { workspace = true }
+ctp-mock-md = { workspace = true }

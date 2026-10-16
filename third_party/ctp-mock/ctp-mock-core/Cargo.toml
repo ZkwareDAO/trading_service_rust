@@ -1,0 +1,18 @@
+[package]
+name = "ctp-mock-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "ctp-mock 模拟器内核：会话协议/脚本/台账/字段保真/行情/控制面（纯逻辑可单测）"
+
+[lib]
+name = "ctp_mock_core"
+path = "src/lib.rs"
+
+[dependencies]
+ctp2rs = { workspace = true }
+encoding_rs = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { workspace = true }
+serde_json = { workspace = true }

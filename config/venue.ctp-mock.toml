@@ -1,0 +1,23 @@
+# ctp-mock 联调用 venue 配置（黑盒测试网替身）。
+#
+# 先构建：scripts/build-ctp-mock.sh
+# 再以本配置启动服务：
+#   cargo run -p trading-service --features ctp -- --venue-config config/venue.ctp-mock.toml
+#
+# 替身 .so 与真实 thosttraderapi_se.so ABI 同构：服务零改动即把它当 CTP 测试网连接。
+# 控制面端口/全天行情由环境变量在服务启动前注入（见 README「真实进程黑盒联调」）：
+#   export CTP_MOCK_CTRL_TD=43011 CTP_MOCK_CTRL_MD=43012 CTP_MOCK_AUTO_TICK=1
+# 假凭证用 account-tool add-account（is_production_mode=false）。
+
+# ---- CTP 国内期货（指向 mock 替身产物）----
+[ctp]
+# 绝对/相对路径均可；此处给出 debug 产物，--release 联调时改为 target/release。
+trader_so = "third_party/ctp-mock/target/debug/libctpmock_td.so"
+md_so = "third_party/ctp-mock/target/debug/libctpmock_md.so"
+# 流文件目录（替身不真正落盘，但仍需一个可创建目录）。
+flow_path = "/tmp/ctp-mock-flow"
+# 行情前置（替身不建连，地址仅作占位；非空才会启动行情线程）。
+md_front = "tcp://127.0.0.1:42213"
+md_account = "MOCKTEST001"
+md_anon = false
+md_pass_is_authcode = false

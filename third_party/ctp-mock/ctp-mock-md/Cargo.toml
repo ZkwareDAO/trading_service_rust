@@ -1,0 +1,16 @@
+[package]
+name = "ctp-mock-md"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "ctp-mock 行情前置 ABI 替身（导出 Itanium mangled CreateFtdcMdApi 等符号）"
+
+[lib]
+name = "ctpmock_md"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+ctp2rs = { workspace = true }
+ctp-mock-core = { workspace = true }

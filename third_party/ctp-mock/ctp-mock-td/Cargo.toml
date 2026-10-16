@@ -1,0 +1,18 @@
+[package]
+name = "ctp-mock-td"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "ctp-mock 交易前置 ABI 替身（导出 Itanium mangled CreateFtdcTraderApi 等符号）"
+
+[lib]
+# cdylib 产出 libctpmock_td.so（venue.toml 的 trader_so 指向它）；
+# rlib 仅供嵌套 workspace 内 L2 测试建立构建依赖（确保 .so 先于测试构建）。
+name = "ctpmock_td"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+ctp2rs = { workspace = true }
+ctp-mock-core = { workspace = true }

@@ -1,0 +1,9 @@
+# 嵌套 workspace 独立构建产物（与主 workspace 的 /target 分离）
+/target
+# 替身不真正落流文件，但忽略可能在 cwd 产生的 CTP 流/con 残留
+td_flow_*
+md_flow_*
+ctl_td_flow_*
+ctl_md_flow_*
+*_flow_e2e_*
+*_flow_

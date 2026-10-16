@@ -1,0 +1,14 @@
+[package]
+name = "ctp-mock-ctl"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "ctp-mock 控制面 CLI（行分隔 JSON over 127.0.0.1 TCP）"
+
+[[bin]]
+name = "ctp-mock-ctl"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
