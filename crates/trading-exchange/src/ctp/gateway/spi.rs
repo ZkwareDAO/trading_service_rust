@@ -130,7 +130,7 @@ impl TraderSpi for EventTraderSpi {
         instrument: Option<&ctp2rs::v1alpha1::CThostFtdcInstrumentField>,
         _info: Option<&CThostFtdcRspInfoField>,
         _request_id: i32,
-        _is_last: bool,
+        is_last: bool,
     ) {
         if let Some(i) = instrument {
             self.emit(CtpEvent::Instrument(InstrumentInfo {
@@ -138,7 +138,12 @@ impl TraderSpi for EventTraderSpi {
                 exchange_id: decode_fixed(&i.ExchangeID),
                 product_id: decode_fixed(&i.ProductID),
                 is_trading: i.IsTrading != 0,
+                volume_multiple: i.VolumeMultiple,
             }));
+        }
+        // 与持仓/委托查询一致：分页末条须发 QueryEnd，否则合约预热闸门永不释放。
+        if is_last {
+            self.emit(CtpEvent::QueryEnd);
         }
     }
 
@@ -251,6 +256,21 @@ mod tests {
         let (mut spi, rx) = setup();
         spi.on_rtn_order(Some(&Default::default()));
         assert!(matches!(rx.try_recv(), Ok(CtpEvent::Order(_))));
+    }
+
+    #[test]
+    fn rsp_qry_instrument_emits_query_end_only_on_last() {
+        let (mut spi, rx) = setup();
+        // 非末条：只发 Instrument，不发 QueryEnd。
+        spi.on_rsp_qry_instrument(Some(&Default::default()), None, 1, false);
+        assert!(matches!(rx.try_recv(), Ok(CtpEvent::Instrument(_))));
+        assert!(
+            rx.try_recv().is_err(),
+            "非末条不得发 QueryEnd（否则提前释放闸门）"
+        );
+        // 末条（末页可能无数据行）：必须发 QueryEnd 释放合约预热闸门。
+        spi.on_rsp_qry_instrument(None, None, 1, true);
+        assert!(matches!(rx.try_recv(), Ok(CtpEvent::QueryEnd)));
     }
 
     #[test]

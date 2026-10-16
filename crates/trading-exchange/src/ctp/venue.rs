@@ -263,18 +263,33 @@ pub(crate) fn run_session_loop(
 /// * 订单/成交/持仓事件喂线程内去抖器（事件只当脏信号）。
 fn inner_loop(h: &mut TraderHandle, handle: &Arc<CtpUserHandle>, ctx: &EventContext) {
     use crate::ctp::core::event::CtpEvent;
-    // 单在途查询闸门：None=空闲；Some=恰有一个查询待 QueryEnd（前台/后台四类互斥）。
+    // 单在途查询闸门：None=空闲；Some=恰有一个查询待 QueryEnd（前台/后台/合约预热互斥）。
     let mut active: Option<ActiveQuery> = None;
+    // 本连接是否已发起合约表预热；断线重连会重新进入 inner_loop，标志复位、重拉一次。
+    let mut contracts_loaded = false;
     loop {
         if handle.shutdown.load(Ordering::SeqCst) {
             return;
         }
+        // 最高优先：建连后先全量预热合约表（乘数），收齐前不发起持仓查询，
+        // 保证持仓成本能按 VolumeMultiple 折算成单价。
+        ensure_contracts_loaded(h, ctx, &mut active, &mut contracts_loaded);
         // 每轮都服务请求：下单/撤单即使有查询在途也立即执行；后台查询与前台
         // 查询的互斥由 issue_* 内部按 active 闸门 + 纯内核 plan_mailbox_drain 决定。
-        issue_background_or_mailbox(h, handle, ctx, &mut active);
+        issue_background_or_mailbox(h, handle, ctx, &mut active, contracts_loaded);
         match h.next_event(EVENT_POLL_TIMEOUT) {
             // 断线：active 随 return drop，在途 oneshot 关闭，前台得 RecvError。
             Some(CtpEvent::FrontDisconnected(_)) => return,
+            Some(CtpEvent::QueryEnd) if matches!(active, Some(ActiveQuery::Contracts)) => {
+                // 合约表收齐：翻预热标志（须在 finish 释放闸门前判定）。
+                contracts_loaded = true;
+                tracing::debug!(
+                    account = %ctx.account,
+                    count = ctx.contract_dir.len(),
+                    "CTP 合约表预热完成（乘数已缓存）"
+                );
+                dispatch_event(CtpEvent::QueryEnd, handle, ctx, &mut active);
+            }
             Some(ev) => dispatch_event(ev, handle, ctx, &mut active),
             None => {
                 // 空闲且闸门空闲：去抖到点则触发后台持仓对账。
@@ -286,9 +301,12 @@ fn inner_loop(h: &mut TraderHandle, handle: &Arc<CtpUserHandle>, ctx: &EventCont
     }
 }
 
-/// 当前唯一在途查询（单在途闸门的四态；前台 RPC 与后台对账共用，严格互斥）。
+/// 当前唯一在途查询（单在途闸门的状态；前台 RPC 与后台对账共用，严格互斥）。
 /// 不派生 Debug：载荷含 oneshot::Sender。
 enum ActiveQuery {
+    /// 建连后合约表预热：Instrument 行写入 ContractDir（乘数），QueryEnd 仅释放闸门。
+    /// 由 [`ensure_contracts_loaded`] 保证先于任何持仓查询完成。
+    Contracts,
     /// 前台按需查单：缓冲当日委托行，QueryEnd 选定后回 OrderLookup。
     FrontOrder {
         /// 首选匹配值（OrderSysID / 受理态 OrderRef）。
@@ -307,34 +325,57 @@ enum ActiveQuery {
     },
     /// 后台委托重放（重连 query_orders("")）：查询行经订单桥恢复状态机并喂目录。
     BackOrderReplay,
-    /// 后台持仓对账：原始持仓行缓冲，QueryEnd 聚合后经持仓桥。
-    BackPositions {
-        buf: Vec<crate::ctp::core::event::PositionSnapshot>,
-    },
+    /// 后台持仓对账：已按乘数映射为单价口径的持仓缓冲，QueryEnd 整批经持仓桥。
+    BackPositions { buf: Vec<crate::api::PositionInfo> },
+}
+
+/// 建连后合约表预热（仅本连接一次）：发起全量合约查询，Instrument 行经
+/// `dispatch_event` 写入 [`ContractDir`]，QueryEnd 释放闸门后才放行持仓查询。
+///
+/// 受理码非 0（流控/未就绪）不占位也不翻 `loaded`，下一轮 2s 后重试；在途时
+/// （`active=Contracts`）等待 QueryEnd。这样保证首笔持仓快照到达时乘数已就绪。
+fn ensure_contracts_loaded(
+    h: &mut TraderHandle,
+    ctx: &EventContext,
+    active: &mut Option<ActiveQuery>,
+    loaded: &mut bool,
+) {
+    if *loaded || active.is_some() {
+        return;
+    }
+    if h.query_instruments() == 0 {
+        *active = Some(ActiveQuery::Contracts);
+        tracing::debug!(account = %ctx.account, "CTP 合约表预热：已发起全量合约查询（乘数）");
+    }
+    // 受理失败：loaded 仍 false、不占位，下轮重试。
 }
 
 /// 一轮"发起"调度：闸门空闲时后台脏标志（委托重放 → 持仓对账）优先；前台信箱
 /// **每轮**都经纯内核 [`plan_mailbox_drain`] 决策——下单/撤单即使有查询在途也
 /// 立即执行，仅前台查询受在途闸门约束（Defer 回塞队首）。任一查询受理码非 0
 /// （流控/未就绪）都不占位，下一轮重试。
+///
+/// `contracts_loaded`：合约乘数预热完成前不发起持仓查询（否则成本无法折算单价）；
+/// 委托重放不依赖乘数，仍可先行。
 fn issue_background_or_mailbox(
     h: &mut TraderHandle,
     handle: &Arc<CtpUserHandle>,
     ctx: &EventContext,
     active: &mut Option<ActiveQuery>,
+    contracts_loaded: bool,
 ) {
     use crate::ctp::mailbox::{plan_mailbox_drain, MailboxAction};
     // ①② 后台查询仅在闸门空闲时发起；在途时保留标志（不消费），下一轮再试。
     if active.is_none() {
-        // ① 重连委托重放（优先，保证状态恢复先于持仓）。
+        // ① 重连委托重放（优先，保证状态恢复先于持仓；不依赖乘数）。
         if handle.flags.query_orders.swap(false, Ordering::SeqCst) {
             if h.query_orders("") == 0 {
                 *active = Some(ActiveQuery::BackOrderReplay);
             }
             return;
         }
-        // ② 去抖/全量持仓对账。
-        if handle.flags.query_positions.swap(false, Ordering::SeqCst) {
+        // ② 去抖/全量持仓对账——必须等合约乘数预热完成，否则单价折算缺除数。
+        if contracts_loaded && handle.flags.query_positions.swap(false, Ordering::SeqCst) {
             issue_back_positions(h, active);
             return;
         }
@@ -458,6 +499,8 @@ pub(crate) struct EventContext {
     pub order_refs: Arc<crate::ctp::order_ref::OrderRefRegistry>,
     /// 合约 → 交易所代码目录（委托回报/查询行喂入；跨会话撤单定位 ExchangeID）。
     pub exchange_dir: Arc<crate::ctp::exchange_dir::ExchangeDir>,
+    /// 合约 → 乘数目录（建连后合约查询预热；持仓成本折算单价用）。
+    pub contract_dir: Arc<crate::ctp::contract_dir::ContractDir>,
     /// 事件桥发送端；随会话线程结束（EventContext drop）而关闭，消费任务随之退出。
     pub tx: tokio::sync::mpsc::Sender<BridgeEvent>,
     /// 线程内去抖器（复用跨所通用纯决策内核）。
@@ -556,19 +599,30 @@ fn dispatch_event(
                 now_ms(),
             );
         }
-        CtpEvent::Position(p) => match active {
-            // 前台查仓：边映射边缓冲（数量为 0 的行由 mapper 过滤），QueryEnd 整批 oneshot。
-            Some(ActiveQuery::FrontPositions { buf, .. }) => {
-                if let Some(info) = crate::ctp::mapping::position_info_from_snapshot(&p) {
-                    buf.push(info);
-                }
+        // 合约预热行：喂入合约→乘数目录（仅在合约查询在途时；其余情形忽略）。
+        CtpEvent::Instrument(i) => {
+            if matches!(active, Some(ActiveQuery::Contracts)) {
+                ctx.contract_dir.remember(&i.instrument, i.volume_multiple);
             }
-            // 后台对账：保留原始行，QueryEnd 聚合后经持仓桥。
-            Some(ActiveQuery::BackPositions { buf }) => buf.push(p),
-            // 无在途持仓查询却收到持仓行：不属于本轮，忽略（不污染任何缓冲）。
-            _ => tracing::debug!(account = %ctx.account, instrument = %p.instrument,
-                "收到无在途查询的持仓行，已忽略"),
-        },
+        }
+        CtpEvent::Position(p) => {
+            // 乘数按合约取；预热缺失（None）时 mapper 返回 None 过滤该批，下轮补。
+            let mult = ctx.contract_dir.get(&p.instrument).unwrap_or(0);
+            match active {
+                // 前台查仓 / 后台对账：都先按乘数映射为单价口径 PositionInfo 再缓冲
+                // （数量为 0/乘数缺失的行由 mapper 过滤）；QueryEnd 再分 oneshot / 持仓桥收尾。
+                Some(
+                    ActiveQuery::FrontPositions { buf, .. } | ActiveQuery::BackPositions { buf },
+                ) => {
+                    if let Some(info) = crate::ctp::mapping::position_info_from_snapshot(&p, mult) {
+                        buf.push(info);
+                    }
+                }
+                // 无在途持仓查询却收到持仓行：不属于本轮，忽略（不污染任何缓冲）。
+                _ => tracing::debug!(account = %ctx.account, instrument = %p.instrument,
+                    "收到无在途查询的持仓行，已忽略"),
+            }
+        }
         CtpEvent::QueryEnd => finish_active_query(ctx, active),
         CtpEvent::Error { code, msg } => {
             // 报单拒/撤单异步拒绝（24/25/26 等）：终态以 on_rtn_order 为准，
@@ -612,6 +666,8 @@ fn finish_active_query(ctx: &EventContext, active: &mut Option<ActiveQuery>) {
         return;
     };
     match current {
+        // 合约预热收尾：Instrument 行已逐条写入 ContractDir，这里仅释放闸门。
+        ActiveQuery::Contracts => {}
         ActiveQuery::FrontOrder {
             exchange_order_id,
             hint,
@@ -641,12 +697,8 @@ fn finish_active_query(ctx: &EventContext, active: &mut Option<ActiveQuery>) {
             // 重放行已在 OrderQuery 分支逐条透传订单桥，QueryEnd 仅释放闸门。
         }
         ActiveQuery::BackPositions { buf } => {
-            // 后台对账：聚合为快照经事件桥投仓位端口（与前台查仓同一 mapper）。
-            let positions: Vec<crate::api::PositionInfo> = buf
-                .iter()
-                .filter_map(crate::ctp::mapping::position_info_from_snapshot)
-                .collect();
-            if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Positions(positions)) {
+            // 后台对账：buf 已在 Position 分支按乘数映射为单价口径，整批经持仓桥。
+            if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Positions(buf)) {
                 tracing::warn!(account = %ctx.account, "事件桥已关闭，持仓快照丢弃：{e}");
             }
         }
@@ -1157,6 +1209,7 @@ mod tests {
             account: "acct".into(),
             order_refs: Arc::new(OrderRefRegistry::new()),
             exchange_dir: Arc::new(ExchangeDir::new()),
+            contract_dir: Arc::new(crate::ctp::contract_dir::ContractDir::new()),
             tx,
             debouncer: Arc::new(Mutex::new(crate::reconcile::ReconcileDebouncer::new(
                 500, 60_000,
@@ -1166,16 +1219,22 @@ mod tests {
     }
 
     fn long_position() -> PositionSnapshot {
+        // 真实量纲：rb 乘数 10、单价 3205、3 手 → 总成本 3205×10×3 = 96150。
         PositionSnapshot {
             instrument: "rb2510".into(),
             direction: '2',
             position: 3,
             yd_position: 1,
             today_position: 2,
-            position_cost: 9615.0,
-            use_margin: 1000.0,
+            position_cost: 96_150.0,
+            use_margin: 32_050.0,
             position_profit: 55.0,
         }
+    }
+
+    /// 给合约目录预热 rb2510 乘数 10（模拟建连后合约表预热完成）。
+    fn warm_rb_multiple(ctx: &EventContext) {
+        ctx.contract_dir.remember("rb2510", 10);
     }
 
     fn front_order_active(
@@ -1254,16 +1313,65 @@ mod tests {
             buf: Vec::new(),
             reply: Some(tx),
         });
+        // 合约乘数先预热（建连后合约查询的产物），持仓行才能折算单价。
+        warm_rb_multiple(&ctx);
         dispatch_event(CtpEvent::Position(long_position()), &h, &ctx, &mut active);
 
         // Act
         dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
 
-        // Assert：整批映射后 oneshot 回执（3 手多头）。
+        // Assert：整批映射后 oneshot 回执（3 手多头；单价 96150/(3×10)=3205）。
         let positions = rx.try_recv().unwrap().unwrap();
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].signed_quantity, rust_decimal::Decimal::from(3));
+        assert_eq!(
+            positions[0].entry_price,
+            rust_decimal::Decimal::try_from(3205.0).unwrap()
+        );
+        assert_eq!(
+            positions[0].multiplier,
+            Some(rust_decimal::Decimal::from(10))
+        );
         assert!(active.is_none());
+    }
+
+    #[test]
+    fn front_positions_without_contract_multiple_is_filtered() {
+        // 合约表未预热（乘数缺失）：宁可过滤该批，也不产出错误量纲的成本价。
+        let (ctx, _rx) = ctx_and_rx();
+        let h = handle();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut active = Some(ActiveQuery::FrontPositions {
+            buf: Vec::new(),
+            reply: Some(tx),
+        });
+        dispatch_event(CtpEvent::Position(long_position()), &h, &ctx, &mut active);
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+        let positions = rx.try_recv().unwrap().unwrap();
+        assert!(positions.is_empty(), "乘数缺失时该持仓行应被过滤");
+    }
+
+    #[test]
+    fn contracts_query_warms_multiple_dir_and_releases_gate() {
+        // 合约预热：Instrument 行经 Contracts 在途写入 ContractDir，QueryEnd 释放闸门。
+        let (ctx, _rx) = ctx_and_rx();
+        let h = handle();
+        let mut active = Some(ActiveQuery::Contracts);
+        dispatch_event(
+            CtpEvent::Instrument(crate::ctp::core::event::InstrumentInfo {
+                instrument: "rb2510".into(),
+                exchange_id: "SHFE".into(),
+                product_id: "rb".into(),
+                is_trading: true,
+                volume_multiple: 10,
+            }),
+            &h,
+            &ctx,
+            &mut active,
+        );
+        assert_eq!(ctx.contract_dir.get("rb2510"), Some(10));
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+        assert!(active.is_none(), "合约预热 QueryEnd 释放闸门");
     }
 
     #[test]
@@ -1295,16 +1403,24 @@ mod tests {
         let (ctx, mut bridge_rx) = ctx_and_rx();
         let h = handle();
         let mut active = Some(ActiveQuery::BackPositions { buf: Vec::new() });
+        warm_rb_multiple(&ctx);
         dispatch_event(CtpEvent::Position(long_position()), &h, &ctx, &mut active);
 
         // Act
         dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
 
-        // Assert：聚合后经持仓桥投递（与前台查仓同一 mapper）。
-        assert!(matches!(
-            bridge_rx.try_recv(),
-            Ok(BridgeEvent::Positions(ps)) if ps.len() == 1
-        ));
+        // Assert：聚合后经持仓桥投递（已按乘数折算为单价；与前台查仓同一 mapper）。
+        match bridge_rx.try_recv() {
+            Ok(BridgeEvent::Positions(ps)) => {
+                assert_eq!(ps.len(), 1);
+                assert_eq!(
+                    ps[0].entry_price,
+                    rust_decimal::Decimal::try_from(3205.0).unwrap()
+                );
+                assert_eq!(ps[0].multiplier, Some(rust_decimal::Decimal::from(10)));
+            }
+            other => panic!("expected one mapped position, got {other:?}"),
+        }
         assert!(active.is_none());
     }
 

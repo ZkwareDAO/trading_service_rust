@@ -372,6 +372,7 @@ mod tests {
             mark_price: Some(dec("2970")),
             unrealized_pnl: Some(dec("15")),
             leverage: Some(5),
+            multiplier: None,
             notional: None,
             margin: None,
             update_ms: None,

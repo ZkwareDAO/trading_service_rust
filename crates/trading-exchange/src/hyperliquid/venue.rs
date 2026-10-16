@@ -97,6 +97,7 @@ pub(crate) fn map_clearing_position(
             .get("leverage")
             .and_then(|l| l.get("value"))
             .and_then(|x| x.as_u64()),
+        multiplier: None,
         notional: json_dec(pos.get("positionValue")),
         margin: json_dec(pos.get("marginUsed")),
         update_ms: None,

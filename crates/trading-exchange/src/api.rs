@@ -172,6 +172,10 @@ pub struct PositionInfo {
     /// 未实现盈亏（结算币种计）。
     pub unrealized_pnl: Option<Decimal>,
     pub leverage: Option<u64>,
+    /// 合约乘数（每手对应的标的数量）。CTP 期货填真实乘数（rb=10、IF=300…），
+    /// 使 `entry_price`/`mark_price` 保持「单位价」量纲；币安/期权等按单位/张
+    /// 交易的所填 None，宿主引擎按 1 处理。真实敞口 = quantity × multiplier。
+    pub multiplier: Option<Decimal>,
     /// 名义价值（交易所口径；部分所带符号，宿主侧取绝对值参与估值）。
     pub notional: Option<Decimal>,
     /// 占用保证金（仅交易所直接给出时填充；交叉保证金由宿主按 notional/leverage 自算）。

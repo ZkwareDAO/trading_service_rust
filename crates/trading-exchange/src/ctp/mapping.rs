@@ -102,12 +102,22 @@ pub fn order_state_from_trade(
     }
 }
 
-/// 持仓快照 → 统一持仓行。
+/// 持仓快照 → 统一持仓行（单价口径）。
 ///
 /// CTP 自然多/空分行：`direction='2'`（买/多）→ 正数量的 BOTH 行，
 /// `'3'`（卖/空）→ 负数量的 BOTH 行（`signed_quantity` 符号表达净多空，
-/// 与 Binance 单向持仓同构；对账 key 靠符号区分）。方向未知或数量为 0 返回 None。
-pub fn position_info_from_snapshot(p: &PositionSnapshot) -> Option<PositionInfo> {
+/// 与 Binance 单向持仓同构；对账 key 靠符号区分）。
+///
+/// **量纲**：CTP 的 `PositionCost` 是总持仓成本 = 单价 × 乘数 × 手数，而 tick/现价是
+/// 「每单位单价」。这里必须除以 `手数 × VolumeMultiple` 才能还原成与现价同量纲的开仓
+/// 单价；真实乘数经 `multiplier` 字段下传，宿主按 `pnl=(cur-entry)×qty×mult` 重算。
+///
+/// 任一前置不满足返回 None（该行被过滤，绝不产出错误量纲价）：数量为 0、方向未知、
+/// 或乘数缺失/非正（合约目录尚未预热时宁可漏一批，待下轮对账补齐）。
+pub fn position_info_from_snapshot(
+    p: &PositionSnapshot,
+    volume_multiple: i32,
+) -> Option<PositionInfo> {
     if p.position == 0 {
         return None;
     }
@@ -116,13 +126,14 @@ pub fn position_info_from_snapshot(p: &PositionSnapshot) -> Option<PositionInfo>
         '3' => -Decimal::from(p.position),
         _ => return None,
     };
-    // 持仓成本按均价口径折算（CTP 的 PositionCost 已含合约乘数，除以手数
-    // 得到每手价格口径的均价）。
-    let entry = if p.position > 0 {
-        Decimal::try_from(p.position_cost / p.position as f64).unwrap_or_default()
-    } else {
-        Decimal::ZERO
-    };
+    // 乘数缺失/非法：不产出（避免退化为"每手成本"污染单价口径）。
+    if volume_multiple <= 0 {
+        return None;
+    }
+    // 单价 = 总持仓成本 / (手数 × 乘数)。
+    // 上方已保证 position≠0、volume_multiple>0，故 denom 必为正。
+    let denom = f64::from(p.position) * f64::from(volume_multiple);
+    let entry = Decimal::try_from(p.position_cost / denom).unwrap_or_default();
     Some(PositionInfo {
         instrument: p.instrument.clone(),
         instrument_type: InstrumentType::Futures,
@@ -130,8 +141,10 @@ pub fn position_info_from_snapshot(p: &PositionSnapshot) -> Option<PositionInfo>
         signed_quantity: signed,
         entry_price: entry,
         mark_price: None,
-        unrealized_pnl: Decimal::try_from(p.position_profit).ok(),
+        // 盈亏交宿主用统一公式（单价 × 乘数）重算，不直接采用柜台汇总值，保证口径单一。
+        unrealized_pnl: None,
         leverage: None,
+        multiplier: Some(Decimal::from(volume_multiple)),
         notional: None,
         margin: Decimal::try_from(p.use_margin).ok(),
         update_ms: None,
@@ -240,50 +253,65 @@ mod tests {
         assert_eq!(st.status, OrderStatus::New);
     }
 
-    #[test]
-    fn position_long_maps_positive_short_negative() {
-        let long = PositionSnapshot {
+    /// rb 螺纹：乘数 10 吨/手，开仓单价 3205，3 手 →
+    /// 柜台 PositionCost 是总成本 = 3205 × 10 × 3 = 96150（含乘数）。
+    fn rb_long_snapshot() -> PositionSnapshot {
+        PositionSnapshot {
             instrument: "rb2510".into(),
             direction: '2',
             position: 3,
             yd_position: 1,
             today_position: 2,
-            position_cost: 9615.0,
-            use_margin: 1000.0,
+            position_cost: 96_150.0,
+            use_margin: 32_050.0,
             position_profit: 55.0,
-        };
-        let info = position_info_from_snapshot(&long).unwrap();
+        }
+    }
+
+    #[test]
+    fn position_long_divides_cost_by_qty_and_multiple_to_unit_price() {
+        let info = position_info_from_snapshot(&rb_long_snapshot(), 10).unwrap();
         assert_eq!(info.signed_quantity, Decimal::from(3));
         assert_eq!(info.position_side, OrderPositionSide::Both);
+        // 单价口径：96150 / (3 手 × 10) = 3205，与 tick 现价同量纲。
         assert_eq!(info.entry_price, Decimal::try_from(3205.0f64).unwrap());
-        assert_eq!(info.margin, Some(Decimal::try_from(1000.0f64).unwrap()));
+        // 真实乘数下传，供宿主 notional/pnl 展开。
+        assert_eq!(info.multiplier, Some(Decimal::from(10)));
+        assert_eq!(info.margin, Some(Decimal::try_from(32_050.0f64).unwrap()));
+        // 盈亏不采用柜台汇总值，交宿主统一公式重算。
+        assert_eq!(info.unrealized_pnl, None);
+    }
 
+    #[test]
+    fn position_short_maps_negative_quantity() {
         let short = PositionSnapshot {
             direction: '3',
-            ..long
+            ..rb_long_snapshot()
         };
-        let info = position_info_from_snapshot(&short).unwrap();
+        let info = position_info_from_snapshot(&short, 10).unwrap();
         assert_eq!(info.signed_quantity, -Decimal::from(3));
+        assert_eq!(info.entry_price, Decimal::try_from(3205.0f64).unwrap());
     }
 
     #[test]
     fn position_zero_or_unknown_direction_filtered() {
         let zero = PositionSnapshot {
-            instrument: "rb2510".into(),
-            direction: '2',
             position: 0,
-            yd_position: 0,
-            today_position: 0,
-            position_cost: 0.0,
-            use_margin: 0.0,
-            position_profit: 0.0,
+            ..rb_long_snapshot()
         };
-        assert!(position_info_from_snapshot(&zero).is_none());
+        assert!(position_info_from_snapshot(&zero, 10).is_none());
         let unknown = PositionSnapshot {
             direction: '9',
             ..zero
         };
-        assert!(position_info_from_snapshot(&unknown).is_none());
+        assert!(position_info_from_snapshot(&unknown, 10).is_none());
+    }
+
+    #[test]
+    fn position_missing_or_invalid_multiple_filtered() {
+        // 合约目录未预热（0）或非法乘数（负）：宁可不产出，也不能退化为错误量纲价。
+        assert!(position_info_from_snapshot(&rb_long_snapshot(), 0).is_none());
+        assert!(position_info_from_snapshot(&rb_long_snapshot(), -5).is_none());
     }
 
     #[test]

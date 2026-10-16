@@ -432,6 +432,7 @@ fn map_position(v: &serde_json::Value, _currency: &str) -> Option<crate::api::Po
         mark_price: json_dec(v.get("mark_price")),
         unrealized_pnl: json_dec(v.get("total_profit_loss")),
         leverage: None,
+        multiplier: None,
         notional: None,
         margin: None,
         update_ms: None,

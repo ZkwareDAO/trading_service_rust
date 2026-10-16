@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 
+use crate::ctp::contract_dir::ContractDir;
 use crate::ctp::core::account::CtpAccount;
 use crate::ctp::exchange_dir::ExchangeDir;
 use crate::ctp::mailbox::SessionMailbox;
@@ -33,6 +34,8 @@ pub struct AccountSession {
     pub mailbox: Arc<SessionMailbox>,
     /// 合约 → 交易所目录（本账户私有；跨会话撤单定位 ExchangeID，回报/重放预热）。
     pub exchange_dir: Arc<ExchangeDir>,
+    /// 合约 → 乘数目录（本账户私有；登录后合约查询预热，持仓成本折算单价）。
+    pub contract_dir: Arc<ContractDir>,
 }
 
 /// 各账户当前会话注册表（**provider 级共享**，跨热加载存活）。
@@ -92,6 +95,7 @@ impl SessionRegistry {
             order_refs: Arc::new(OrderRefRegistry::new()),
             mailbox: Arc::new(SessionMailbox::new()),
             exchange_dir: Arc::new(ExchangeDir::new()),
+            contract_dir: Arc::new(ContractDir::new()),
         })
     }
 }
@@ -220,6 +224,7 @@ impl CtpVenueConnector {
             account: account.to_string(),
             order_refs: Arc::clone(&session.order_refs),
             exchange_dir: Arc::clone(&session.exchange_dir),
+            contract_dir: Arc::clone(&session.contract_dir),
             tx,
             debouncer: Arc::new(Mutex::new(crate::reconcile::ReconcileDebouncer::new(
                 account_stream_millis(self.debounce),

@@ -184,6 +184,7 @@ impl ExchangeApi for XiliExchange {
                     mark_price: None,
                     unrealized_pnl: None,
                     leverage: None,
+                    multiplier: None,
                     notional: None,
                     margin: None,
                     update_ms: None,

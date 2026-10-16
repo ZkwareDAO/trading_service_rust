@@ -28,6 +28,15 @@ use trading_store::{LeverageKey, LeverageRepo, PositionRepo};
 /// 行情入站键 `(quote_venue, quote_kind)`：on_quote 据此反查到所属档案。
 type QuoteKey = (Venue, MarketKind);
 
+/// CTP 交易所规范名（与 trading-exchange `ctp::provider::NAME` 口径一致）。
+const CTP_EXCHANGE: &str = "ctp";
+/// CTP 国内交易席位的结算币种：人民币。
+///
+/// 币种挂在柜台 `CThostFtdcProductField`（需额外 `ReqQryProduct` 且 ctp2rs v1alpha1
+/// 未封装该回调），而国内六所对境内席位一律 CNY 结算（INE 原油的 USD 口径仅限境外
+/// 特殊参与者，本系统不接）。将来支持境外席位时，把此处替换为按产品查询的币种即可。
+const CTP_SETTLE_CCY: &str = "CNY";
+
 /// 仓位档案的**只读索引**：由 [`PositionProfile`] 列表在启动前一次性构建。
 ///
 /// 两套查询各取所需：
@@ -294,7 +303,8 @@ where
     // 单位/乘数/结算币种按交易所收敛：
     // binance USDM：按币、乘数 1、USDT；
     // deribit 期权：按张(contract)、乘数 1（精确 contract_size 在 OrderRule）、
-    //   结算币种取合约首段（BTC/ETH）。
+    //   结算币种取合约首段（BTC/ETH）；
+    // ctp 国内期货：按手(contract)、乘数取合约规格（rb=10、IF=300…）、人民币结算。
     if exchange == "deribit" {
         p.qty_unit = QtyUnit::Contract;
         p.multiplier = Decimal::ONE;
@@ -304,6 +314,11 @@ where
             .next()
             .unwrap_or("BTC")
             .to_string();
+    } else if exchange == CTP_EXCHANGE {
+        p.qty_unit = QtyUnit::Contract;
+        // 真实合约乘数由适配层经合约表预热下传；缺省 1（防御，正常路径必带值）。
+        p.multiplier = info.multiplier.unwrap_or(Decimal::ONE);
+        p.settle_currency = CTP_SETTLE_CCY.to_string();
     } else {
         p.qty_unit = QtyUnit::Base;
         p.multiplier = Decimal::ONE;
@@ -318,10 +333,15 @@ where
         .map(|ms| ms as u64)
         .unwrap_or(now_ms);
 
-    // 估值价：交易所标记价优先，行情表兜底；都无价时按 0 重估（指标安全归零）。
+    // 估值价：交易所标记价 → 行情表 tick；两者皆无（如 CTP 首开新合约、行情订阅
+    // 空窗）时回退开仓均价——语义为“刚成交、暂无浮盈”，roi=0，避免把 0 当现价
+    // 算出多仓 roi≈-1 的异常值；首个真实 tick 由 on_quote→revalue_by_price 覆盖。
+    // entry 也非正则保持 0（revalued 对 0 成本/无价的边界安全归零，不除零）。
     let price = info
         .mark_price
         .or_else(|| price_of(&info.instrument))
+        .filter(|p| *p > Decimal::ZERO)
+        .or_else(|| Some(info.entry_price).filter(|p| *p > Decimal::ZERO))
         .unwrap_or(Decimal::ZERO);
     let mut valued = p.revalued(price);
     // 保证金：逐仓取交易所口径；交叉（无值）按重算后的 notional/leverage 自算。
@@ -423,6 +443,7 @@ mod tests {
             unrealized_pnl: None,
             leverage,
             notional: None,
+            multiplier: None,
             margin: None,
             update_ms: Some(1_000),
         }
@@ -461,6 +482,7 @@ mod tests {
             unrealized_pnl: pnl.map(dec),
             leverage,
             notional: None,
+            multiplier: None,
             margin: margin.map(dec),
             update_ms: Some(1_000),
         }
@@ -499,6 +521,91 @@ mod tests {
         assert_eq!(p.margin, dec("801"));
         assert_eq!(p.leverage, 10);
         assert_eq!(p.exchange_update_time, 1000);
+    }
+
+    #[test]
+    fn ctp_position_uses_unit_price_with_contract_multiple_and_cny() {
+        // rb 螺纹：3 手多头，开仓单价 3205、现价 3210，合约乘数 10（吨/手）。
+        // 适配层已把 PositionCost 折算为单价，并经 multiplier 下传真实乘数。
+        let ctp = PositionInfo {
+            instrument: "rb2510".into(),
+            instrument_type: InstrumentType::Futures,
+            position_side: OrderPositionSide::Both,
+            signed_quantity: dec("3"),
+            entry_price: dec("3205"),
+            mark_price: Some(dec("3210")),
+            unrealized_pnl: None,
+            leverage: None,
+            multiplier: Some(dec("10")),
+            notional: None,
+            margin: None,
+            update_ms: Some(1_000),
+        };
+        let no_price = |_: &str| None;
+        let v = snapshot_positions(7, "ctp", &[ctp], &no_price, 2_000);
+        let p = &v[0];
+        // 单位：手（contract）；成本/现价同为「每吨单价」量纲。
+        assert_eq!(p.qty_unit, QtyUnit::Contract);
+        assert_eq!(p.pos_price, dec("3205"));
+        assert_eq!(p.current_price, dec("3210"));
+        assert_eq!(p.multiplier, dec("10"));
+        assert_eq!(p.settle_currency, "CNY");
+        // 名义额 = 单价 × 手数 × 乘数 = 3210×3×10 = 96300（修复前错误地只 = 单价×手数）。
+        assert_eq!(p.notional, dec("96300"));
+        // 多头盈亏 = (3210−3205)×3×10 = 150（修复前因乘数缺失/量纲错而严重失真）。
+        assert_eq!(p.pnl_value, dec("150"));
+    }
+
+    #[test]
+    fn ctp_first_open_without_quote_falls_back_to_entry_price_roi_neutral() {
+        // CTP 首开新合约：持仓快照无现价、行情订阅空窗 QuoteTable 也无价。
+        // 不得以 0 当现价（会把多仓算成 roi≈-1）；应以开仓均价兜底，roi=0。
+        let ctp = PositionInfo {
+            instrument: "rb2510".into(),
+            instrument_type: InstrumentType::Futures,
+            position_side: OrderPositionSide::Both,
+            signed_quantity: dec("3"),
+            entry_price: dec("3205"),
+            mark_price: None,
+            unrealized_pnl: None,
+            leverage: None,
+            multiplier: Some(dec("10")),
+            notional: None,
+            margin: None,
+            update_ms: Some(1_000),
+        };
+        let no_price = |_: &str| None;
+        let v = snapshot_positions(7, "ctp", &[ctp], &no_price, 2_000);
+        let p = &v[0];
+        assert_eq!(p.current_price, dec("3205"), "现价缺省回退开仓均价");
+        assert_eq!(p.roi, dec("0"), "开仓均价对开仓均价，roi 必须中性为 0");
+        assert_eq!(p.pnl_value, dec("0"));
+        // notional = entry × 手 × 乘数 = 3205×3×10 = 96150（成本口径，非 0）。
+        assert_eq!(p.notional, dec("96150"));
+    }
+
+    #[test]
+    fn ctp_real_quote_overrides_entry_fallback() {
+        // 回归：行情 tick 到达后，QuoteTable 的真实现价必须覆盖 entry 兜底。
+        let ctp = PositionInfo {
+            instrument: "rb2510".into(),
+            instrument_type: InstrumentType::Futures,
+            position_side: OrderPositionSide::Both,
+            signed_quantity: dec("3"),
+            entry_price: dec("3205"),
+            mark_price: None,
+            unrealized_pnl: None,
+            leverage: None,
+            multiplier: Some(dec("10")),
+            notional: None,
+            margin: None,
+            update_ms: Some(1_000),
+        };
+        let quote = |sym: &str| (sym == "rb2510").then(|| dec("3210"));
+        let v = snapshot_positions(7, "ctp", &[ctp], &quote, 2_000);
+        let p = &v[0];
+        assert_eq!(p.current_price, dec("3210"));
+        assert_eq!(p.pnl_value, dec("150"));
     }
 
     #[test]
@@ -902,6 +1009,7 @@ mod tests {
             unrealized_pnl: None,
             leverage: Some(1),
             notional: None,
+            multiplier: None,
             margin: None,
             update_ms: Some(1_000),
         }

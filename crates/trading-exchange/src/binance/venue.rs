@@ -173,6 +173,7 @@ fn map_v2_position(p: PositionInformationV2ResponseInner) -> anyhow::Result<Opti
         mark_price: mark,
         unrealized_pnl: parse_opt_dec("unRealizedProfit", p.un_realized_profit.as_deref())?,
         leverage: parse_leverage(p.leverage.as_deref()),
+        multiplier: None,
         notional,
         margin,
         update_ms: p.update_time,
