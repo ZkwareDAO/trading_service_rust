@@ -11,9 +11,13 @@ use trading_core::quote::{QuoteTable, QuoteUpdate};
 use trading_models::Instrument;
 use trading_models::{MarketKind, TopOfBook, Venue};
 
+use std::sync::atomic::Ordering;
+
+use crate::backoff::ReconnectBackoff;
 use crate::ctp::core::account::CtpAccount;
 use crate::ctp::core::quote::TickSnapshot;
 use crate::ctp::gateway::md::{MdEvent, MdHandle};
+use crate::ctp::venue::sleep_interruptibly;
 use crate::ctp::CtpConfig;
 use crate::port::QuoteObserver;
 
@@ -54,11 +58,13 @@ pub struct MdParams {
     pub config: CtpConfig,
 }
 
-/// 启动行情线程（阻塞线程内跑 MdHandle 循环）。
+/// 启动行情线程（阻塞线程内跑退避重连循环）。
 ///
 /// `interests`：订阅兴趣供给（与其它所同型，None 时不订阅、线程退出）。
-/// 登录失败（含 code=64 行情前置未开）按 warn 降级退出：不重试风暴，
-/// 由宿主重启/重载时再尝试。
+/// 部署性关闭（未配 `md_front` / 无兴趣端口/兴趣集空）直接退出、不重连；
+/// 运行期断线、登录或订阅失败则按 [`ReconnectBackoff`] 退避重连
+/// （10s→30s→1m→3m→5m 封顶），与交易连接 `run_session_loop` 同型，
+/// 不再需要重启服务即可在前置恢复/夜盘开盘时自动恢复 tick。
 pub fn spawn_market_worker(
     params: MdParams,
     interests: Option<Arc<dyn crate::port::MarketInterest>>,
@@ -78,7 +84,32 @@ pub fn spawn_market_worker(
         .unwrap_or_else(|e| tracing::warn!(error = %e, "CTP 行情线程启动失败"));
 }
 
-/// 行情线程主循环：连接 → 登录 → 按兴趣订阅 → tick 写表 + 回调观察口。
+/// 一次连接尝试的结果（驱动退避外循环的纯决策输入）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MdSessionOutcome {
+    /// 连接成功建立并订阅生效（其后断线）——阶梯归零，下次断线从 10s 起。
+    Connected,
+    /// 连接/登录/订阅失败或前置断开——安排退避后重连。
+    Reconnect,
+    /// 停机标志置位——退出线程。
+    Stop,
+}
+
+/// 一次**已成功建连**的会话结束后的去向：纯决策（便于单测，不触 FFI/时钟）。
+/// 停机→退出；运行中被前置断开→按 Connected 处理（外循环 `reset()` 归零阶梯后，
+/// 统一 `note_retry()` 排下一次 10s 重试，与交易 `run_session_loop` 同型）。
+fn md_session_end(stopped: bool) -> MdSessionOutcome {
+    if stopped {
+        MdSessionOutcome::Stop
+    } else {
+        MdSessionOutcome::Connected
+    }
+}
+
+/// 行情线程主循环（退避重连外循环）：参照交易 `run_session_loop`。
+///
+/// 每个周期新建并 Drop 一个 `MdHandle`（连接→登录→订阅→tick），成功过则
+/// `backoff.reset()`、失败/断线 `note_retry()`；退避睡眠可被停机标志分片打断。
 fn run_md_loop(
     params: &MdParams,
     interests: Option<Arc<dyn crate::port::MarketInterest>>,
@@ -90,15 +121,64 @@ fn run_md_loop(
         tracing::info!("CTP 行情未提供兴趣端口，跳过订阅");
         return;
     };
-    let symbols: Vec<String> = interests
+    // 无兴趣集属于部署态（非临时故障）：直接退出，不进入退避重连。
+    let has_symbols = interests
         .interests()
         .iter()
-        .filter(|k| k.venue == Venue::Ctp && k.kind == MarketKind::Futures)
-        .map(|k| k.symbol.clone())
-        .collect();
-    if symbols.is_empty() {
+        .any(|k| k.venue == Venue::Ctp && k.kind == MarketKind::Futures);
+    if !has_symbols {
         tracing::info!("CTP 行情兴趣集为空，跳过连接");
         return;
+    }
+
+    let mut backoff = ReconnectBackoff::new();
+    while !stop.load(Ordering::SeqCst) {
+        if let Some(wait) = backoff.next_wait() {
+            sleep_interruptibly(wait, stop);
+        }
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        // 每周期按当前兴趣集重新取订阅标的（新增/移除合约随重连生效）。
+        let symbols: Vec<String> = interests
+            .interests()
+            .iter()
+            .filter(|k| k.venue == Venue::Ctp && k.kind == MarketKind::Futures)
+            .map(|k| k.symbol.clone())
+            .collect();
+
+        let outcome = if symbols.is_empty() {
+            tracing::info!("CTP 行情兴趣集变空，行情线程退出");
+            MdSessionOutcome::Stop
+        } else {
+            run_md_session(params, &symbols, quotes, &observer, stop)
+        };
+
+        match outcome {
+            MdSessionOutcome::Stop => break,
+            // 成功建连后被断开：阶梯归零，再排下一次等待（note_retry → 10s），
+            // 与交易 run_session_loop「连接成功 reset、循环末 note_retry」一致。
+            MdSessionOutcome::Connected => {
+                backoff.reset();
+                backoff.note_retry();
+            }
+            MdSessionOutcome::Reconnect => backoff.note_retry(),
+        }
+    }
+    tracing::info!("CTP 行情线程退出");
+}
+
+/// 单个连接会话：连接 → 登录 → 订阅 → 消费 tick，直到断线/失败/停机。
+/// 返回前 `MdHandle` drop（release 刷盘），下一周期重新建连。
+fn run_md_session(
+    params: &MdParams,
+    symbols: &[String],
+    quotes: &Arc<QuoteTable>,
+    observer: &Option<Arc<dyn QuoteObserver>>,
+    stop: &std::sync::atomic::AtomicBool,
+) -> MdSessionOutcome {
+    if stop.load(Ordering::SeqCst) {
+        return MdSessionOutcome::Stop;
     }
     let mut md = match MdHandle::connect(
         &params.account,
@@ -111,51 +191,41 @@ fn run_md_loop(
     ) {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!(error = %e, "CTP 行情前置连接失败，行情降级");
-            return;
+            tracing::warn!(error = %e, "CTP 行情前置连接失败，将退避重连");
+            return MdSessionOutcome::Reconnect;
         }
     };
-    // 登录受理重试（官方文档口径：FrontConnected 只是 TCP 建连，FTD 会话
-    // 协商未完成时 ReqUserLogin 返回 -1，应"等待一小会重发"）。
-    let login_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let login_code = loop {
-        let code = md.login();
-        if code == 0 {
-            break 0;
-        }
-        if std::time::Instant::now() > login_deadline {
-            break code;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    };
+    // 登录受理重试（官方口径：FrontConnected 只是 TCP 建连，FTD 会话协商未完成时
+    // ReqUserLogin 返回 -1，应等待重发）；可被停机标志打断（1s 分片，最长 60s）。
+    let login_code = retry_until_accepted(|| md.login(), stop, 60);
+    if stop.load(Ordering::SeqCst) {
+        return MdSessionOutcome::Stop;
+    }
     if login_code != 0 {
-        tracing::warn!(code = login_code, "CTP 行情登录受理失败（重试 60s 后放弃），行情降级");
-        return;
+        tracing::warn!(
+            code = login_code,
+            "CTP 行情登录受理失败（重试 60s），将退避重连"
+        );
+        return MdSessionOutcome::Reconnect;
     }
     let refs: Vec<&str> = symbols.iter().map(|s| s.as_str()).collect();
-    // 订阅受理同样按官方口径重发（规则同登录）。
-    let sub_code = loop {
-        let code = md.subscribe(&refs);
-        if code == 0 {
-            break 0;
-        }
-        if std::time::Instant::now() > login_deadline {
-            break code;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    };
+    let sub_code = retry_until_accepted(|| md.subscribe(&refs), stop, 60);
+    if stop.load(Ordering::SeqCst) {
+        return MdSessionOutcome::Stop;
+    }
     if sub_code != 0 {
-        tracing::warn!(code = sub_code, "CTP 行情订阅受理失败，行情降级");
-        return;
+        tracing::warn!(code = sub_code, "CTP 行情订阅受理失败，将退避重连");
+        return MdSessionOutcome::Reconnect;
     }
     tracing::info!(count = symbols.len(), "CTP 行情订阅生效");
-    // 优雅停机：tick 轮询粒度响应停机标志（MdHandle 析构正常刷盘，避免 kill 线程损坏流文件）。
-    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+
+    // tick 消费：断开即结束本会话交外循环重连；停机即整体退出。
+    while !stop.load(Ordering::SeqCst) {
         match md.next_event(MD_POLL_TIMEOUT) {
             Some(MdEvent::Tick(t)) => {
                 let now = now_ms();
                 quotes.apply(&instrument_key(&t.instrument), tick_to_update(&t, now));
-                if let Some(obs) = &observer {
+                if let Some(obs) = observer {
                     if let Some(price) = Decimal::try_from(t.last_price)
                         .ok()
                         .filter(|p| *p > Decimal::ZERO)
@@ -165,11 +235,33 @@ fn run_md_loop(
                 }
             }
             Some(MdEvent::FrontDisconnected(reason)) => {
-                tracing::warn!(reason, "CTP 行情前置断开，行情降级（不自动重连）");
-                return;
+                tracing::warn!(reason, "CTP 行情前置断开，退避重连");
+                return md_session_end(stop.load(Ordering::SeqCst));
             }
             _ => {}
         }
+    }
+    MdSessionOutcome::Stop
+}
+
+/// 受理码重试：`attempt` 返回 0 即成功；否则每秒重试直到累计 `max_secs` 秒。
+/// 停机标志置位时提前返回当前码（避免关进程时还要睡满 60s）。
+fn retry_until_accepted<F: FnMut() -> i32>(
+    mut attempt: F,
+    stop: &std::sync::atomic::AtomicBool,
+    max_secs: u64,
+) -> i32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(max_secs);
+    loop {
+        let code = attempt();
+        if code == 0 {
+            return 0;
+        }
+        if stop.load(Ordering::SeqCst) || std::time::Instant::now() >= deadline {
+            return code;
+        }
+        // 1s 分片：循环 5 次 200ms，使停机响应粒度与交易侧一致。
+        sleep_interruptibly(Duration::from_secs(1), stop);
     }
 }
 
@@ -222,5 +314,57 @@ mod tests {
         assert_eq!(k.venue, Venue::Ctp);
         assert_eq!(k.kind, MarketKind::Futures);
         assert_eq!(k.symbol, "rb2510");
+    }
+
+    #[test]
+    fn md_session_end_stops_on_flag_else_marks_connected() {
+        // 已成功建连后：停机→退出；前置断开→Connected（外循环归零后按 10s 重连）。
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            md_session_end(stop.load(Ordering::SeqCst)),
+            MdSessionOutcome::Connected
+        );
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(
+            md_session_end(stop.load(Ordering::SeqCst)),
+            MdSessionOutcome::Stop
+        );
+    }
+
+    #[test]
+    fn retry_until_accepted_returns_zero_on_success() {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut n = 0u32;
+        // 前两次流控（-1），第三次受理 0。
+        let code = retry_until_accepted(
+            || {
+                n += 1;
+                if n < 3 {
+                    -1
+                } else {
+                    0
+                }
+            },
+            &stop,
+            5,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn retry_until_accepted_returns_last_code_after_deadline() {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        // 始终 -1：超时窗口 0s → 立即返回非零，不无限重试。
+        let code = retry_until_accepted(|| -1, &stop, 0);
+        assert_eq!(code, -1);
+    }
+
+    #[test]
+    fn retry_until_accepted_aborts_on_stop_flag() {
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        // 停机已置位：即使持续失败也应立即返回，不睡满窗口。
+        let code = retry_until_accepted(|| -1, &stop, 60);
+        assert_eq!(code, -1);
     }
 }
