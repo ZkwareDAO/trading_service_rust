@@ -81,6 +81,21 @@ impl OrderRefRegistry {
             .find_map(|(order_ref, mapped_cid)| (mapped_cid == cid).then(|| order_ref.clone()))
     }
 
+    /// 撤单路由反查（全部）：本地长 cid → 本会话为其登记的**全部** OrderRef。
+    ///
+    /// 跨今昨一单两腿时一个 cid 对应两个 OrderRef（首腿投递前分配、第二腿会话
+    /// 线程内再 [`Self::allocate`]），撤单需对两腿分别寻址；单腿单只返回一个。
+    /// 表项规模 = 在途物理腿数，遍历成本可忽略。
+    pub fn order_refs_of_cid(&self, cid: &str) -> Vec<String> {
+        self.map
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, mapped_cid)| *mapped_cid == cid)
+            .map(|(order_ref, _)| order_ref.clone())
+            .collect()
+    }
+
     /// 移除映射（柜台受理失败时清脏表：未受理的 OrderRef 不会有回报）。
     pub fn remove(&self, order_ref: &str) {
         self.map.lock().unwrap().remove(order_ref);
@@ -171,6 +186,50 @@ mod tests {
         // Act / Assert：重启后表空 / 非本会话 / 透传 cid 均未命中（走系统号兜底）。
         assert!(r.order_ref_of_cid(&long_cid("Z")).is_none());
         assert!(r.order_ref_of_cid("12345678").is_none());
+    }
+
+    #[test]
+    fn order_refs_of_cid_returns_all_refs_for_two_leg_order() {
+        // Arrange：跨今昨一单两腿——同一 cid 分配两个 OrderRef。
+        let r = OrderRefRegistry::new();
+        let cid = long_cid("L");
+        let first = r.allocate(&cid);
+        let second = r.allocate(&cid);
+        assert_ne!(first, second, "两腿必须是不同 OrderRef");
+
+        // Act
+        let mut all = r.order_refs_of_cid(&cid);
+        all.sort();
+
+        // Assert：两个 ref 都反查到同一 cid，且都能正向枚举（撤单两腿寻址用）。
+        let mut expected = vec![first.clone(), second.clone()];
+        expected.sort();
+        assert_eq!(all, expected);
+        assert_eq!(r.cid_of(&first).as_deref(), Some(cid.as_str()));
+        assert_eq!(r.cid_of(&second).as_deref(), Some(cid.as_str()));
+    }
+
+    #[test]
+    fn order_refs_of_cid_single_and_unknown() {
+        // 单腿单只返回一个 ref；未知 cid 为空。
+        let r = OrderRefRegistry::new();
+        let cid = long_cid("S");
+        let only = r.allocate(&cid);
+        assert_eq!(r.order_refs_of_cid(&cid), vec![only]);
+        assert!(r.order_refs_of_cid(&long_cid("Z")).is_empty());
+    }
+
+    #[test]
+    fn remove_one_leg_ref_keeps_the_other() {
+        // 终态回收是逐腿的：撤掉一腿映射不影响另一腿反查。
+        let r = OrderRefRegistry::new();
+        let cid = long_cid("R");
+        let first = r.allocate(&cid);
+        let second = r.allocate(&cid);
+        r.remove(&first);
+        assert_eq!(r.cid_of(&first), None);
+        assert_eq!(r.cid_of(&second).as_deref(), Some(cid.as_str()));
+        assert_eq!(r.order_refs_of_cid(&cid), vec![second]);
     }
 
     #[test]

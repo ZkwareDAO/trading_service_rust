@@ -5,7 +5,7 @@
 
 use crate::ctp::core::encoding::decode_fixed;
 use crate::ctp::core::event::{OrderSnapshot, PositionSnapshot, TradeSnapshot};
-use crate::ctp::core::types::{Direction, OrderStatus};
+use crate::ctp::core::types::{Direction, Offset, OrderStatus};
 use ctp2rs::v1alpha1::{
     CThostFtdcInvestorPositionField, CThostFtdcOrderField, CThostFtdcTradeField,
 };
@@ -39,6 +39,9 @@ pub fn trade_snapshot(trade: &CThostFtdcTradeField) -> TradeSnapshot {
         exchange_id: decode_fixed(&trade.ExchangeID),
         order_sys_id: decode_fixed(&trade.OrderSysID),
         direction: Direction::from_code(trade.Direction as u8 as char).unwrap_or(Direction::Buy),
+        // 开平标志未知字符容错为 None（与 Direction 的 Buy 兜底不同：Offset 无
+        // 安全默认值，None 时 PositionDir 不做今/昨增量，等持仓快照收敛）。
+        offset: Offset::from_code(trade.OffsetFlag as u8 as char),
         price: trade.Price,
         volume: trade.Volume,
         trade_date: decode_fixed(&trade.TradeDate),
@@ -64,7 +67,7 @@ pub fn position_snapshot(position: &CThostFtdcInvestorPositionField) -> Position
 mod tests {
     use super::{order_snapshot, trade_snapshot};
     use crate::ctp::core::encoding::encode_fixed;
-    use crate::ctp::core::types::{Direction, OrderStatus};
+    use crate::ctp::core::types::{Direction, Offset, OrderStatus};
     use ctp2rs::v1alpha1::{CThostFtdcOrderField, CThostFtdcTradeField};
     use std::os::raw::c_char;
 
@@ -125,6 +128,7 @@ mod tests {
         encode_fixed(&mut t.ExchangeID, "SHFE");
         encode_fixed(&mut t.OrderSysID, "9001");
         t.Direction = '0' as c_char;
+        t.OffsetFlag = '0' as c_char; // 开仓
         t.Price = 3205.0;
         t.Volume = 1;
         encode_fixed(&mut t.TradeDate, "20261009");
@@ -139,6 +143,7 @@ mod tests {
         assert_eq!(s.trade_id, "55");
         assert_eq!(s.instrument, "rb2510");
         assert_eq!(s.direction, Direction::Buy);
+        assert_eq!(s.offset, Some(Offset::Open), "OffsetFlag 应解析为开平标志");
         assert_eq!(s.price, 3205.0);
         assert_eq!(s.volume, 1);
         assert_eq!(s.trade_date, "20261009");

@@ -3,7 +3,7 @@
 //! 这些类型在 SPI 回调内即时拷贝生成，不含任何指向 C++ 内存的指针，
 //! 可安全地跨线程/在回调返回后使用。
 
-use crate::ctp::core::types::{Direction, OrderStatus};
+use crate::ctp::core::types::{Direction, Offset, OrderStatus};
 
 /// 委托快照（柜台 `CThostFtdcOrderField` 的安全副本）。
 #[derive(Debug, Clone)]
@@ -63,6 +63,11 @@ pub struct TradeSnapshot {
     pub order_sys_id: String,
     /// 买卖方向。
     pub direction: Direction,
+    /// 开平标志（开仓/平仓/平今/平昨）；未知字符为 None。
+    ///
+    /// 供会话内存 PositionDir 做今/昨仓增量：开仓→今仓+、平今→今仓−、
+    /// 平昨→昨仓−；笼统 Close 不可分今昨，不更新（等持仓快照收敛）。
+    pub offset: Option<Offset>,
     /// 成交价。
     pub price: f64,
     /// 成交手数。
@@ -204,6 +209,7 @@ mod tests {
             exchange_id: "SHFE".into(),
             order_sys_id: "1".into(),
             direction: Direction::Buy,
+            offset: Some(Offset::Open),
             price: 3205.0,
             volume: 1,
             trade_date: "20261009".into(),

@@ -11,6 +11,7 @@ use crate::ctp::core::account::CtpAccount;
 use crate::ctp::exchange_dir::ExchangeDir;
 use crate::ctp::mailbox::SessionMailbox;
 use crate::ctp::order_ref::OrderRefRegistry;
+use crate::ctp::position_dir::PositionDir;
 use crate::ctp::venue::{
     run_session_loop, BridgeEvent, CtpUserHandle, EventContext, RequestFlags, SessionLoop,
 };
@@ -36,6 +37,8 @@ pub struct AccountSession {
     pub exchange_dir: Arc<ExchangeDir>,
     /// 合约 → 乘数目录（本账户私有；登录后合约查询预热，持仓成本折算单价）。
     pub contract_dir: Arc<ContractDir>,
+    /// (合约,持仓方向) → (今,昨) 会话内存路由表（本账户私有；SHFE 平今/平昨路由，不落盘）。
+    pub position_dir: Arc<PositionDir>,
 }
 
 /// 各账户当前会话注册表（**provider 级共享**，跨热加载存活）。
@@ -96,6 +99,7 @@ impl SessionRegistry {
             mailbox: Arc::new(SessionMailbox::new()),
             exchange_dir: Arc::new(ExchangeDir::new()),
             contract_dir: Arc::new(ContractDir::new()),
+            position_dir: Arc::new(PositionDir::new()),
         })
     }
 }
@@ -192,7 +196,7 @@ impl CtpVenueConnector {
             flags: Arc::new(RequestFlags::default()),
             session_epoch: Arc::new(AtomicU64::new(0)),
             shutdown,
-            filled_by_sys_id: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            filled_by_cid: Arc::new(Mutex::new(std::collections::HashMap::new())),
             mailbox: Arc::clone(&session.mailbox),
         });
         // 事件桥：有界队列 + 常驻消费任务（Sender 随会话线程退出而 drop）。
@@ -225,6 +229,8 @@ impl CtpVenueConnector {
             order_refs: Arc::clone(&session.order_refs),
             exchange_dir: Arc::clone(&session.exchange_dir),
             contract_dir: Arc::clone(&session.contract_dir),
+            position_dir: Arc::clone(&session.position_dir),
+            leg_table: Arc::new(crate::ctp::leg_table::LegTable::new()),
             tx,
             debouncer: Arc::new(Mutex::new(crate::reconcile::ReconcileDebouncer::new(
                 account_stream_millis(self.debounce),

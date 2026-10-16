@@ -102,53 +102,107 @@ pub fn order_state_from_trade(
     }
 }
 
-/// 持仓快照 → 统一持仓行（单价口径）。
+/// 同一 `(合约, 持仓方向)` 分片聚合结果：整合持仓行 + 今/昨路由明细。
+///
+/// 上期所等柜台会把同一仓位按今仓/昨仓回**两行**（投机仓）；上游持久层一个
+/// (账户,交易所,合约,方向) 只有一条整合 Position，故必须先在 ctp 包内聚合成
+/// 一条 [`PositionInfo`]，今/昨明细 (`today`/`yesterday`) 仅喂会话内存
+/// `PositionDir` 供平今/平昨路由，不落盘。
+pub struct MergedPosition {
+    /// 聚合后的统一持仓行（总手数、手数加权合并单价、保证金之和）。
+    pub info: PositionInfo,
+    /// 今仓手数（Σ TodayPosition）。
+    pub today: i32,
+    /// 昨仓手数（Σ YdPosition）。
+    pub yesterday: i32,
+}
+
+/// 同 `(合约, 持仓方向)` 的若干持仓分片 → 一条整合持仓行 + 今/昨明细。
 ///
 /// CTP 自然多/空分行：`direction='2'`（买/多）→ 正数量的 BOTH 行，
 /// `'3'`（卖/空）→ 负数量的 BOTH 行（`signed_quantity` 符号表达净多空，
-/// 与 Binance 单向持仓同构；对账 key 靠符号区分）。
+/// 与 Binance 单向持仓同构；对账 key 靠符号区分）。调用方须按
+/// `(instrument, direction)` 分桶后逐组调用。
 ///
-/// **量纲**：CTP 的 `PositionCost` 是总持仓成本 = 单价 × 乘数 × 手数，而 tick/现价是
-/// 「每单位单价」。这里必须除以 `手数 × VolumeMultiple` 才能还原成与现价同量纲的开仓
-/// 单价；真实乘数经 `multiplier` 字段下传，宿主按 `pnl=(cur-entry)×qty×mult` 重算。
+/// **量纲**：CTP 的 `PositionCost` 是总持仓成本 = 单价 × 乘数 × 手数（可加）。
+/// 今仓行+昨仓行是同一仓位的不相交分片，故：
+/// * 总手数 `N = Σ position`（剔除 position=0 空壳行）；
+/// * 总成本 `C = Σ PositionCost`；
+/// * 合并开仓单价 `entry = C / (N × multiplier)`——**先求和再除**
+///   （手数加权；绝不可先算各行单价再平均）；
+/// * 占用保证金 `margin = Σ UseMargin`；
+/// * `today = Σ TodayPosition`、`yesterday = Σ YdPosition`（喂 PositionDir）。
 ///
-/// 任一前置不满足返回 None（该行被过滤，绝不产出错误量纲价）：数量为 0、方向未知、
-/// 或乘数缺失/非正（合约目录尚未预热时宁可漏一批，待下轮对账补齐）。
+/// 现价/pnl/roi/notional 适配层不计算（`mark_price=None`、`unrealized_pnl=None`），
+/// 交引擎用 QuoteTable 现价对合并后的一条统一重估。
+///
+/// 任一前置不满足返回 None（该组被过滤，绝不产出错误量纲价）：过滤后无有效行
+/// （数量皆 0/方向未知）、或乘数缺失/非正（合约目录尚未预热时宁可漏一批，
+/// 待下轮对账补齐）。
+pub fn merge_position_snapshots(
+    group: &[PositionSnapshot],
+    volume_multiple: i32,
+) -> Option<MergedPosition> {
+    // 乘数缺失/非法：整组不产出（避免退化为"每手成本"污染单价口径）。
+    if volume_multiple <= 0 {
+        return None;
+    }
+    // 剔除空壳行；同组 (合约,方向) 一致由调用方分桶保证，这里取首个有效行为代表。
+    let valid: Vec<&PositionSnapshot> = group
+        .iter()
+        .filter(|p| p.position != 0 && matches!(p.direction, '2' | '3'))
+        .collect();
+    let head = *valid.first()?;
+    // 手数饱和求和：柜台畸形大值下 debug 构建也不得因 i32 溢出在会话线程 panic
+    // （同方向今/昨分片通常仅 1~2 行，饱和上限现实中不可达）。
+    let saturating_sum = |f: fn(&PositionSnapshot) -> i32| {
+        valid.iter().fold(0_i32, |acc, p| acc.saturating_add(f(p)))
+    };
+    let total = saturating_sum(|p| p.position);
+    if total <= 0 {
+        return None;
+    }
+    let total_cost: f64 = valid.iter().map(|p| p.position_cost).sum();
+    let total_margin: f64 = valid.iter().map(|p| p.use_margin).sum();
+    let today = saturating_sum(|p| p.today_position.max(0));
+    let yesterday = saturating_sum(|p| p.yd_position.max(0));
+    let signed = match head.direction {
+        '2' => Decimal::from(total),
+        '3' => -Decimal::from(total),
+        _ => return None,
+    };
+    // 合并单价 = 总成本之和 / (总手数 × 乘数)；total>0、mult>0 故 denom 必为正。
+    let denom = f64::from(total) * f64::from(volume_multiple);
+    let entry = Decimal::try_from(total_cost / denom).unwrap_or_default();
+    Some(MergedPosition {
+        info: PositionInfo {
+            instrument: head.instrument.clone(),
+            instrument_type: InstrumentType::Futures,
+            position_side: OrderPositionSide::Both,
+            signed_quantity: signed,
+            entry_price: entry,
+            mark_price: None,
+            // 盈亏交宿主用统一公式（单价 × 乘数）重算，不直接采用柜台汇总值，保证口径单一。
+            unrealized_pnl: None,
+            leverage: None,
+            multiplier: Some(Decimal::from(volume_multiple)),
+            notional: None,
+            margin: Decimal::try_from(total_margin).ok(),
+            update_ms: None,
+        },
+        today,
+        yesterday,
+    })
+}
+
+/// 单条持仓快照 → 统一持仓行（单价口径）；[`merge_position_snapshots`] 的单行特例。
+///
+/// 语义与聚合路径完全一致（同一实现），数量为 0/方向未知/乘数缺失非正时返回 None。
 pub fn position_info_from_snapshot(
     p: &PositionSnapshot,
     volume_multiple: i32,
 ) -> Option<PositionInfo> {
-    if p.position == 0 {
-        return None;
-    }
-    let signed = match p.direction {
-        '2' => Decimal::from(p.position),
-        '3' => -Decimal::from(p.position),
-        _ => return None,
-    };
-    // 乘数缺失/非法：不产出（避免退化为"每手成本"污染单价口径）。
-    if volume_multiple <= 0 {
-        return None;
-    }
-    // 单价 = 总持仓成本 / (手数 × 乘数)。
-    // 上方已保证 position≠0、volume_multiple>0，故 denom 必为正。
-    let denom = f64::from(p.position) * f64::from(volume_multiple);
-    let entry = Decimal::try_from(p.position_cost / denom).unwrap_or_default();
-    Some(PositionInfo {
-        instrument: p.instrument.clone(),
-        instrument_type: InstrumentType::Futures,
-        position_side: OrderPositionSide::Both,
-        signed_quantity: signed,
-        entry_price: entry,
-        mark_price: None,
-        // 盈亏交宿主用统一公式（单价 × 乘数）重算，不直接采用柜台汇总值，保证口径单一。
-        unrealized_pnl: None,
-        leverage: None,
-        multiplier: Some(Decimal::from(volume_multiple)),
-        notional: None,
-        margin: Decimal::try_from(p.use_margin).ok(),
-        update_ms: None,
-    })
+    merge_position_snapshots(std::slice::from_ref(p), volume_multiple).map(|m| m.info)
 }
 
 #[cfg(test)]
@@ -314,6 +368,143 @@ mod tests {
         assert!(position_info_from_snapshot(&rb_long_snapshot(), -5).is_none());
     }
 
+    // ---- 今/昨分片聚合（SHFE 柜台同方向回两行）----
+
+    /// 构造一条 rb2510 持仓分片（仅聚合相关字段）。
+    fn rb_shard(
+        direction: char,
+        position: i32,
+        today: i32,
+        yd: i32,
+        cost: f64,
+        margin: f64,
+    ) -> PositionSnapshot {
+        PositionSnapshot {
+            instrument: "rb2510".into(),
+            direction,
+            position,
+            yd_position: yd,
+            today_position: today,
+            position_cost: cost,
+            use_margin: margin,
+            position_profit: 0.0,
+        }
+    }
+
+    #[test]
+    fn merge_today_and_yesterday_shards_into_one_weighted_position() {
+        // Arrange：今 2 手@3200（cost=3200×10×2=64000）+ 昨 3 手@3300（99000）。
+        let group = vec![
+            rb_shard('2', 2, 2, 0, 64_000.0, 20_000.0),
+            rb_shard('2', 3, 0, 3, 99_000.0, 30_000.0),
+        ];
+
+        // Act
+        let merged = merge_position_snapshots(&group, 10).expect("乘数就绪应聚合成功");
+
+        // Assert：一条、qty=5、entry=163000/(5×10)=3260（手数加权，非 3250），
+        // margin=两行和，路由明细 today=2/yd=3。
+        assert_eq!(merged.info.signed_quantity, Decimal::from(5));
+        assert_eq!(merged.info.entry_price, Decimal::try_from(3260.0).unwrap());
+        assert_eq!(
+            merged.info.margin,
+            Some(Decimal::try_from(50_000.0).unwrap())
+        );
+        assert_eq!(merged.info.multiplier, Some(Decimal::from(10)));
+        assert_eq!((merged.today, merged.yesterday), (2, 3));
+    }
+
+    #[test]
+    fn merge_single_shard_matches_single_row_mapper_field_by_field() {
+        // Arrange：单行分片与既有单条映射输入同构。
+        let single = rb_long_snapshot();
+
+        // Act
+        let merged = merge_position_snapshots(std::slice::from_ref(&single), 10).unwrap();
+        let direct = position_info_from_snapshot(&single, 10).unwrap();
+
+        // Assert：聚合路径与单条映射逐字段一致（回归保护），明细取该行今昨。
+        assert_eq!(merged.info.signed_quantity, direct.signed_quantity);
+        assert_eq!(merged.info.entry_price, direct.entry_price);
+        assert_eq!(merged.info.multiplier, direct.multiplier);
+        assert_eq!(merged.info.margin, direct.margin);
+        assert_eq!(merged.info.instrument, direct.instrument);
+        assert_eq!((merged.today, merged.yesterday), (2, 1));
+    }
+
+    #[test]
+    fn merge_keeps_long_and_short_groups_separate() {
+        // Arrange：同合约多/空各一组（每组内部聚合，互不混）。
+        let long = vec![
+            rb_shard('2', 2, 2, 0, 64_000.0, 20_000.0),
+            rb_shard('2', 3, 0, 3, 99_000.0, 30_000.0),
+        ];
+        let short = vec![rb_shard('3', 4, 1, 3, 132_000.0, 40_000.0)];
+
+        // Act
+        let m_long = merge_position_snapshots(&long, 10).unwrap();
+        let m_short = merge_position_snapshots(&short, 10).unwrap();
+
+        // Assert：多 +5、空 −4，各自单价独立。
+        assert_eq!(m_long.info.signed_quantity, Decimal::from(5));
+        assert_eq!(m_short.info.signed_quantity, -Decimal::from(4));
+        assert_eq!(m_short.info.entry_price, Decimal::try_from(3300.0).unwrap());
+        assert_eq!((m_short.today, m_short.yesterday), (1, 3));
+    }
+
+    #[test]
+    fn merge_ignores_zero_position_shell_rows() {
+        // Arrange：柜台推 position=0 空壳行混入有效今仓行。
+        let group = vec![
+            rb_shard('2', 0, 0, 0, 0.0, 0.0),
+            rb_shard('2', 2, 2, 0, 64_000.0, 20_000.0),
+        ];
+
+        // Act / Assert：空壳行不参与手数/成本/明细。
+        let merged = merge_position_snapshots(&group, 10).unwrap();
+        assert_eq!(merged.info.signed_quantity, Decimal::from(2));
+        assert_eq!(merged.info.entry_price, Decimal::try_from(3200.0).unwrap());
+        assert_eq!((merged.today, merged.yesterday), (2, 0));
+    }
+
+    #[test]
+    fn merge_returns_none_when_multiple_missing_or_all_shells() {
+        // 乘数 0：整组不映射（等下轮对账）。
+        let group = vec![
+            rb_shard('2', 2, 2, 0, 64_000.0, 20_000.0),
+            rb_shard('2', 3, 0, 3, 99_000.0, 30_000.0),
+        ];
+        assert!(merge_position_snapshots(&group, 0).is_none());
+        // 全是空壳行：无有效持仓。
+        let shells = vec![rb_shard('2', 0, 0, 0, 0.0, 0.0)];
+        assert!(merge_position_snapshots(&shells, 10).is_none());
+        // 空组。
+        assert!(merge_position_snapshots(&[], 10).is_none());
+    }
+
+    #[test]
+    fn merge_short_two_shards_keeps_negative_qty_and_positive_entry() {
+        // Arrange：空头今 1@3200 + 昨 2@3300（成本均为正金额）。
+        let group = vec![
+            rb_shard('3', 1, 1, 0, 32_000.0, 10_000.0),
+            rb_shard('3', 2, 0, 2, 66_000.0, 20_000.0),
+        ];
+
+        // Act
+        let merged = merge_position_snapshots(&group, 10).unwrap();
+
+        // Assert：signed=−3；entry 为正的加权单价 98000/(3×10)≈3266.667。
+        assert_eq!(merged.info.signed_quantity, -Decimal::from(3));
+        assert!(merged.info.entry_price > Decimal::ZERO, "开仓单价必须为正");
+        let expected = Decimal::from(98_000) / Decimal::from(30);
+        assert!(
+            (merged.info.entry_price - expected).abs() < Decimal::new(1, 6),
+            "entry={} 应≈手数加权单价 {expected}",
+            merged.info.entry_price
+        );
+        assert_eq!((merged.today, merged.yesterday), (1, 2));
+    }
+
     #[test]
     fn trade_maps_cumulative_filled() {
         let t = TradeSnapshot {
@@ -323,6 +514,7 @@ mod tests {
             exchange_id: "SHFE".into(),
             order_sys_id: "9001".into(),
             direction: Direction::Buy,
+            offset: Some(crate::ctp::core::types::Offset::Open),
             price: 3205.0,
             volume: 1,
             trade_date: "20261012".into(),
