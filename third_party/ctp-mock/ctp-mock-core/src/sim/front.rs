@@ -21,8 +21,13 @@ use ctp2rs::v1alpha1::{
 };
 
 use super::frames::{instrument_frame, order_frame, position_frame, rsp_info, trade_frame, Party};
-use super::ledger::{Fill, InstrumentSpec, OrderLedger, OrderRecord, PositionLedger, TradeRecord};
-use super::script::{ctp_error_text, plan_insert, FillMode, FillScript, OrderReq};
+use super::ledger::{
+    Fill, InstrumentSpec, OrderLedger, OrderRecord, PositionLedger, TradeRecord, DIR_SELL,
+};
+use super::rules::{needs_close_avail_check, reject_close_avail_code, reject_insert_code};
+use super::script::{
+    ctp_error_text, plan_insert, FillMode, FillScript, OrderReq, TIME_GFD, TIME_IOC,
+};
 use super::session::{
     Handshake, LoginInfo, Phase, QryKind, QueryGate, RET_NOT_CONNECTED, RET_OK,
     RET_QUERY_FLOW_CONTROL,
@@ -392,12 +397,6 @@ impl MockTdFront {
         let instrument = get_fixed(&req.InstrumentID);
         let exchange = self.ensure_exchange(&instrument);
 
-        // 一次性拒绝优先于脚本。
-        let script = match self.next_reject.lock().unwrap().take() {
-            Some(code) => FillScript::rejected(code),
-            None => self.fill_script.lock().unwrap().clone(),
-        };
-
         let order_req = OrderReq {
             order_ref: order_ref.clone(),
             instrument: instrument.clone(),
@@ -408,17 +407,42 @@ impl MockTdFront {
             price_type: req.OrderPriceType as u8 as char,
             limit_price: req.LimitPrice,
             volume: req.VolumeTotalOriginal,
+            time_condition: normalize_time_condition(
+                req.TimeCondition as u8 as char,
+                req.OrderPriceType as u8 as char,
+            ),
+        };
+
+        // 柜台内置字段规则（默认常开、与成交脚本正交）：SHFE 市价 → 80、
+        // SHFE 笼统平仓 → 15。命中即拒且**不消费**一次性注入（注入留给后续单）。
+        if let Some(code) = reject_insert_code(&order_req) {
+            self.emit_insert_reject(code, _request_id);
+            return RET_OK;
+        }
+        // SHFE 显式平今/平昨的可平量校验：仅此类单按被平方向读台账，
+        // 超今仓 50 / 超昨仓 51（开仓与非 SHFE 单不上持仓锁）。
+        if needs_close_avail_check(&order_req) {
+            let (today_avail, yd_avail) = {
+                let positions = self.positions.lock().unwrap();
+                // SELL 平多 / BUY 平空。
+                positions.closeable(&instrument, order_req.direction == DIR_SELL)
+            };
+            if let Some(code) = reject_close_avail_code(&order_req, today_avail, yd_avail) {
+                self.emit_insert_reject(code, _request_id);
+                return RET_OK;
+            }
+        }
+
+        // 规则放行后：一次性拒绝优先于脚本。
+        let script = match self.next_reject.lock().unwrap().take() {
+            Some(code) => FillScript::rejected(code),
+            None => self.fill_script.lock().unwrap().clone(),
         };
         let marker = *self.marker_price.lock().unwrap();
 
         // 录入被拒：不分配系统号、不记账，异步 on_rsp_order_insert 带真实错误码。
         if script.mode == FillMode::Rejected {
-            let code = script.reject_code;
-            let msg = ctp_error_text(code).to_string();
-            self.post(move |spi| {
-                let info = rsp_info(code, &msg);
-                spi.on_rsp_order_insert(None, Some(&info), _request_id, true);
-            });
+            self.emit_insert_reject(script.reject_code, _request_id);
             return RET_OK;
         }
 
@@ -460,6 +484,7 @@ impl MockTdFront {
             direction: req.direction,
             offset: req.offset,
             price_type: req.price_type,
+            time_condition: req.time_condition,
             limit_price: req.limit_price,
             volume_total: req.volume,
             volume_traded: 0,
@@ -604,6 +629,16 @@ impl MockTdFront {
         RET_OK
     }
 
+    /// 录单被拒的统一出口：不分配系统号、不记账，异步 on_rsp_order_insert
+    /// 带真实错误码/文案（受理码仍返 0，与真实柜台「受理后柜台侧拒绝」一致）。
+    fn emit_insert_reject(&self, code: i32, request_id: i32) {
+        let msg = ctp_error_text(code).to_string();
+        self.post(move |spi| {
+            let info = rsp_info(code, &msg);
+            spi.on_rsp_order_insert(None, Some(&info), request_id, true);
+        });
+    }
+
     fn emit_cancel_reject(&self, code: i32) {
         let msg = super::script::ctp_error_text(code).to_string();
         self.post(move |spi| {
@@ -726,6 +761,7 @@ impl MockTdFront {
                     direction: t.direction,
                     offset: t.offset,
                     price_type: '2',
+                    time_condition: TIME_GFD,
                     limit_price: t.price,
                     volume_total: t.volume,
                     volume_traded: t.volume,
@@ -823,6 +859,21 @@ impl MockTdFront {
 impl Drop for MockTdFront {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// 回报有效期归一化：真实客户端市价恒带 IOC、限价带 GFD；当请求未显式给
+/// （测试 default 为 NUL `'\0'`）时按价格条件推断，保证回报帧与真实柜台一致。
+fn normalize_time_condition(time_condition: char, price_type: char) -> char {
+    match time_condition {
+        TIME_IOC | TIME_GFD => time_condition,
+        _ => {
+            if price_type == super::script::PRICE_ANY {
+                TIME_IOC
+            } else {
+                TIME_GFD
+            }
+        }
     }
 }
 
@@ -977,17 +1028,58 @@ mod tests {
         h
     }
 
-    fn insert(order_ref: &str, instrument: &str, vol: i32) -> CThostFtdcInputOrderField {
+    /// 通用录单构造（方向/开平/价格条件/有效期/价格均可配）。
+    #[allow(clippy::too_many_arguments)]
+    fn input_order(
+        order_ref: &str,
+        instrument: &str,
+        vol: i32,
+        direction: char,
+        offset: char,
+        price_type: char,
+        time_cond: char,
+        price: f64,
+    ) -> CThostFtdcInputOrderField {
         let mut req = CThostFtdcInputOrderField::default();
         put_fixed(&mut req.OrderRef, order_ref);
         put_fixed(&mut req.InstrumentID, instrument);
-        req.Direction = '0' as i8;
-        req.CombOffsetFlag[0] = '0' as i8;
+        req.Direction = direction as i8;
+        req.CombOffsetFlag[0] = offset as i8;
         req.CombHedgeFlag[0] = '1' as i8;
-        req.OrderPriceType = '2' as i8;
-        req.LimitPrice = 3200.0;
+        req.OrderPriceType = price_type as i8;
+        req.TimeCondition = time_cond as i8;
+        req.LimitPrice = price;
         req.VolumeTotalOriginal = vol;
         req
+    }
+
+    /// 限价 GFD 买开（既有链路默认请求）。
+    fn insert(order_ref: &str, instrument: &str, vol: i32) -> CThostFtdcInputOrderField {
+        input_order(order_ref, instrument, vol, '0', '0', '2', '3', 3200.0)
+    }
+
+    /// 市价 IOC（AnyPrice、价格填 0）。
+    fn market(
+        order_ref: &str,
+        instrument: &str,
+        vol: i32,
+        direction: char,
+        offset: char,
+    ) -> CThostFtdcInputOrderField {
+        input_order(order_ref, instrument, vol, direction, offset, '1', '1', 0.0)
+    }
+
+    /// 限价 GFD（开平/方向可配）。
+    fn limit(
+        order_ref: &str,
+        instrument: &str,
+        vol: i32,
+        direction: char,
+        offset: char,
+    ) -> CThostFtdcInputOrderField {
+        input_order(
+            order_ref, instrument, vol, direction, offset, '2', '3', 3200.0,
+        )
     }
 
     #[test]
@@ -1046,6 +1138,107 @@ mod tests {
         let h = ready_front();
         h.front.reject_next(30);
         assert_eq!(h.front.insert_order(&insert("1", "rb2510", 1), 10), 0);
+        assert_eq!(h.recv("insertrej30"), "insertrej:30");
+    }
+
+    // ---- 柜台内置规则：SHFE 市价 80 / 笼统平仓 15 / 非 SHFE 市价成交 ----
+
+    #[test]
+    fn shfe_market_order_is_rejected_80_and_not_booked() {
+        let h = ready_front();
+        // SHFE 市价买开：80，无委托/成交回报。
+        assert_eq!(
+            h.front
+                .insert_order(&market("1", "rb2510", 2, '0', '0'), 10),
+            0
+        );
+        assert_eq!(h.recv("insertrej80"), "insertrej:80");
+        // 台账无该单：之后无 order/trade 回调（再撤也找不到）。
+        let mut act = CThostFtdcInputOrderActionField::default();
+        put_fixed(&mut act.OrderRef, "1");
+        act.FrontID = 1;
+        act.SessionID = 7001;
+        assert_eq!(h.front.cancel_order(&act, 11), 0);
+        assert_eq!(h.recv("cancelerr25"), "cancelerr:25");
+    }
+
+    #[test]
+    fn non_shfe_market_order_fills_at_marker_with_ioc() {
+        let h = ready_front();
+        // 显式注册为非 SHFE（IF2510 前缀夹具 exchange_id=""，用 register_spec 钉死 CFFEX）。
+        h.front
+            .register_spec(InstrumentSpec::generic("IF2510", "CFFEX"));
+        assert_eq!(
+            h.front
+                .insert_order(&market("1", "IF2510", 2, '0', '0'), 10),
+            0
+        );
+        // 非 SHFE 市价直接受理并按 marker 价成交。
+        assert_eq!(h.recv("order3"), "order:3");
+        assert_eq!(h.recv("trade"), "trade");
+        assert_eq!(h.recv("order0"), "order:0");
+    }
+
+    #[test]
+    fn shfe_generic_close_is_rejected_15_but_explicit_close_today_accepted() {
+        let h = ready_front();
+        // SHFE 限价笼统平仓 Close='1'：15。
+        assert_eq!(
+            h.front.insert_order(&limit("1", "rb2510", 1, '1', '1'), 10),
+            0
+        );
+        assert_eq!(h.recv("insertrej15"), "insertrej:15");
+        // 显式平今 CloseToday='3'（无持仓，50/51 仅校验显式腿的可平量——
+        // 这里先只验证笼统 Close 被 15 拦；显式腿的超量用例见下）。
+        h.front.seed_position("rb2510", true, 2, 2, 0, 3200.0);
+        assert_eq!(
+            h.front.insert_order(&limit("2", "rb2510", 2, '1', '3'), 11),
+            0
+        );
+        assert_eq!(h.recv("order3"), "order:3");
+        assert_eq!(h.recv("trade"), "trade");
+        assert_eq!(h.recv("order0"), "order:0");
+    }
+
+    #[test]
+    fn shfe_explicit_close_over_position_rejected_50_51() {
+        let h = ready_front();
+        // 今 1 昨 2：平今 2 → 50；平昨 3 → 51；平今 1 / 平昨 2 放行。
+        h.front.seed_position("rb2510", true, 3, 1, 2, 3200.0);
+        assert_eq!(
+            h.front.insert_order(&limit("1", "rb2510", 2, '1', '3'), 10),
+            0
+        );
+        assert_eq!(h.recv("insertrej50"), "insertrej:50");
+        // SELL 平多平昨 3 > 昨仓 2 → 51。
+        assert_eq!(
+            h.front.insert_order(&limit("2", "rb2510", 3, '1', '4'), 11),
+            0
+        );
+        assert_eq!(h.recv("insertrej51"), "insertrej:51");
+        // 正确方向（SELL 平多）平昨 2 手（=昨仓）：放行成交。
+        assert_eq!(
+            h.front.insert_order(&limit("3", "rb2510", 2, '1', '4'), 12),
+            0
+        );
+        assert_eq!(h.recv("order3"), "order:3");
+        assert_eq!(h.recv("trade"), "trade");
+        assert_eq!(h.recv("order0"), "order:0");
+    }
+
+    #[test]
+    fn builtin_rule_reject_does_not_consume_one_shot_injection() {
+        let h = ready_front();
+        // 预置一次性注入 30，随后发 SHFE 市价（规则 80）：注入不应被吞。
+        h.front.reject_next(30);
+        assert_eq!(
+            h.front
+                .insert_order(&market("1", "rb2510", 1, '0', '0'), 10),
+            0
+        );
+        assert_eq!(h.recv("insertrej80"), "insertrej:80");
+        // 下一笔合规单仍吃到注入的 30。
+        assert_eq!(h.front.insert_order(&insert("2", "rb2510", 1), 11), 0);
         assert_eq!(h.recv("insertrej30"), "insertrej:30");
     }
 

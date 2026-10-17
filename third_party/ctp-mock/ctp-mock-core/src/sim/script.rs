@@ -9,6 +9,9 @@
 
 /// 市价单的价格条件字符（CTP `THOST_FTDC_OPT_AnyPrice`）。
 pub const PRICE_ANY: char = '1';
+/// 有效期字符：IOC `'1'`（市价单）/ GFD `'3'`（限价单）。
+pub const TIME_IOC: char = '1';
+pub const TIME_GFD: char = '3';
 
 /// 报单请求要素（FFI 层从 `CThostFtdcInputOrderField` 拷贝而来）。
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +29,8 @@ pub struct OrderReq {
     pub price_type: char,
     pub limit_price: f64,
     pub volume: i32,
+    /// 有效期：'1' IOC / '3' GFD（回报帧原样回填）。
+    pub time_condition: char,
 }
 
 /// 成交方式（脚本，不撮合）。
@@ -120,11 +125,15 @@ pub enum CancelOutcome {
 /// 未收录码返回通用兜底，避免空信息。
 pub fn ctp_error_text(code: i32) -> &'static str {
     match code {
+        15 => "报单字段有误",
         24 => "撤单已报送，不允许重复撤单",
         25 => "撤单找不到相应报单",
         26 => "报单已全成交或已撤销，不能再撤",
         30 => "平仓量超过持仓量",
+        50 => "平今仓位不足",
+        51 => "平昨仓位不足",
         64 => "客户端未认证",
+        80 => "交易所不支持的价格类型",
         _ => "未知错误",
     }
 }
@@ -262,6 +271,7 @@ mod tests {
             price_type: '2',
             limit_price: 3205.0,
             volume: vol,
+            time_condition: TIME_GFD,
         }
     }
 

@@ -398,6 +398,21 @@ impl PositionLedger {
         self.pos.get(instrument).map(|p| p.net()).unwrap_or(0)
     }
 
+    /// 按**被平方向**返回可平 (今, 昨) 非负手数。
+    ///
+    /// SELL 平多（`closing_long=true`）取今/昨的正分量；BUY 平空取负分量绝对值。
+    /// 非今昨区分所把全部净仓记在 today 上（yd=0），与平仓净额口径一致。
+    pub fn closeable(&self, instrument: &str, closing_long: bool) -> (i32, i32) {
+        let Some(p) = self.pos.get(instrument) else {
+            return (0, 0);
+        };
+        if closing_long {
+            (p.today.max(0), p.yd.max(0))
+        } else {
+            ((-p.today).max(0), (-p.yd).max(0))
+        }
+    }
+
     /// 派生全部有账合约的持仓行（确定性顺序，控制面 ledger 快照用）。
     pub fn all_rows(&self) -> Vec<PositionRow> {
         self.instruments()
@@ -435,6 +450,8 @@ pub struct OrderRecord {
     pub offset: char,
     /// 价格条件 '1' 市价 / '2' 限价（回报 OrderPriceType 回填）。
     pub price_type: char,
+    /// 有效期 '1' IOC / '3' GFD（回报 TimeCondition 回填）。
+    pub time_condition: char,
     pub limit_price: f64,
     pub volume_total: i32,
     pub volume_traded: i32,
@@ -612,6 +629,21 @@ mod tests {
     }
 
     #[test]
+    fn closeable_reports_today_yd_by_closing_direction() {
+        let mut l = shfe_ledger();
+        // 多头 今1 昨2：SELL 平多可平 (今1, 昨2)；BUY 平空为 (0,0)。
+        l.seed("rb2510", true, 3, 1, 2, 3200.0);
+        assert_eq!(l.closeable("rb2510", true), (1, 2));
+        assert_eq!(l.closeable("rb2510", false), (0, 0));
+        // 空头 今3：BUY 平空取负分量绝对值。
+        l.seed("rb2510", false, 3, 3, 0, 3200.0);
+        assert_eq!(l.closeable("rb2510", false), (3, 0));
+        assert_eq!(l.closeable("rb2510", true), (0, 0));
+        // 无账合约：(0,0)。
+        assert_eq!(l.closeable("nope", true), (0, 0));
+    }
+
+    #[test]
     fn generic_exchange_close_is_net_and_single_date() {
         let mut l = generic_ledger();
         l.apply_fill(&Fill {
@@ -704,6 +736,7 @@ mod tests {
             direction: DIR_BUY,
             offset: OFFSET_OPEN,
             price_type: '2',
+            time_condition: '3',
             limit_price: 3200.0,
             volume_total: 2,
             volume_traded: 0,
@@ -729,6 +762,7 @@ mod tests {
             direction: DIR_BUY,
             offset: OFFSET_OPEN,
             price_type: '2',
+            time_condition: '3',
             limit_price: 1.0,
             volume_total: 1,
             volume_traded: 1,
@@ -751,6 +785,7 @@ mod tests {
                 direction: DIR_BUY,
                 offset: OFFSET_OPEN,
                 price_type: '2',
+                time_condition: '3',
                 limit_price: 1.0,
                 volume_total: 1,
                 volume_traded: 0,

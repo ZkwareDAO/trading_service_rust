@@ -60,6 +60,7 @@ pub fn order_frame(
     o.CombOffsetFlag[0] = rec.offset as i8;
     o.CombHedgeFlag[0] = HEDGE_SPECULATION as i8;
     o.LimitPrice = rec.limit_price;
+    o.TimeCondition = rec.time_condition as i8;
     o.VolumeTotalOriginal = rec.volume_total;
     o.VolumeTotal = rec.volume_total;
     o.VolumeTraded = volume_traded;
@@ -176,6 +177,7 @@ mod tests {
             direction: '0',
             offset: '0',
             price_type: '2',
+            time_condition: '3',
             limit_price: 3205.0,
             volume_total: 2,
             volume_traded: 0,

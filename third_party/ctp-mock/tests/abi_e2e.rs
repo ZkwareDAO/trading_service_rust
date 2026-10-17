@@ -500,17 +500,85 @@ fn trader_inprocess_control_rejects_next_insert_with_code_30() {
     let front = ctpmock_td::ffi::td_api::control_for(flow).expect("in-process handle");
     front.reject_next(30);
 
+    // 用「限价卖开」触发注入：SHFE 笼统平仓会被内置规则 15 先拦（见下条用例），
+    // 开仓不受规则约束，注入的 30 才会生效。
     let mut o = CThostFtdcInputOrderField::default();
     put(&mut o.OrderRef, "9");
     put(&mut o.InstrumentID, "rb2510");
     o.Direction = '1' as i8;
-    o.CombOffsetFlag[0] = '1' as i8;
+    o.CombOffsetFlag[0] = '0' as i8;
     o.CombHedgeFlag[0] = '1' as i8;
     o.OrderPriceType = '2' as i8;
+    o.TimeCondition = '3' as i8;
     o.LimitPrice = 3200.0;
     o.VolumeTotalOriginal = 99;
     assert_eq!(td.insert(&mut o, 10), 0);
     wait(&rx, &TE::InsertRej(30), "insert-rejected-30");
+
+    drop(td);
+}
+
+/// L2：柜台内置 SHFE 规则（真实 ctp2rs 句柄 dlopen 替身）。
+/// * SHFE 市价（AnyPrice+IOC）→ `OnRspOrderInsert` 80；
+/// * SHFE 限价笼统平仓 Close='1' → 15；
+/// * 非 SHFE 合约市价 → 正常受理成交（IF 前缀夹具 exchange=""，规则只正向命中 SHFE）。
+#[test]
+fn trader_shfe_builtin_rules_80_15_and_non_shfe_market_fills() {
+    use ctp2rs::v1alpha1::*;
+    let flow = "./td_shfe_rules_flow_inproc_";
+    let (tx, rx) = std::sync::mpsc::sync_channel::<TE>(64);
+    let spi = Box::into_raw(Box::new(LifeSpi { tx })) as *mut dyn TraderSpi;
+    let td = InProcTd::create(flow, spi);
+    td.init();
+    wait(&rx, &TE::Connected, "connected");
+    assert_eq!(td.authenticate(1), 0);
+    wait(&rx, &TE::Authed, "authed");
+    assert_eq!(td.login(2), 0);
+    wait(&rx, &TE::Login, "login");
+    assert_eq!(td.settle(3), 0);
+    wait(&rx, &TE::Settled, "settled");
+
+    // ① SHFE 市价买开：80（受理码仍 0，错误走 OnRspOrderInsert）。
+    let mut mkt = CThostFtdcInputOrderField::default();
+    put(&mut mkt.OrderRef, "1");
+    put(&mut mkt.InstrumentID, "rb2510");
+    mkt.Direction = '0' as i8;
+    mkt.CombOffsetFlag[0] = '0' as i8;
+    mkt.CombHedgeFlag[0] = '1' as i8;
+    mkt.OrderPriceType = '1' as i8; // AnyPrice
+    mkt.TimeCondition = '1' as i8; // IOC
+    mkt.VolumeTotalOriginal = 2;
+    assert_eq!(td.insert(&mut mkt, 10), 0);
+    wait(&rx, &TE::InsertRej(80), "shfe-market-80");
+
+    // ② SHFE 限价笼统平仓 Close='1'：15。
+    let mut close = CThostFtdcInputOrderField::default();
+    put(&mut close.OrderRef, "2");
+    put(&mut close.InstrumentID, "rb2510");
+    close.Direction = '1' as i8;
+    close.CombOffsetFlag[0] = '1' as i8;
+    close.CombHedgeFlag[0] = '1' as i8;
+    close.OrderPriceType = '2' as i8;
+    close.TimeCondition = '3' as i8;
+    close.LimitPrice = 3200.0;
+    close.VolumeTotalOriginal = 1;
+    assert_eq!(td.insert(&mut close, 11), 0);
+    wait(&rx, &TE::InsertRej(15), "shfe-close-15");
+
+    // ③ 非 SHFE（IF 前缀夹具交易所非 SHFE）市价：直接受理成交。
+    let mut mkt2 = CThostFtdcInputOrderField::default();
+    put(&mut mkt2.OrderRef, "3");
+    put(&mut mkt2.InstrumentID, "IF2510");
+    mkt2.Direction = '0' as i8;
+    mkt2.CombOffsetFlag[0] = '0' as i8;
+    mkt2.CombHedgeFlag[0] = '1' as i8;
+    mkt2.OrderPriceType = '1' as i8;
+    mkt2.TimeCondition = '1' as i8;
+    mkt2.VolumeTotalOriginal = 2;
+    assert_eq!(td.insert(&mut mkt2, 12), 0);
+    wait(&rx, &TE::RtnOrder('3'), "non-shfe-queued");
+    wait(&rx, &TE::RtnTrade, "non-shfe-trade");
+    wait(&rx, &TE::RtnOrder('0'), "non-shfe-all-traded");
 
     drop(td);
 }
