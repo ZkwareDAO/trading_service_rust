@@ -19,6 +19,11 @@ use crate::ctp::gateway::trader::TraderHandle;
 /// 事件等待超时：空闲轮询粒度（同时是"空闲读超时判死连"的窗口下限）。
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// 全成委托快照先于成交回报到达时，等待 `OnRtnTrade` 补齐真实成交价的宽限（ms）。
+/// 正常两路间隔仅 1~2ms（同毫秒级对齐）；仅当成交帧异常丢失时才走满此宽限，
+/// 由 inner_loop 空闲 tick 兜底按已知数据投影终态，避免订单悬挂。
+const TERMINAL_TRADE_GRACE_MS: i64 = 1500;
+
 /// 登录三步总窗口：认证/登录应答秒级，结算确认在交易日切换时可能需下载
 /// 结算单，放宽到 5 分钟。
 const LOGIN_DEADLINE: Duration = Duration::from_secs(300);
@@ -185,6 +190,10 @@ pub struct CtpUserHandle {
     /// cid 下所有腿终态（终态钩子回收，见 [`forward_order_snapshot`]）；
     /// 崩溃恢复不依赖本表——重连补快照的委托回报自带柜台权威 `volume_traded`。
     pub(crate) filled_by_cid: Arc<Mutex<std::collections::HashMap<String, i64>>>,
+    /// 按 **cid** 累计成交额（Σ 成交价×成交量，f64）：与 [`Self::filled_by_cid`]
+    /// 配套，用于在每笔成交回报上算成交均价（VWAP=成交额÷成交量）带给上游。
+    /// 生存期/回收与成交量表完全一致。
+    pub(crate) filled_amount_by_cid: Arc<Mutex<std::collections::HashMap<String, f64>>>,
     /// 会话请求信箱（下单/撤单/查询；async 侧投递 → 本线程消费；provider 级共享）。
     pub(crate) mailbox: Arc<crate::ctp::mailbox::SessionMailbox>,
 }
@@ -268,6 +277,9 @@ fn inner_loop(h: &mut TraderHandle, handle: &Arc<CtpUserHandle>, ctx: &EventCont
     let mut active: Option<ActiveQuery> = None;
     // 本连接是否已发起合约表预热；断线重连会重新进入 inner_loop，标志复位、重拉一次。
     let mut contracts_loaded = false;
+    // 新连接入口：清空上一连接遗留的「待终态对齐」暂存（同一 ctx 跨重连复用），
+    // 避免上个连接没等到成交回报的 cid 在本连接被误兜底投影。
+    ctx.pending_terminal.clear();
     loop {
         if handle.shutdown.load(Ordering::SeqCst) {
             return;
@@ -293,7 +305,19 @@ fn inner_loop(h: &mut TraderHandle, handle: &Arc<CtpUserHandle>, ctx: &EventCont
             }
             Some(ev) => dispatch_event(ev, handle, ctx, &mut active),
             None => {
-                // 空闲且闸门空闲：去抖到点则触发后台持仓对账。
+                // 空闲：先兜底「待终态对齐」超时项（成交帧异常丢失时按已知数据投影，
+                // 不悬挂订单）；闸门空闲再看去抖是否到点触发后台持仓对账。
+                for (pending_cid, _expected) in ctx
+                    .pending_terminal
+                    .take_due(now_ms(), TERMINAL_TRADE_GRACE_MS)
+                {
+                    tracing::warn!(
+                        account = %ctx.account, cid = %pending_cid,
+                        grace_ms = TERMINAL_TRADE_GRACE_MS,
+                        "CTP 终态对齐超时：成交回报未在宽限内到齐，按快照兜底投影终态"
+                    );
+                    project_terminal(ctx, handle, &pending_cid);
+                }
                 if active.is_none() && ctx.debouncer.lock().unwrap().poll(now_ms()).is_some() {
                     issue_back_positions(h, &mut active);
                 }
@@ -551,17 +575,20 @@ fn close_plan_error(
     e: ClosePlanError,
     req: &crate::ctp::core::order::OrderRequest,
 ) -> anyhow::Error {
+    use crate::ctp::place_error::CtpPlaceError;
     match e {
-        ClosePlanError::SplitNotReady => anyhow::anyhow!(
+        // 今昨分布未就绪是可重试的临时态（重连/首轮对账未完成），判应答不确定，
+        // 不终态拒绝——对账完成后规则/手动重试仍可下单。
+        ClosePlanError::SplitNotReady => CtpPlaceError::indeterminate(format!(
             "CTP SHFE 平仓推迟：{} 的今/昨仓分布尚未就绪（重连/首轮持仓对账未完成），\
              请待对账后重试",
             req.instrument
-        ),
-        ClosePlanError::InsufficientPosition => anyhow::anyhow!(
+        )),
+        // 平仓量超过今+昨总仓：确定性拒绝（订单未送达柜台）。
+        ClosePlanError::InsufficientPosition => CtpPlaceError::rejected(format!(
             "CTP SHFE 平仓被拒：{} 平仓量 {} 超过今+昨总仓",
-            req.instrument,
-            req.volume
-        ),
+            req.instrument, req.volume
+        )),
     }
 }
 
@@ -624,13 +651,19 @@ fn insert_one_leg(
 ) -> anyhow::Result<()> {
     match h.insert_order(leg, order_ref) {
         Ok(0) => Ok(()),
+        // 柜台同步受理码非 0：确定性拒绝（订单未受理）。
         Ok(code) => {
             ctx.order_refs.remove(order_ref);
-            anyhow::bail!("CTP {label}报单被柜台拒绝：受理码 {code}")
+            Err(crate::ctp::place_error::CtpPlaceError::rejected(format!(
+                "CTP {label}报单被柜台拒绝：受理码 {code}"
+            )))
         }
+        // 投递前本地校验失败：确定性拒绝（订单未送达柜台）。
         Err(e) => {
             ctx.order_refs.remove(order_ref);
-            anyhow::bail!("CTP {label}报单校验失败: {e}")
+            Err(crate::ctp::place_error::CtpPlaceError::rejected(format!(
+                "CTP {label}报单校验失败: {e}"
+            )))
         }
     }
 }
@@ -648,10 +681,11 @@ fn submit_two_legs(
     // 短 cid（≤13B 透传）allocate 会原样返回同一串，无法支撑两腿，fail-closed。
     let Some(cid) = ctx.order_refs.cid_of(first_ref) else {
         ctx.order_refs.remove(first_ref);
-        anyhow::bail!(
+        // 两腿都未发出：确定性拒绝（短 cid 不支持一单两腿）。
+        return Err(crate::ctp::place_error::CtpPlaceError::rejected(format!(
             "CTP SHFE 跨今昨两腿下单失败：{} 的 cid 未在 OrderRef 映射中（短 cid 不支持两腿）",
             req.instrument
-        );
+        )));
     };
     let second_ref = ctx.order_refs.allocate(&cid);
     tracing::info!(
@@ -666,9 +700,12 @@ fn submit_two_legs(
         return Err(e);
     }
     // 昨腿已受理：今腿失败只清第二腿映射，昨腿保留（靠回报/对账收敛，不静默）。
+    // 因已有一腿送达柜台，整体应答不确定（不能当未受理拒绝），落 UNKNOWN 待收敛。
     if let Err(e) = insert_one_leg(h, ctx, &today, &second_ref, "平今腿") {
-        return Err(anyhow::anyhow!(
+        return Err(crate::ctp::place_error::CtpPlaceError::indeterminate(
+            format!(
             "CTP 一单两腿：平昨腿已受理、平今腿失败（{e}）；整体判失败，已受理腿靠成交回报/对账收敛"
+        ),
         ));
     }
     Ok(0)
@@ -814,6 +851,8 @@ pub(crate) struct EventContext {
     pub position_dir: Arc<crate::ctp::position_dir::PositionDir>,
     /// cid → 物理腿委托快照（跨今昨一单两腿的成交/终态聚合；仅会话线程用）。
     pub leg_table: Arc<crate::ctp::leg_table::LegTable>,
+    /// 全成委托快照先于成交回报到达时的「待终态对齐」cid 集合（仅会话线程用）。
+    pub pending_terminal: Arc<crate::ctp::pending_terminal::PendingTerminalTable>,
     /// 事件桥发送端；随会话线程结束（EventContext drop）而关闭，消费任务随之退出。
     pub tx: tokio::sync::mpsc::Sender<BridgeEvent>,
     /// 线程内去抖器（复用跨所通用纯决策内核）。
@@ -888,12 +927,17 @@ fn dispatch_event(
             // 回报反查：OrderRef → 本地长 cid（未命中保留原值，宿主 fallback 兜底）。
             // 两腿共享同一 cid，必须先解析再按 cid 累计，两腿成交才会求和。
             let cid = resolve_event_cid(ctx, &t.order_ref);
-            // 成交回报：按 cid 累计两腿成交量后推订单端口。
-            let cum = {
-                let mut m = handle.filled_by_cid.lock().unwrap();
-                let e = m.entry(cid.clone()).or_insert(0);
-                *e += t.volume.max(0) as i64;
-                *e
+            // 成交回报：按 cid 累计两腿成交量与成交额，算成交均价（VWAP）后推订单端口。
+            let (cum, avg_price) = {
+                let mut qty = handle.filled_by_cid.lock().unwrap();
+                let mut amt = handle.filled_amount_by_cid.lock().unwrap();
+                let q = qty.entry(cid.clone()).or_insert(0);
+                *q += t.volume.max(0) as i64;
+                let a = amt.entry(cid.clone()).or_insert(0.0);
+                *a += t.price.max(0.0) * t.volume.max(0) as f64;
+                // 同一把锁作用域内算出均价，避免跨锁读取不一致。
+                let avg = if *q > 0 { *a / (*q as f64) } else { 0.0 };
+                (*q, avg)
             };
             // 今/昨路由表的成交增量（主数据仍由周期持仓快照整批覆盖）：
             // 开仓增减方向=成交方向；平仓=反向（卖平多/买平空）；笼统 Close 不分今昨，
@@ -908,8 +952,18 @@ fn dispatch_event(
                 ctx.position_dir
                     .apply_trade(&t.instrument, offset, holding, t.volume);
             }
-            let state =
-                crate::ctp::mapping::order_state_from_trade(&t, rust_decimal::Decimal::from(cum));
+            // 终态对齐：全成委托快照先到、本笔成交正好把累计量补齐到快照量时，
+            // 经唯一收口投影带真实 VWAP 的终态，不再单独发成交 PARTIAL（终态事件
+            // 已含相同累计成交量/均价）。未补齐（分批成交）则照常发带价 PARTIAL。
+            if trade_completes_pending_terminal(ctx, &cid, cum) {
+                project_terminal(ctx, handle, &cid);
+                return;
+            }
+            let state = crate::ctp::mapping::order_state_from_trade(
+                &t,
+                rust_decimal::Decimal::from(cum),
+                avg_price,
+            );
             // cid 已在上方反查（两腿共享，成交按 cid 累计）。
             let mut event = crate::translate::order_event(&state);
             event.client_order_id = cid;
@@ -957,6 +1011,31 @@ fn dispatch_event(
     }
 }
 
+/// 判定柜台 StatusMsg 是否为「拒绝/出错」类原因（需 warn）。
+///
+/// 正常态文案：空、「全部成交」「未成交」「已撤单」「报单已提交」「部成」等。
+/// 柜台把受理后拒绝/错误的原因写在 StatusMsg（GB18030），实测形如
+/// `49:已撤单报单被拒绝SHFE:价格超出涨停板`、`707:…指定商品不在本交易节交易`，
+/// 并常以 `错误码:`/`CTP:` 前缀给出。命中「拒绝/出错/错误/废单/不足/超出涨跌停…」
+/// 等关键词即视为异常原因；保守起见只收敛明确词，宁可漏判为 debug，不可误判刷屏。
+fn is_venue_reject_status_msg(msg: &str) -> bool {
+    const REJECT_KEYWORDS: &[&str] = &[
+        "拒绝",
+        "废单",
+        "出错",
+        "错误",
+        "不足",
+        "超出涨跌停",
+        "超过涨跌停",
+        "涨跌停板",
+        "不在本交易节",
+        "不能成交",
+        "禁止",
+        "违规",
+    ];
+    REJECT_KEYWORDS.iter().any(|k| msg.contains(k))
+}
+
 /// 委托快照 → 订单端口（实时回报与后台重放共用同一路径）。
 ///
 /// 一个 cid 可能对应跨今昨一单两腿：先把本腿最新快照写入 LegTable，按 **cid 聚合**
@@ -972,6 +1051,25 @@ fn forward_order_snapshot(
     // 回报反查：OrderRef → 本地长 cid（两腿共享同一 cid；未命中保留原值）。
     let cid = resolve_event_cid(ctx, &s.order_ref);
     let instrument = s.instrument.clone();
+    // 柜台在委托快照里回填的状态/原因（GB18030 已在 FFI 层解码）。注意「受理后被柜台
+    // 撤/拒」不一定伴随 OnErrRtnOrderInsert（真机：SHFE 涨停板拒单只来 OnRtnOrder
+    // Cancelled + StatusMsg），只看错误帧会丢原因（#5/C11 排查关键）。正常态 StatusMsg
+    // 为「全部成交/未成交/已撤单/报单已提交」等——降 debug 不刷屏；仅拒单/出错类原因
+    // （见 is_venue_reject_status_msg）打 warn 便于告警与复盘。
+    let status_msg = s.status_msg.trim();
+    if is_venue_reject_status_msg(status_msg) {
+        tracing::warn!(
+            account = %ctx.account, cid = %cid, instrument = %s.instrument,
+            order_ref = %s.order_ref, raw_status = ?s.status, status_msg = %status_msg,
+            "CTP 委托回报：订单被柜台拒绝/撤销"
+        );
+    } else if !status_msg.is_empty() {
+        tracing::debug!(
+            account = %ctx.account, cid = %cid, order_ref = %s.order_ref,
+            raw_status = ?s.status, status_msg = %status_msg,
+            "CTP 委托回报状态"
+        );
+    }
     ctx.leg_table.upsert(&cid, s);
     // 聚合此刻该 cid 的全部腿（单腿单聚合即其自身）。
     let Some(agg) = ctx.leg_table.aggregate_cid(&cid) else {
@@ -991,10 +1089,36 @@ fn forward_order_snapshot(
     }
     // 严格相等才算收齐（不接受超额冒充完成，避免异常形态下提前收敛）。
     let legs_complete = received_legs == expected_legs;
-    // 腿未收齐时，即使已到的腿终态也不得收敛整单：有成交报 Partial、无成交报排队。
-    let reported_status = if agg.all_terminal && legs_complete {
-        agg.status
-    } else if agg.filled > 0 {
+    let is_terminal = agg.all_terminal && legs_complete;
+
+    // 终态对齐（修真实柜台 filled_price=0）：委托快照（OnRtnOrder）管生命周期但
+    // **不带成交价**，成交回报（OnRtnTrade）才带真实 VWAP。真机上全成快照常先于
+    // 成交回报 1~2ms 到达。若见全成快照即抛终态，晚到成交帧会在共享状态机被当
+    // 「终态后帧」丢弃 → 订单 filled_price 恒 0、通知价格/平仓盈亏错。故此处把两路
+    // join 收口在 CTP 层：成交未到齐先暂不投影终态/回收，等成交到齐再 project_terminal。
+    if is_terminal && should_defer_terminal_trade(ctx, handle, &cid, agg.filled) {
+        ctx.pending_terminal
+            .mark(&cid, agg.filled.max(0) as i64, now_ms());
+        tracing::debug!(
+            account = %ctx.account, cid = %cid, snapshot_filled = agg.filled,
+            trade_filled = handle.filled_of_cid(&cid),
+            "CTP 终态对齐：全成快照先到，暂不投影终态，等待成交回报补齐 VWAP"
+        );
+        // 延迟期不发任何进度帧：宿主此前已收 NEW/排队帧，订单保持其最后非终态；
+        // 若此处补发「快照成交量」的 PARTIAL，会与随后逐笔成交累计量短暂不一致
+        // （非单调）。唯一终态（带 VWAP）由成交到齐或超时兜底经 project_terminal 投影。
+        note_order_dirty(ctx, &instrument);
+        return;
+    }
+
+    if is_terminal {
+        // 零成交终态（撤/拒），或成交回报已先到齐：经唯一收口投影带 VWAP 的终态并回收。
+        project_terminal(ctx, handle, &cid);
+        return;
+    }
+
+    // 非终态进度：腿未收齐/在途——有成交报 Partial、无成交报排队、其余取聚合状态。
+    let reported_status = if agg.filled > 0 {
         CtpStatus::PartTradedQueueing
     } else if agg.all_terminal {
         CtpStatus::NoTradeQueueing
@@ -1007,18 +1131,119 @@ fn forward_order_snapshot(
     state.filled_quantity = rust_decimal::Decimal::from(agg.filled.max(0));
     let mut event = crate::translate::order_event(&state);
     event.client_order_id = cid.clone();
-    if agg.all_terminal && legs_complete {
-        // 两腿齐终态（或单腿终态）：回收该 cid 的全部会话表项，防无限增长。
-        release_terminal_cid(ctx, handle, &cid);
-        ctx.leg_table.remove_cid(&cid);
-    }
     // 阻塞线程 → async 端口经有界队列投递（满则阻塞背压，不丢单）。
     if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Order(Box::new(event))) {
         tracing::warn!(account = %ctx.account, "事件桥已关闭，订单事件丢弃：{e}");
     }
+    note_order_dirty(ctx, &instrument);
+}
+
+/// 全成委托快照是否需要**暂缓终态**等成交回报：
+/// 有成交量、且是本会话 registry 内活动 cid、但成交回报累计尚未到齐快照量。
+/// 零成交终态（撤/拒）无需成交价立即投影；重连回放/跨会话的孤儿 cid（registry
+/// 无映射）也立即投影、维持历史行为，避免历史单被挂起。
+fn should_defer_terminal_trade(
+    ctx: &EventContext,
+    handle: &Arc<CtpUserHandle>,
+    cid: &str,
+    snapshot_filled: i32,
+) -> bool {
+    if snapshot_filled <= 0 {
+        return false;
+    }
+    if ctx.order_refs.order_refs_of_cid(cid).is_empty() {
+        return false;
+    }
+    handle.filled_of_cid(cid) < snapshot_filled as i64
+}
+
+/// 读 cid 截至当前的成交均价（VWAP = Σ成交额 ÷ Σ成交量）；无成交返回 None（不臆造价）。
+fn vwap_of_cid(handle: &Arc<CtpUserHandle>, cid: &str) -> Option<rust_decimal::Decimal> {
+    let qty = handle.filled_of_cid(cid);
+    if qty <= 0 {
+        return None;
+    }
+    let amount = handle
+        .filled_amount_by_cid
+        .lock()
+        .ok()?
+        .get(cid)
+        .copied()
+        .unwrap_or(0.0);
+    // Decimal::from_f64_retain 为 rust_decimal 固有方法（无需 FromPrimitive 导入）。
+    rust_decimal::Decimal::from_f64_retain(amount / qty as f64)
+        .filter(|p| *p > rust_decimal::Decimal::ZERO)
+}
+
+/// 终态唯一投影收口：从腿表聚合终态、附成交回报累计的真实 VWAP，向上游发**一条**
+/// 终态订单事件，随后回收待对齐标记 / cid↔OrderRef 映射 / 成交累计 / 腿表。
+///
+/// 幂等：投影即清腿表，重复调用（成交到齐与超时兜底竞争）因腿表已空直接返回，
+/// 保证终态只发一次。VWAP 在回收成交累计**之前**读取。
+fn project_terminal(ctx: &EventContext, handle: &Arc<CtpUserHandle>, cid: &str) {
+    use crate::ctp::core::types::OrderStatus as CtpStatus;
+    // 重新聚合（投影前不允许清腿表）；已回收则 no-op。
+    let Some(agg) = ctx.leg_table.aggregate_cid(cid) else {
+        ctx.pending_terminal.remove(cid);
+        return;
+    };
+    let expected_legs = ctx.order_refs.order_refs_of_cid(cid).len().max(1);
+    let legs_complete = ctx.leg_table.leg_count(cid) == expected_legs;
+    // 正常终态（腿齐全终态）取聚合终态 AllTraded/Cancelled…；理论上 project 只在
+    // 终态或超时兜底时调用，腿表保留的是标记时的全成/终态快照，故此处恒为终态。
+    let reported = if agg.all_terminal && legs_complete {
+        agg.status
+    } else if agg.filled > 0 {
+        CtpStatus::PartTradedQueueing
+    } else {
+        CtpStatus::NoTradeQueueing
+    };
+    let vwap = vwap_of_cid(handle, cid);
+    if agg.filled > 0 && vwap.is_none() {
+        // 有成交却拿不到 VWAP：成交回报在宽限内未到齐（异常丢帧/超时兜底）。
+        tracing::warn!(
+            account = %ctx.account, cid = %cid, snapshot_filled = agg.filled,
+            trade_filled = handle.filled_of_cid(cid),
+            "CTP 终态投影缺成交回报 VWAP（可能丢帧），按快照成交量投影、成交价留空"
+        );
+    }
+    let mut state = crate::ctp::mapping::order_state_from_snapshot(&agg.representative);
+    state.status = crate::ctp::mapping::status_from_snapshot(reported);
+    state.filled_quantity = rust_decimal::Decimal::from(agg.filled.max(0));
+    // 快照本身无价；真实成交均价只来自 OnRtnTrade 累计。
+    state.average_price = vwap;
+    let mut event = crate::translate::order_event(&state);
+    event.client_order_id = cid.to_string();
+    if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Order(Box::new(event))) {
+        tracing::warn!(account = %ctx.account, "事件桥已关闭，终态订单事件丢弃：{e}");
+    }
+    // 先发后回收（VWAP 已在上方读取）。
+    ctx.pending_terminal.remove(cid);
+    release_terminal_cid(ctx, handle, cid);
+    ctx.leg_table.remove_cid(cid);
+    let instrument = agg.representative.instrument.clone();
+    note_order_dirty(ctx, &instrument);
+}
+
+/// 成交回报到达时，判定其是否正好补齐某笔「待终态对齐」单：腿表已全成全终态、
+/// 成交累计达到快照成交量。
+fn trade_completes_pending_terminal(ctx: &EventContext, cid: &str, cumulative_qty: i64) -> bool {
+    if !ctx.pending_terminal.contains(cid) {
+        return false;
+    }
+    let Some(agg) = ctx.leg_table.aggregate_cid(cid) else {
+        return false;
+    };
+    let expected_legs = ctx.order_refs.order_refs_of_cid(cid).len().max(1);
+    let legs_complete = ctx.leg_table.leg_count(cid) == expected_legs;
+    agg.all_terminal && legs_complete && cumulative_qty >= agg.filled as i64
+}
+
+/// 订单/成交事件后的持仓去抖脏信号（成交可能改持仓，触发去抖对账）。
+fn note_order_dirty(ctx: &EventContext, instrument: &str) {
     ctx.debouncer.lock().unwrap().note_dirty(
         &crate::api::AccountDirty {
-            instruments: vec![instrument],
+            instruments: vec![instrument.to_string()],
         },
         now_ms(),
     );
@@ -1033,6 +1258,7 @@ fn release_terminal_cid(ctx: &EventContext, handle: &Arc<CtpUserHandle>, cid: &s
         ctx.order_refs.remove(&order_ref);
     }
     let removed_cum = handle.filled_by_cid.lock().unwrap().remove(cid).is_some();
+    handle.filled_amount_by_cid.lock().unwrap().remove(cid);
     tracing::debug!(
         account = %ctx.account, cid, filled_acc_removed = removed_cum,
         "CTP 终态回收：cid↔OrderRef 映射（全部腿）与 cid 成交累计已释放"
@@ -1294,6 +1520,7 @@ mod tests {
             session_epoch: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
             filled_by_cid: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            filled_amount_by_cid: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -1445,6 +1672,354 @@ mod tests {
         assert!(ctx.order_refs.cid_of(&r2).is_none());
         assert!(!ctx.leg_table.contains(&cid));
         assert_eq!(h.filled_of_cid(&cid), 0);
+    }
+
+    /// 构造成交回报（ref/价/量；买开），供「终态快照 × 成交回报对齐」用例。
+    fn trade_snap(
+        order_ref: &str,
+        price: f64,
+        volume: i32,
+    ) -> crate::ctp::core::event::TradeSnapshot {
+        crate::ctp::core::event::TradeSnapshot {
+            order_ref: order_ref.to_string(),
+            trade_id: "t1".into(),
+            instrument: "rb2510".into(),
+            exchange_id: "SHFE".into(),
+            order_sys_id: "s1".into(),
+            direction: Direction::Buy,
+            offset: Some(crate::ctp::core::types::Offset::Open),
+            price,
+            volume,
+            trade_date: "20261019".into(),
+            trade_time: "09:40:00".into(),
+        }
+    }
+
+    /// 排干桥上全部订单事件，收集 (状态, 成交量, 成交价)，按发出顺序。
+    fn drain_all_orders(
+        rx: &mut mpsc::Receiver<BridgeEvent>,
+    ) -> Vec<(
+        String,
+        Option<rust_decimal::Decimal>,
+        Option<rust_decimal::Decimal>,
+    )> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let BridgeEvent::Order(e) = ev {
+                out.push((e.status.clone(), e.filled_quantity, e.filled_price));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn filled_terminal_snapshot_waits_for_trade_and_emits_priced_terminal() {
+        // bug 复现（真机 risk-1.1）：全成 OnRtnOrder 快照先到（快照无成交价），
+        // 带 VWAP 的 OnRtnTrade 晚到。旧逻辑见全成快照即抛无价 FILLED 并回收，
+        // 晚到的成交帧在共享状态机被当「终态后帧」丢弃 → filled_price 恒 0。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("W");
+        let r1 = ctx.order_refs.allocate(&cid);
+
+        // ① 全成委托快照先到（traded=2，无成交价）。
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r1, OrderStatus::AllTraded, 2, 2, "s1")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+
+        // 此刻不得提前抛终态 FILLED；把桥上订单事件排干，最后一条也不能是终态。
+        let mut saw_terminal = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let BridgeEvent::Order(e) = ev {
+                if matches!(e.status.as_str(), "FILLED" | "CANCELED" | "REJECTED") {
+                    saw_terminal = true;
+                }
+            }
+        }
+        assert!(!saw_terminal, "成交回报未到齐不得提前抛终态");
+        assert!(
+            ctx.order_refs.cid_of(&r1).is_some(),
+            "对齐期间不得回收 OrderRef 映射（否则成交帧反查不到长 cid）"
+        );
+        assert!(ctx.leg_table.contains(&cid), "对齐期间不得清腿表");
+
+        // ② 成交回报到（2 手 @3972）。
+        dispatch_event(
+            CtpEvent::Trade(trade_snap(&r1, 3972.0, 2)),
+            &h,
+            &ctx,
+            &mut None,
+        );
+
+        // 终态：恰好一条 FILLED，filled=2、成交价=3972（VWAP，非 0）。
+        let mut finals = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let BridgeEvent::Order(e) = ev {
+                finals.push((e.status.clone(), e.filled_quantity, e.filled_price));
+            }
+        }
+        let filled: Vec<_> = finals.iter().filter(|(s, _, _)| s == "FILLED").collect();
+        assert_eq!(filled.len(), 1, "恰好一条终态 FILLED；事件={finals:?}");
+        assert_eq!(filled[0].1, Some(rust_decimal::Decimal::from(2)));
+        assert_eq!(
+            filled[0].2,
+            Some(rust_decimal::Decimal::from(3972)),
+            "终态必须带真实成交均价，不得为 0"
+        );
+        // 终态后才回收。
+        assert!(ctx.order_refs.cid_of(&r1).is_none());
+        assert!(!ctx.leg_table.contains(&cid));
+    }
+
+    #[test]
+    fn zero_fill_terminal_projects_immediately_without_pending() {
+        // T2：零成交终态（撤单）不需要成交价，立即投影、不入待对齐表。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("Z");
+        let r1 = ctx.order_refs.allocate(&cid);
+
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r1, OrderStatus::Cancelled, 1, 0, "s1")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+
+        let evs = drain_all_orders(&mut rx);
+        assert!(evs.iter().any(|(s, _, _)| s == "CANCELED"));
+        assert!(!ctx.pending_terminal.contains(&cid));
+        assert!(ctx.order_refs.cid_of(&r1).is_none(), "零成交终态照常回收");
+    }
+
+    #[test]
+    fn reject_status_msg_classifier_distinguishes_errors_from_normal() {
+        // 真机/典型拒单原因 → true（warn）。
+        for m in [
+            "49:已撤单报单被拒绝SHFE:价格超出涨停板",
+            "707:已撤单报单被拒绝CZCE:出错: 指定商品不在本交易节交易",
+            "平仓持仓不足",
+            "CTP:资金不足",
+            "废单",
+        ] {
+            assert!(is_venue_reject_status_msg(m), "应判拒单原因: {m}");
+        }
+        // 正常态/空 → false（debug，不刷屏）。
+        for m in ["", "全部成交", "未成交", "已撤单", "报单已提交", "部成"] {
+            assert!(!is_venue_reject_status_msg(m), "正常态不应判拒单: {m}");
+        }
+    }
+
+    #[test]
+    fn cancel_snapshot_with_status_msg_still_projects_canceled() {
+        // 柜台在 StatusMsg 回填撤单原因（GB18030 已解码）：诊断日志不影响终态投影/回收。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("M");
+        let r1 = ctx.order_refs.allocate(&cid);
+        let mut snap = leg_snap(&r1, OrderStatus::Cancelled, 1, 0, "s1");
+        snap.status_msg = "资金不足".to_string();
+
+        dispatch_event(CtpEvent::Order(snap), &h, &ctx, &mut None);
+
+        let evs = drain_all_orders(&mut rx);
+        assert!(evs.iter().any(|(s, _, _)| s == "CANCELED"));
+        assert!(ctx.order_refs.cid_of(&r1).is_none());
+    }
+
+    #[test]
+    fn orphan_cid_terminal_is_not_deferred() {
+        // T5：未在本会话 registry 的 cid（重连回放/跨会话孤儿）来全成快照，
+        // 立即投影、不入待对齐表（历史单不被挂起）。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        // 不 allocate：order_ref 反查未命中 → cid 即该 ref，registry 内无映射。
+        dispatch_event(
+            CtpEvent::Order(leg_snap("orphanref", OrderStatus::AllTraded, 2, 2, "s9")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        let evs = drain_all_orders(&mut rx);
+        assert!(
+            evs.iter().any(|(s, _, _)| s == "FILLED"),
+            "孤儿全成立即投影 {evs:?}"
+        );
+        assert!(!ctx.pending_terminal.contains("orphanref"));
+    }
+
+    #[test]
+    fn terminal_after_trades_already_accumulated_emits_vwap() {
+        // T3：成交回报先于全成快照到齐（累计表已有量/额），快照到即投影带 VWAP 终态。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("A");
+        let r1 = ctx.order_refs.allocate(&cid);
+        h.filled_by_cid.lock().unwrap().insert(cid.clone(), 2);
+        h.filled_amount_by_cid
+            .lock()
+            .unwrap()
+            .insert(cid.clone(), 2.0 * 3972.0);
+
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r1, OrderStatus::AllTraded, 2, 2, "s1")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+
+        let evs = drain_all_orders(&mut rx);
+        let filled: Vec<_> = evs.iter().filter(|(s, _, _)| s == "FILLED").collect();
+        assert_eq!(filled.len(), 1);
+        assert_eq!(filled[0].1, Some(rust_decimal::Decimal::from(2)));
+        assert_eq!(filled[0].2, Some(rust_decimal::Decimal::from(3972)));
+        assert!(!ctx.pending_terminal.contains(&cid));
+    }
+
+    #[test]
+    fn partial_trades_before_terminal_converge_to_vwap_filled() {
+        // T4：终态快照先到（暂存）→ 分批成交：先 PARTIAL(1@3970)，补齐后唯一
+        // FILLED(2, VWAP=3972)。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("P");
+        let r1 = ctx.order_refs.allocate(&cid);
+
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r1, OrderStatus::AllTraded, 2, 2, "s1")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        assert!(ctx.pending_terminal.contains(&cid));
+        assert!(drain_all_orders(&mut rx).is_empty(), "对齐等待期不发帧");
+
+        // 第 1 笔成交 1@3970：未补齐 → 带价 PARTIAL。
+        dispatch_event(
+            CtpEvent::Trade(trade_snap(&r1, 3970.0, 1)),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        let p1 = drain_all_orders(&mut rx);
+        assert_eq!(p1.len(), 1);
+        assert_eq!(p1[0].0, "PARTIAL");
+        assert_eq!(p1[0].1, Some(rust_decimal::Decimal::from(1)));
+        assert_eq!(p1[0].2, Some(rust_decimal::Decimal::from(3970)));
+        assert!(ctx.pending_terminal.contains(&cid), "未补齐仍待对齐");
+
+        // 第 2 笔成交 1@3974：累计 2 补齐 → 唯一 FILLED，VWAP=(3970+3974)/2=3972。
+        dispatch_event(
+            CtpEvent::Trade(trade_snap(&r1, 3974.0, 1)),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        let evs = drain_all_orders(&mut rx);
+        let filled: Vec<_> = evs.iter().filter(|(s, _, _)| s == "FILLED").collect();
+        assert_eq!(filled.len(), 1, "恰好一条 FILLED；{evs:?}");
+        assert_eq!(filled[0].1, Some(rust_decimal::Decimal::from(2)));
+        assert_eq!(filled[0].2, Some(rust_decimal::Decimal::from(3972)));
+        assert!(!ctx.pending_terminal.contains(&cid));
+        assert!(ctx.order_refs.cid_of(&r1).is_none());
+    }
+
+    #[test]
+    fn timeout_flush_projects_terminal_without_price_and_reaps() {
+        // T6：全成快照先到、成交帧异常丢失 → 暂存；超时 take_due 取出后由
+        // project_terminal 兜底投影（无价 FILLED），不悬挂、表项回收。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("T");
+        let r1 = ctx.order_refs.allocate(&cid);
+
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r1, OrderStatus::AllTraded, 2, 2, "s1")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        assert!(ctx.pending_terminal.contains(&cid));
+        assert!(drain_all_orders(&mut rx).is_empty());
+
+        // 宽限到期（grace=0 立即到期）：取出 cid，再走兜底投影。
+        let due = ctx.pending_terminal.take_due(now_ms(), 0);
+        assert_eq!(due, vec![(cid.clone(), 2)]);
+        assert!(!ctx.pending_terminal.contains(&cid), "take_due 已移除");
+        project_terminal(&ctx, &h, &cid);
+
+        let evs = drain_all_orders(&mut rx);
+        let filled: Vec<_> = evs.iter().filter(|(s, _, _)| s == "FILLED").collect();
+        assert_eq!(filled.len(), 1);
+        assert_eq!(filled[0].1, Some(rust_decimal::Decimal::from(2)));
+        assert_eq!(filled[0].2, None, "丢帧无价：filled_price 留空而非 0 臆造");
+        assert!(ctx.order_refs.cid_of(&r1).is_none());
+        assert!(!ctx.leg_table.contains(&cid));
+    }
+
+    #[test]
+    fn two_leg_terminal_waits_for_trades_then_emits_priced_filled() {
+        // T7：一单两腿全成快照先到（合计 filled=2，累计 0）→ 暂存；两腿成交回报
+        // 累计到齐后投影一条 FILLED，filled=两腿和、price=两腿 VWAP。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("L");
+        let r1 = ctx.order_refs.allocate(&cid);
+        let r2 = ctx.order_refs.allocate(&cid);
+
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r1, OrderStatus::AllTraded, 1, 1, "s1")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r2, OrderStatus::AllTraded, 1, 1, "s2")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        let _ = drain_all_orders(&mut rx); // 排干在途 PARTIAL
+        assert!(
+            ctx.pending_terminal.contains(&cid),
+            "两腿齐终态、成交未到→暂存"
+        );
+
+        dispatch_event(
+            CtpEvent::Trade(trade_snap(&r1, 100.0, 1)),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        assert!(drain_all_orders(&mut rx)
+            .iter()
+            .any(|(s, _, _)| s == "PARTIAL"));
+
+        dispatch_event(
+            CtpEvent::Trade(trade_snap(&r2, 102.0, 1)),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        let evs = drain_all_orders(&mut rx);
+        let filled: Vec<_> = evs.iter().filter(|(s, _, _)| s == "FILLED").collect();
+        assert_eq!(filled.len(), 1, "两腿成交到齐后一条 FILLED；{evs:?}");
+        assert_eq!(
+            filled[0].1,
+            Some(rust_decimal::Decimal::from(2)),
+            "filled=两腿和"
+        );
+        assert_eq!(
+            filled[0].2,
+            Some(rust_decimal::Decimal::from(101)),
+            "VWAP=(100+102)/2"
+        );
+        assert!(ctx.order_refs.cid_of(&r1).is_none());
+        assert!(ctx.order_refs.cid_of(&r2).is_none());
+        assert!(!ctx.leg_table.contains(&cid));
     }
 
     #[test]
@@ -1950,6 +2525,7 @@ mod tests {
             instrument_dir: Arc::new(crate::ctp::instrument_dir::InstrumentDir::new()),
             position_dir: Arc::new(crate::ctp::position_dir::PositionDir::new()),
             leg_table: Arc::new(crate::ctp::leg_table::LegTable::new()),
+            pending_terminal: Arc::new(crate::ctp::pending_terminal::PendingTerminalTable::new()),
             tx,
             debouncer: Arc::new(Mutex::new(crate::reconcile::ReconcileDebouncer::new(
                 500, 60_000,

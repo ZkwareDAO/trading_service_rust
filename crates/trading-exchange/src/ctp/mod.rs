@@ -20,6 +20,8 @@ pub mod mailbox;
 pub mod mapping;
 pub mod market;
 pub mod order_ref;
+pub mod pending_terminal;
+pub mod place_error;
 pub mod position_dir;
 pub mod prep;
 pub mod provider;

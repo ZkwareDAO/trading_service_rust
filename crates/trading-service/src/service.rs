@@ -312,9 +312,13 @@ pub(crate) async fn submit_order_core(
             }
         };
 
-        // 期货开仓、且显式带杠杆时：读对账缓存的杠杆，命中且相等则**整次跳过**
-        // （省权重）；缓存缺失/不一致才 set_leverage。平仓单不碰杠杆。
-        if matches!(order.instrument_type, InstrumentType::Futures) && set_leverage_explicit {
+        // 期货开仓、显式带杠杆、且该所支持程序化杠杆时：读对账缓存，命中相等跳过，
+        // 否则 set_leverage。平仓单不碰杠杆；CTP 等不支持杠杆的所整段跳过（其
+        // set_leverage 恒报错，不能据此拒单）。
+        if matches!(order.instrument_type, InstrumentType::Futures)
+            && set_leverage_explicit
+            && adapter.supports_programmatic_leverage()
+        {
             let cached = state
                 .store
                 .leverage_repo()
@@ -340,6 +344,28 @@ pub(crate) async fn submit_order_core(
         }
 
         match adapter.place_order(&req).await {
+            Ok(ack) if !ack.accepted => {
+                // 适配器以“应答成功但明确未受理”表达确定性拒绝（CTP 小数手/缺价/
+                // SHFE 未就绪/柜台同步受理码非 0）：收敛为 REJECTED，不能误标 NEW。
+                let reason = ack
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "交易所拒绝下单".to_string());
+                warn!(%client_order_id, error = %reason, "place_order rejected by exchange (ack)");
+                if let Err(re) = orders.apply_rejection(&client_order_id) {
+                    warn!(%client_order_id, error = %re, "apply_rejection failed");
+                }
+                emit(&state, &callback, |strategy| {
+                    with_cid(
+                        ClientEvent::error(
+                            format!("交易所拒绝下单: {reason}"),
+                            Some(strategy.to_string()),
+                        ),
+                        &client_order_id,
+                    )
+                })
+                .await;
+            }
             Ok(ack) => {
                 let acknowledged = orders
                     .apply_ack(&client_order_id, ack.exchange_order_id, OrderStatus::New)

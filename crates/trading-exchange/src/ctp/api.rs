@@ -149,10 +149,20 @@ impl ExchangeApi for CtpApi {
             order_ref: order_ref.clone(),
             reply: reply_tx,
         }));
+        // 会话线程回传的错误已带类型（CtpPlaceError，见 venue 提交链路），原样
+        // 透传以便 classify_place_error 精确判别；超时/线程退出是应答不确定。
         let code = match tokio::time::timeout(SUBMIT_TIMEOUT, reply_rx).await {
-            Ok(Ok(ret)) => ret.map_err(|e| anyhow::anyhow!("CTP 报单校验失败: {e}"))?,
-            Ok(Err(_)) => anyhow::bail!("CTP 会话线程已退出，下单结果不确定"),
-            Err(_) => anyhow::bail!("CTP 下单等待会话线程超时（5s），结果不确定"),
+            Ok(Ok(ret)) => ret?,
+            Ok(Err(_)) => {
+                return Err(crate::ctp::place_error::CtpPlaceError::indeterminate(
+                    "CTP 会话线程已退出，下单结果不确定",
+                ))
+            }
+            Err(_) => {
+                return Err(crate::ctp::place_error::CtpPlaceError::indeterminate(
+                    "CTP 下单等待会话线程超时（5s），结果不确定",
+                ))
+            }
         };
         // 受理码 0=受理；非 0 为柜台拒绝（同步拒）。
         let accepted = code == 0;
@@ -243,6 +253,30 @@ impl ExchangeApi for CtpApi {
     /// CTP 无程序化杠杆设置语义（保证金率由柜台/交易所规定）。
     async fn set_leverage(&self, _instrument: &str, _leverage: u32) -> anyhow::Result<()> {
         anyhow::bail!("CTP 不支持程序化设置杠杆")
+    }
+
+    /// CTP 保证金率由柜台规定，无程序化杠杆接口；开仓前一律跳过 set_leverage。
+    fn supports_programmatic_leverage(&self) -> bool {
+        false
+    }
+
+    /// CTP 下单错误分类：
+    ///
+    /// * 信箱超时 / 会话线程退出 / 5s 无回执——应答不确定，订单是否已到柜台
+    ///   不可知，落 [`PlaceErrorKind::Indeterminate`]（UNKNOWN，等回报/查单收敛）；
+    /// * 其余均为投递前的**确定性**失败：下单要素非法、SHFE 平仓超今昨总仓、
+    ///   柜台同步受理码非 0——订单确定未受理，落 [`PlaceErrorKind::Rejected`]。
+    fn classify_place_error(&self, err: &anyhow::Error) -> PlaceErrorKind {
+        // 按类型化会话错误判别，不依赖错误文案：会话线程投递前/受理阶段的
+        // 确定性失败包 CtpPlaceError。其余（未类型化错误，如今昨未就绪等可
+        // 重试情形、未知错误）保守判 Indeterminate，避免把可重试误终态拒绝。
+        match err.downcast_ref::<crate::ctp::place_error::CtpPlaceError>() {
+            Some(crate::ctp::place_error::CtpPlaceError::Rejected(_)) => PlaceErrorKind::Rejected,
+            Some(crate::ctp::place_error::CtpPlaceError::Indeterminate(_)) => {
+                PlaceErrorKind::Indeterminate
+            }
+            None => PlaceErrorKind::Indeterminate,
+        }
     }
 
     /// 参考价来自公共行情流（market.rs 写 QuoteTable），不直连柜台。
@@ -508,6 +542,51 @@ mod tests {
             std::sync::Arc::new(trading_core::quote::QuoteTable::new()),
         );
         assert_eq!(api.exchange(), "ctp");
+    }
+
+    #[test]
+    fn ctp_does_not_support_programmatic_leverage() {
+        // CTP 无程序化杠杆接口：开仓规则/手动开仓据此跳过 set_leverage，
+        // 不会因“CTP 不支持程序化设置杠杆”而把开仓单误判拒单。
+        let api = test_api(
+            std::sync::Arc::new(crate::ctp::order_ref::OrderRefRegistry::new()),
+            std::sync::Arc::new(crate::ctp::mailbox::SessionMailbox::new()),
+            std::sync::Arc::new(crate::ctp::instrument_dir::InstrumentDir::new()),
+            std::sync::Arc::new(trading_core::quote::QuoteTable::new()),
+        );
+        assert!(!api.supports_programmatic_leverage());
+    }
+
+    #[test]
+    fn classifies_deterministic_reject_vs_indeterminate() {
+        let api = test_api(
+            std::sync::Arc::new(crate::ctp::order_ref::OrderRefRegistry::new()),
+            std::sync::Arc::new(crate::ctp::mailbox::SessionMailbox::new()),
+            std::sync::Arc::new(crate::ctp::instrument_dir::InstrumentDir::new()),
+            std::sync::Arc::new(trading_core::quote::QuoteTable::new()),
+        );
+        use crate::ctp::place_error::CtpPlaceError;
+        // 类型化：确定性拒绝（超今昨总仓等）→ Rejected。
+        let rejected = CtpPlaceError::rejected("CTP SHFE 平仓被拒：rb2612 平仓量 20 超过今+昨总仓");
+        assert!(matches!(
+            api.classify_place_error(&rejected),
+            crate::api::PlaceErrorKind::Rejected
+        ));
+        // 类型化：信箱超时 / 线程退出 → Indeterminate（落 UNKNOWN，等回报/查单）。
+        let unknown = CtpPlaceError::indeterminate("CTP 下单等待会话线程超时（5s），结果不确定");
+        assert!(matches!(
+            api.classify_place_error(&unknown),
+            crate::api::PlaceErrorKind::Indeterminate
+        ));
+        // 未类型化的“可重试/推迟”错误（如今昨分布未就绪）：保守判 Indeterminate，
+        // 绝不能因文案含“被拒”字样就误终态 REJECTED（对账完成后仍可下单）。
+        let deferrable = anyhow::anyhow!(
+            "CTP SHFE 平仓推迟：rb2612 的今/昨仓分布尚未就绪（重连/首轮持仓对账未完成）"
+        );
+        assert!(matches!(
+            api.classify_place_error(&deferrable),
+            crate::api::PlaceErrorKind::Indeterminate
+        ));
     }
 
     #[test]

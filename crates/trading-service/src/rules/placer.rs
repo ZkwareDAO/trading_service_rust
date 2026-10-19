@@ -72,7 +72,11 @@ impl RuleOrderPlacer for ExchangeRulePlacer {
         // （省权重）；缓存缺失/不一致才 set_leverage。**平仓单（reduce_only）不碰
         // 杠杆**——杠杆对平仓成交无意义，移除原先的无效前置。开仓设置失败按拒单
         // 处理，规则随之 retire。
-        if matches!(order.instrument_type, InstrumentType::Futures) {
+        // 该所不支持程序化杠杆（如 CTP，保证金率由柜台定）：开仓也整段跳过，
+        // 绝不能因 set_leverage 返回“不支持”而把开仓单误判为拒单。
+        if matches!(order.instrument_type, InstrumentType::Futures)
+            && adapter.supports_programmatic_leverage()
+        {
             let cached =
                 self.leverages
                     .get_for(order.account_id, &order.exchange, &order.instrument);
@@ -96,6 +100,18 @@ impl RuleOrderPlacer for ExchangeRulePlacer {
         }
 
         match adapter.place_order(&request).await {
+            Ok(ack) if !ack.accepted => {
+                // 应答成功但适配器明确未受理（确定性拒绝，如 CTP 小数手/超量）：
+                // 收敛 REJECTED（规则随终态退休），不能误标 NEW。
+                let reason = ack
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "交易所拒绝下单".into());
+                tracing::warn!(%cid, error = %reason, "rule order rejected by exchange (ack)");
+                if let Err(re) = self.orders.apply_rejection(cid) {
+                    tracing::warn!(%cid, error = %re, "apply_rejection failed");
+                }
+            }
             Ok(ack) => {
                 let updated = self
                     .orders

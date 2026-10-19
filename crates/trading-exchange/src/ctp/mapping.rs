@@ -27,7 +27,11 @@ pub fn volume_to_i32(quantity: Decimal) -> Option<i32> {
     if quantity <= Decimal::ZERO || quantity.fract() != Decimal::ZERO {
         return None;
     }
-    i32::try_from(quantity.mantissa()).ok()
+    // 此处值已是正整数（fract==0），但 Decimal 内部仍可能带 scale
+    // （如百分比平仓算出的 2.0 = 20×10^-1）。必须按 scale 还原成整数，
+    // 不能取 mantissa()——那会把 2.0 放大成 20 手。TryFrom<Decimal> for i32
+    // 按 scale 还原；超 i32 范围返回 None 拒单。
+    i32::try_from(quantity).ok()
 }
 
 /// 价格：Decimal → f64（CTP 字段口径）；非有限或非正返回 None。
@@ -85,7 +89,14 @@ pub fn order_state_from_snapshot(s: &OrderSnapshot) -> crate::api::OrderState {
 pub fn order_state_from_trade(
     t: &TradeSnapshot,
     cumulative_filled: Decimal,
+    // 截至本笔的成交均价（VWAP = Σ成交额 ÷ Σ成交量）；非正视为无价。
+    average_price: f64,
 ) -> crate::api::OrderState {
+    // 成交回报（OnRtnTrade）是 CTP 唯一带真实成交价的事件——委托回报
+    // （OnRtnOrder）只有委托价。必须把成交均价带给上游，否则订单 filled_price
+    // 为 0，成交通知价格/平仓盈亏与 ROI 全部算错。
+    let average_price =
+        rust_decimal::Decimal::from_f64_retain(average_price).filter(|p| *p > Decimal::ZERO);
     crate::api::OrderState {
         client_order_id: Some(t.order_ref.clone()),
         exchange_order_id: if t.order_sys_id.trim().is_empty() {
@@ -96,7 +107,7 @@ pub fn order_state_from_trade(
         instrument: t.instrument.clone(),
         status: OrderStatus::Partial,
         filled_quantity: cumulative_filled,
-        average_price: None,
+        average_price,
         position_side: OrderPositionSide::Both,
         venue_extra: None,
     }
@@ -223,6 +234,16 @@ mod tests {
         assert_eq!(volume_to_i32(Decimal::new(15, 1)), None); // 1.5 → 拒
         assert_eq!(volume_to_i32(Decimal::ZERO), None);
         assert_eq!(volume_to_i32(-Decimal::from(1)), None);
+    }
+
+    #[test]
+    fn volume_integer_value_with_decimal_scale_is_restored() {
+        // 百分比平仓量会带小数位（50%×4=2.0）：值为整数时必须按 scale 还原，
+        // 绝不能取 mantissa（2.0 的 mantissa=20）把 2 手放大成 20 手。
+        assert_eq!(volume_to_i32(Decimal::new(20, 1)), Some(2)); // 2.0
+        assert_eq!(volume_to_i32(Decimal::new(10, 1)), Some(1)); // 1.0
+        assert_eq!(volume_to_i32(Decimal::new(200, 2)), Some(2)); // 2.00
+        assert_eq!(volume_to_i32(Decimal::new(120, 1)), Some(12)); // 12.0
     }
 
     #[test]
@@ -520,8 +541,10 @@ mod tests {
             trade_date: "20261012".into(),
             trade_time: "09:30:01".into(),
         };
-        let st = order_state_from_trade(&t, Decimal::from(2));
+        let st = order_state_from_trade(&t, Decimal::from(2), 3205.0);
         assert_eq!(st.filled_quantity, Decimal::from(2));
+        // 成交回报必须把成交价带给上游（通知价格/盈亏 ROI 依赖它）。
+        assert_eq!(st.average_price, Some(rust_decimal::Decimal::from(3205)));
         assert_eq!(st.exchange_order_id.as_deref(), Some("9001"));
         // 成交回报同样回传 OrderRef（客户端自填），cid 关联与委托回报同口径。
         assert_eq!(st.client_order_id.as_deref(), Some("1"));

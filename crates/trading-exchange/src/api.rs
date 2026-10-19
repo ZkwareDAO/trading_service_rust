@@ -348,6 +348,15 @@ pub trait ExchangeApi: Send + Sync {
     /// 设置杠杆；Deribit（仅期权）应返回 `不支持` 错误而非成功。
     async fn set_leverage(&self, instrument: &str, leverage: u32) -> anyhow::Result<()>;
 
+    /// 是否支持程序化设置杠杆。
+    ///
+    /// 绝大多数期货所（Binance 等）支持，默认 `true`；CTP 这类保证金率由柜台
+    /// 规定、无程序化杠杆接口的所覆盖为 `false`——调用方据此在开仓前**跳过**
+    /// set_leverage 直接下单，而不是把"不支持"当成致命拒单。
+    fn supports_programmatic_leverage(&self) -> bool {
+        true
+    }
+
     /// 取参考价（口径见各所：last / mid / mark）。
     async fn get_reference_price(&self, instrument: &str) -> anyhow::Result<ReferencePrice>;
 

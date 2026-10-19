@@ -50,32 +50,29 @@ fn to_repo_input(ev: &OrderEvent) -> OrderEventInput {
 /// `source` 仅用于日志区分来源（如 "binance" / "xili"）。
 pub async fn apply_and_route(state: &AppState, ev: &OrderEvent, source: &str) {
     let orders = state.store.order_repo().expect("order repo after recover");
-    let input = to_repo_input(ev);
+    let mut input = to_repo_input(ev);
     // cid miss 时的回查 fallback（各所通用）：柜台回报可能只带交易所侧标识
     // （CTP 重启后内存映射丢失，事件 cid=OrderRef；订单行受理时已落
-    // exchange_order_id）。命中唯一行则改写 cid 重试一次；其余维持丢弃语义。
-    let input = match orders.apply_event(&input) {
-        Ok(_) => input,
-        Err(_) => {
-            let fallback = orders
-                .resolve_cid_by_exchange_id(&ev.client_order_id, ev.exchange_order_id.as_deref());
-            match fallback {
-                Some(cid) => {
-                    tracing::info!(
-                        source,
-                        event_cid = %ev.client_order_id,
-                        resolved_cid = %cid,
-                        "order event cid miss, resolved by exchange_order_id"
-                    );
-                    OrderEventInput {
-                        client_order_id: cid,
-                        ..input
-                    }
-                }
-                None => input,
-            }
+    // exchange_order_id）。命中唯一行则改写 cid；其余维持丢弃语义。
+    //
+    // 关键：这里必须**只读探测**（peek_by_cid），不能用会改状态的 apply_event
+    // 当“探测”——否则若事件本身就是终态（CTP 即时成交同毫秒推 NEW→满量
+    // PARTIAL→FILLED，cid 又恰好命中），第一次“探测性 apply”就把订单推进终态，
+    // 第二次 apply 必报 already terminal 走 Err，导致挂在 Ok 分支的规则退休 /
+    // 成交通知 / 策略回推全部被吞。改为先 peek 决定目标 cid，全程只 apply 一次。
+    if orders.peek_by_cid(&ev.client_order_id).is_none() {
+        if let Some(cid) =
+            orders.resolve_cid_by_exchange_id(&ev.client_order_id, ev.exchange_order_id.as_deref())
+        {
+            tracing::info!(
+                source,
+                event_cid = %ev.client_order_id,
+                resolved_cid = %cid,
+                "order event cid miss, resolved by exchange_order_id"
+            );
+            input.client_order_id = cid;
         }
-    };
+    }
     match orders.apply_event(&input) {
         Ok(updated) => {
             tracing::info!(
@@ -125,5 +122,119 @@ impl trading_exchange::port::OrderEventSink for crate::state::AppState {
                 .announce_deribit_position(ev, account, account_id);
         }
         apply_and_route(self, ev, source).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+    use trading_core::protocol::OrderEvent;
+    use trading_models::{
+        Order, OrderType, Side, WatchConditionKind, WatchRule, WatchRuleAction, WatchRuleStatus,
+    };
+
+    /// 造一条规则平仓单 + 关联的 in_use 风控规则（active→claim→in_use）。
+    /// 返回 (state, 本地 cid, 规则 id)。
+    async fn seed_inuse_rule_order(seed_exchange_order_id: bool) -> (AppState, String, u64) {
+        let app = crate::api::test_support::app_with_accounts("").await;
+        let state = app.state;
+        let rules = state.store.rule_repo().unwrap();
+        let orders = state.store.order_repo().unwrap();
+
+        let cid = "0xapply_route_terminal_0000000000000001".to_string();
+        let rule = rules
+            .insert(WatchRule::new_risk(
+                1,
+                1,
+                WatchConditionKind::Price,
+                Some("rb2612".into()),
+                ">=",
+                Decimal::from(1),
+                WatchRuleAction::UseSelf,
+                OrderType::Market,
+                Decimal::ZERO,
+                Decimal::ONE,
+            ))
+            .unwrap();
+        // 规则已触发：active → in_use（模拟已 claim、等待平仓终态退休）。
+        assert!(rules.claim_self(rule.id).unwrap());
+
+        let mut order = Order::new(1, cid.clone(), "ctp", "rb2612", Side::Sell);
+        order.rule_id = rule.id;
+        order.order_type = OrderType::Limit;
+        order.order_quantity = Decimal::from(2);
+        if seed_exchange_order_id {
+            order.exchange_order_id = Some("179223760958".to_string());
+        }
+        orders.insert(order).unwrap();
+        (state, cid, rule.id)
+    }
+
+    fn ev(cid: &str, status: &str, exchange_order_id: Option<&str>) -> OrderEvent {
+        OrderEvent {
+            client_order_id: cid.to_string(),
+            status: status.to_string(),
+            exchange_order_id: exchange_order_id.map(str::to_string),
+            filled_price: None,
+            filled_quantity: Some(Decimal::from(2)),
+            exchange_update_time: None,
+            message: None,
+            instrument: "rb2612".to_string(),
+            direction: Some("sell".to_string()),
+            reduce_only: true,
+            amount: None,
+            limit_price: None,
+        }
+    }
+
+    /// CTP 路径：回报 cid 即本地长 cid（venue 已反查），NEW/FILLED 都直接命中。
+    /// 若 apply_and_route 的双 apply 在「第一次就置终态」时吞掉退休副作用，
+    /// 规则会卡在 in_use——本用例据此判定。
+    #[tokio::test]
+    async fn terminal_event_with_matching_cid_retires_inuse_rule() {
+        let (state, cid, rule_id) = seed_inuse_rule_order(false).await;
+
+        // 受理：NEW（两次 apply 均非终态，幂等）。
+        apply_and_route(&state, &ev(&cid, "NEW", None), "ctp").await;
+        // 满量成交：单帧 FILLED。
+        apply_and_route(&state, &ev(&cid, "FILLED", Some("179223760958")), "ctp").await;
+
+        let rule = state
+            .store
+            .rule_repo()
+            .unwrap()
+            .get_including_deleted(rule_id)
+            .expect("rule row exists");
+        assert_eq!(
+            rule.status,
+            WatchRuleStatus::Retired,
+            "单帧 FILLED（cid 直接命中）必须把 in_use 规则退休；卡在 {:?} 即双 apply 吞了退休副作用",
+            rule.status
+        );
+        // FILLED 单已被状态机软删（tombstone），须用 peek 读取终态。
+        let order = state.store.order_repo().unwrap().peek_by_cid(&cid).unwrap();
+        assert_eq!(order.status, trading_models::OrderStatus::Filled);
+    }
+
+    /// 健康对照：回报 cid 是交易所单号（本地未命中），靠 exchange_order_id fallback
+    /// 解析后再置终态——第一次 apply 探测失败（不改状态），第二次唯一生效，规则应退休。
+    #[tokio::test]
+    async fn terminal_event_resolved_by_exchange_id_retires_rule() {
+        let (state, _cid, rule_id) = seed_inuse_rule_order(true).await;
+        apply_and_route(
+            &state,
+            &ev("179223760958", "FILLED", Some("179223760958")),
+            "ctp",
+        )
+        .await;
+
+        let rule = state
+            .store
+            .rule_repo()
+            .unwrap()
+            .get_including_deleted(rule_id)
+            .expect("rule row exists");
+        assert_eq!(rule.status, WatchRuleStatus::Retired);
     }
 }

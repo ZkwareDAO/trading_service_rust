@@ -197,6 +197,7 @@ impl CtpVenueConnector {
             session_epoch: Arc::new(AtomicU64::new(0)),
             shutdown,
             filled_by_cid: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            filled_amount_by_cid: Arc::new(Mutex::new(std::collections::HashMap::new())),
             mailbox: Arc::clone(&session.mailbox),
         });
         // 事件桥：有界队列 + 常驻消费任务（Sender 随会话线程退出而 drop）。
@@ -230,6 +231,7 @@ impl CtpVenueConnector {
             instrument_dir: Arc::clone(&self.instrument_dir),
             position_dir: Arc::clone(&session.position_dir),
             leg_table: Arc::new(crate::ctp::leg_table::LegTable::new()),
+            pending_terminal: Arc::new(crate::ctp::pending_terminal::PendingTerminalTable::new()),
             tx,
             debouncer: Arc::new(Mutex::new(crate::reconcile::ReconcileDebouncer::new(
                 account_stream_millis(self.debounce),
