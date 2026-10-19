@@ -254,6 +254,7 @@ mod tests {
             Decimal::new(12, 2),
             WatchRuleAction::UseSelf,
             OrderType::Market,
+            Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
             Decimal::ZERO,
             Decimal::ONE,
         ))
@@ -272,6 +273,7 @@ mod tests {
                 Decimal::from(90_000),
                 WatchRuleAction::ActivateRule { rule_id: target },
                 OrderType::Limit,
+                Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
                 Decimal::ZERO,
                 Decimal::ONE,
             ))
@@ -335,6 +337,7 @@ mod tests {
             Decimal::from(90_000),
             WatchRuleAction::UseSelf,
             OrderType::Market,
+            Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
             Decimal::ZERO,
             Decimal::ONE,
         );

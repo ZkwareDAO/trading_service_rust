@@ -506,6 +506,11 @@ pub(crate) async fn submit_cancel_core(
                 Ok(ack) => {
                     let updated = orders.apply_canceled(&client_order_id).unwrap_or(order);
                     info!(%client_order_id, exchange_order_id = ?ack.exchange_order_id, "cancel accepted");
+                    // 手动撤单成功即终态：若该单由规则产生，把关联规则 in_use → retired
+                    // （语义退休，不复位 active）。与 WS 终态回报共用同一收口
+                    // （event.rs），retire 幂等；随后的柜台撤单确认重复退休仅 warn。
+                    // rule_id=0 的策略单内部直接返回，无副作用。
+                    crate::event::retire_rule_for_terminal_order(&state, &updated);
                     emit(&state, &callback, |_| {
                         ClientEvent::order_snapshot("ack", OrderStatus::Canceled.wire(), &updated)
                     })
@@ -1535,5 +1540,205 @@ mod tests {
         // Assert：正常空列表，而非错误帧。
         assert_eq!(v["type"], "positions");
         assert_eq!(v["positions"].as_array().unwrap().len(), 0);
+    }
+
+    // ---- 手动撤单成功 → 关联规则语义退休（真机 rule7 卡 in_use 回归）----
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use trading_exchange::api::{
+        ExchangeApi, OrderAck, OrderLookup, OrderRef, PlaceOrderRequest, PositionInfo,
+        ReferencePrice,
+    };
+    use trading_exchange::provider::VenueProvider;
+    use trading_exchange::registry::ExchangeRegistry;
+    use trading_models::{WatchConditionKind, WatchRule, WatchRuleAction, WatchRuleStatus};
+
+    use super::{submit_cancel_core, CancelOrderInput};
+
+    /// 撤单恒受理的假适配器：不发出任何网络请求，`cancel_order` 直接回 accepted。
+    struct CancelOkApi;
+    #[async_trait::async_trait]
+    impl ExchangeApi for CancelOkApi {
+        fn exchange(&self) -> &str {
+            "cancel-ok"
+        }
+        async fn place_order(&self, _: &PlaceOrderRequest) -> anyhow::Result<OrderAck> {
+            anyhow::bail!("本夹具只覆盖撤单路径")
+        }
+        async fn cancel_order(
+            &self,
+            _instrument: &str,
+            order: &OrderRef,
+        ) -> anyhow::Result<OrderAck> {
+            Ok(OrderAck {
+                accepted: true,
+                client_order_id: order.client_order_id.clone(),
+                exchange_order_id: Some("eid-cancel-ok".to_string()),
+                status: OrderStatus::Canceled,
+                message: None,
+                placed_type: None,
+                placed_price: None,
+                placed_quantity: None,
+            })
+        }
+        async fn query_order(&self, _: &str, _: &OrderRef) -> OrderLookup {
+            OrderLookup::Unavailable
+        }
+        async fn get_positions(&self) -> anyhow::Result<Vec<PositionInfo>> {
+            Ok(vec![])
+        }
+        async fn set_leverage(&self, _: &str, _: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_reference_price(&self, _: &str) -> anyhow::Result<ReferencePrice> {
+            anyhow::bail!("本夹具只覆盖撤单路径")
+        }
+    }
+
+    /// 只产出 [`CancelOkApi`] 的假所 provider（精确名匹配，唯一所名 `cancel-ok`）。
+    #[derive(Clone)]
+    struct CancelOkProvider;
+    impl VenueProvider for CancelOkProvider {
+        fn matches(&self, exchange: &str) -> bool {
+            exchange == "cancel-ok"
+        }
+        fn build_api(
+            &self,
+            _exchange: &str,
+            _instrument_type: Option<&str>,
+            _account: &str,
+        ) -> anyhow::Result<Arc<dyn ExchangeApi>> {
+            Ok(Arc::new(CancelOkApi))
+        }
+    }
+
+    /// 起空账户应用，把交易所注册表替换为仅含「撤单恒受理」假所的注册表。
+    async fn app_with_cancel_ok() -> crate::state::AppState {
+        let app = crate::api::test_support::app_with_accounts("").await;
+        crate::state::AppState {
+            exchanges: Arc::new(ExchangeRegistry::from_providers(vec![Arc::new(
+                CancelOkProvider,
+            )])),
+            ..app.state
+        }
+    }
+
+    /// 撤单内核入参（账户/所固定为假所）。
+    fn cancel_input(cid: &str) -> CancelOrderInput {
+        CancelOrderInput {
+            client_order_id: cid.to_string(),
+            account: Some("default".to_string()),
+            exchange: Some("cancel-ok".to_string()),
+        }
+    }
+
+    /// 撤单 ack 在 spawn 的后台任务里落地，轮询至多 1s 等待谓词命中，超时即失败。
+    async fn wait_until<T>(mut ready: impl FnMut() -> Option<T>) -> T {
+        for _ in 0..50 {
+            if let Some(value) = ready() {
+                return value;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("等待撤单后台任务收口超时（>1s）");
+    }
+
+    /// 种一条非终态订单；with_rule=true 时同时种已 claim（in_use）的关联风控规则，
+    /// 订单 rule_id 指向该规则；否则 rule_id=0（策略单）。返回 (cid, rule_id)。
+    fn seed_cancel_order(state: &crate::state::AppState, with_rule: bool) -> (String, u64) {
+        let cid = format!("0x{}", "c".repeat(32));
+        let rule_id = if with_rule {
+            let rules = state.store.rule_repo().unwrap();
+            let rule = rules
+                .insert(WatchRule::new_risk(
+                    1,
+                    1,
+                    WatchConditionKind::Price,
+                    Some("rb2612".to_string()),
+                    ">=",
+                    Decimal::ONE,
+                    WatchRuleAction::UseSelf,
+                    OrderType::Limit,
+                    Decimal::from(4050),
+                    Decimal::ZERO,
+                    Decimal::ONE,
+                ))
+                .unwrap();
+            // 规则已命中：active → in_use（等待平仓单终态退休）。
+            assert!(rules.claim_self(rule.id).unwrap());
+            rule.id
+        } else {
+            0
+        };
+
+        let mut order = Order::new(1, cid.clone(), "cancel-ok", "rb2612", Side::Sell);
+        order.rule_id = rule_id;
+        state.store.order_repo().unwrap().insert(order).unwrap();
+        (cid, rule_id)
+    }
+
+    /// 手动撤 in_use 规则单成功：规则必须语义退休（retired + deleted），不复位 active。
+    #[tokio::test]
+    async fn cancel_accepted_retires_associated_inuse_rule() {
+        // Arrange：in_use 风控规则 + 其非终态订单。
+        let state = app_with_cancel_ok().await;
+        let (cid, rule_id) = seed_cancel_order(&state, true);
+        assert_ne!(rule_id, 0);
+
+        // Act：手动撤单内核受理（后台任务执行适配器撤单 + 本地收口）。
+        let returned = submit_cancel_core(state.clone(), cancel_input(&cid), Callback::Ignore)
+            .await
+            .unwrap();
+        // 同步返回的是撤单前快照。
+        assert_eq!(returned.status, OrderStatus::Placing);
+
+        // Assert：规则语义退休（不是复位 active）；订单进入 Canceled 终态。
+        let rules = state.store.rule_repo().unwrap();
+        let rule = wait_until(|| rules.get_including_deleted(rule_id).filter(|r| r.deleted)).await;
+        assert_eq!(
+            rule.status,
+            WatchRuleStatus::Retired,
+            "手动撤单成功必须把 in_use 关联规则退休（真机 rule7 卡 in_use 回归）"
+        );
+        let orders = state.store.order_repo().unwrap();
+        let order = wait_until(|| {
+            orders
+                .peek_by_cid(&cid)
+                .filter(|o| o.status == OrderStatus::Canceled)
+        })
+        .await;
+        assert_eq!(order.status, OrderStatus::Canceled);
+    }
+
+    /// 策略单（rule_id=0）撤单成功：无规则可退、幂等无副作用，订单照常 Canceled。
+    #[tokio::test]
+    async fn cancel_accepted_strategy_order_has_no_rule_to_retire() {
+        // Arrange：无关联规则的策略单。
+        let state = app_with_cancel_ok().await;
+        let (cid, rule_id) = seed_cancel_order(&state, false);
+        assert_eq!(rule_id, 0);
+
+        // Act：撤单受理不报错。
+        submit_cancel_core(state.clone(), cancel_input(&cid), Callback::Ignore)
+            .await
+            .unwrap();
+
+        // Assert：订单终态 Canceled；规则表始终为空（没有任何退休动作）。
+        let orders = state.store.order_repo().unwrap();
+        let order = wait_until(|| {
+            orders
+                .peek_by_cid(&cid)
+                .filter(|o| o.status == OrderStatus::Canceled)
+        })
+        .await;
+        assert_eq!(order.status, OrderStatus::Canceled);
+        assert!(state
+            .store
+            .rule_repo()
+            .unwrap()
+            .list_non_retired()
+            .is_empty());
     }
 }

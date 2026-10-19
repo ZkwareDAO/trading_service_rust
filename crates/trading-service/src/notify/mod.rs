@@ -677,6 +677,7 @@ mod tests {
             dec("0.002"),
             WatchRuleAction::UseSelf,
             OrderType::Market,
+            Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
             Decimal::ZERO,
             dec("1"),
         );

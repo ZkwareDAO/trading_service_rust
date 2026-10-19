@@ -303,6 +303,9 @@ impl WatchRule {
     /// * 按绝对数量：`quantity` 给数量、`quantity_pct=0`。
     ///
     /// `order_type` 为平仓单类型；动作为激活其他规则时数量/类型不被消费，传默认即可。
+    ///
+    /// `price` 为平仓限价：限价单（非 [`OrderType::Market`]）必须给正数，命中下单
+    /// 直接作为委托价；市价单调 [`Decimal::ZERO`]（正价校验由调用方负责）。
     #[allow(clippy::too_many_arguments)]
     pub fn new_risk(
         account_id: u64,
@@ -313,6 +316,7 @@ impl WatchRule {
         value: Decimal,
         action: WatchRuleAction,
         order_type: OrderType,
+        price: Decimal,
         quantity: Decimal,
         quantity_pct: Decimal,
     ) -> Self {
@@ -333,7 +337,8 @@ impl WatchRule {
             instrument_type: InstrumentType::Futures,
             // risk 平仓方向由持仓反向推出，不消费 side；给默认值即可。
             side: Side::Buy,
-            price: Decimal::ZERO,
+            // 平仓限价：market 由调用方传 ZERO；limit 为校验后的正数。
+            price,
             quantity,
             order_type,
             quantity_pct,
@@ -467,6 +472,7 @@ mod tests {
             Decimal::new(1, 2),
             WatchRuleAction::UseSelf,
             OrderType::Market,
+            Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
             Decimal::ZERO,
             Decimal::ONE,
         );
@@ -494,6 +500,7 @@ mod tests {
                 Decimal::ZERO,
                 WatchRuleAction::UseSelf,
                 OrderType::Market,
+                Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
                 Decimal::ZERO,
                 Decimal::ONE,
             );
@@ -512,6 +519,7 @@ mod tests {
             Decimal::new(1, 2),
             WatchRuleAction::UseSelf,
             OrderType::Market,
+            Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
             Decimal::ZERO,
             Decimal::ONE,
         );
@@ -524,6 +532,7 @@ mod tests {
             Decimal::new(1, 2),
             WatchRuleAction::UseSelf,
             OrderType::Market,
+            Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
             Decimal::ZERO,
             Decimal::ONE,
         );
@@ -544,6 +553,7 @@ mod tests {
                 value,
                 WatchRuleAction::UseSelf,
                 OrderType::Market,
+                Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
                 Decimal::ZERO,
                 Decimal::ONE,
             )
@@ -595,6 +605,7 @@ mod tests {
                 Decimal::ZERO,
                 WatchRuleAction::UseSelf,
                 OrderType::Market,
+                Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
                 Decimal::ZERO,
                 Decimal::ONE,
             )
@@ -733,6 +744,7 @@ mod tests {
             Decimal::new(12, 2), // 0.12 = +12%
             WatchRuleAction::UseSelf,
             OrderType::Market,
+            Decimal::ZERO,      // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
             Decimal::ZERO,      // 比例平仓：绝对数量为 0
             Decimal::new(5, 1), // 半仓 0.5
         );
@@ -761,6 +773,7 @@ mod tests {
             Decimal::new(90000, 0),
             WatchRuleAction::UseSelf,
             OrderType::Limit,
+            Decimal::ZERO,      // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
             Decimal::new(3, 0), // 平仓 3（币/张）
             Decimal::ZERO,
         );
@@ -810,6 +823,7 @@ mod tests {
             Decimal::new(90000, 0),
             WatchRuleAction::ActivateRule { rule_id: 55 },
             OrderType::Limit,
+            Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
             Decimal::ZERO,
             Decimal::new(5, 1),
         );

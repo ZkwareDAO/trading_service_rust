@@ -153,6 +153,7 @@ mod tests {
                 Decimal::from(1),
                 WatchRuleAction::UseSelf,
                 OrderType::Market,
+                Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
                 Decimal::ZERO,
                 Decimal::ONE,
             ))

@@ -95,6 +95,7 @@ impl Harness {
             Decimal::new(12, 2),
             WatchRuleAction::UseSelf,
             OrderType::Market,
+            Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
             Decimal::ZERO, // 比例平仓：绝对数量为 0
             Decimal::ONE,  // quantity_pct=1 全平
         )

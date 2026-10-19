@@ -96,6 +96,7 @@ mod tests {
             Decimal::from(80_000),
             WatchRuleAction::ActivateRule { rule_id: 99 },
             OrderType::Market,
+            Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
             Decimal::ZERO,
             Decimal::ONE,
         );

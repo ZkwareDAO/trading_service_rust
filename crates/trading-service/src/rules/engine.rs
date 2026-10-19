@@ -728,6 +728,7 @@ mod tests {
                 dec(value),
                 WatchRuleAction::UseSelf,
                 OrderType::Market,
+                Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
                 Decimal::ZERO,
                 Decimal::ONE,
             ))
@@ -800,6 +801,7 @@ mod tests {
                     dec("90000"),
                     WatchRuleAction::UseSelf,
                     OrderType::Market,
+                    Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
                     Decimal::ZERO,
                     Decimal::ONE,
                 );
@@ -819,6 +821,7 @@ mod tests {
                 dec("0.12"),
                 WatchRuleAction::ActivateRule { rule_id: target.id },
                 OrderType::Market,
+                Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
                 Decimal::ZERO,
                 Decimal::ONE,
             ))
@@ -969,6 +972,7 @@ mod tests {
             dec("0.05"),
             WatchRuleAction::UseSelf,
             OrderType::Market,
+            Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
             Decimal::ZERO,
             Decimal::ONE,
         );
@@ -997,6 +1001,7 @@ mod tests {
             dec("0.05"),
             WatchRuleAction::UseSelf,
             OrderType::Market,
+            Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
             Decimal::ZERO,
             Decimal::ONE,
         );
@@ -1025,6 +1030,7 @@ mod tests {
                 dec("0.1"),
                 WatchRuleAction::UseSelf,
                 OrderType::Market,
+                Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
                 Decimal::ZERO,
                 Decimal::ONE,
             ))
@@ -1059,6 +1065,7 @@ mod tests {
                 dec(value),
                 WatchRuleAction::UseSelf,
                 OrderType::Market,
+                Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
                 if quantity.is_empty() {
                     Decimal::ZERO
                 } else {
@@ -1218,6 +1225,7 @@ mod tests {
                     dec("0.05"),
                     WatchRuleAction::UseSelf,
                     OrderType::Market,
+                    Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
                     Decimal::ZERO,
                     Decimal::ONE,
                 );
@@ -1274,6 +1282,7 @@ mod tests {
                 dec(value),
                 action,
                 OrderType::Market,
+                Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
                 Decimal::ZERO,
                 Decimal::ONE,
             ))
@@ -1299,6 +1308,7 @@ mod tests {
                 Decimal::ZERO,
                 WatchRuleAction::UseSelf,
                 OrderType::Market,
+                Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
                 Decimal::ZERO,
                 Decimal::ONE,
             ))
@@ -1351,6 +1361,7 @@ mod tests {
                 Decimal::ZERO,
                 WatchRuleAction::UseSelf,
                 OrderType::Market,
+                Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
                 Decimal::ZERO,
                 Decimal::ONE,
             ))

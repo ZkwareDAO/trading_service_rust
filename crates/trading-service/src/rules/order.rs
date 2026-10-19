@@ -171,6 +171,7 @@ mod tests {
             dec("0.12"),
             WatchRuleAction::UseSelf,
             order_type,
+            Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
             dec(quantity),
             dec(pct),
         );

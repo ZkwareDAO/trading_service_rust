@@ -182,6 +182,19 @@ fn build_risk(
         (Decimal::ZERO, pct)
     };
 
+    // 限价平仓单必须给正价（与 new 开仓限价比齐）：否则命中下单委托价恒 0，
+    // 必被柜台拒绝（真机 CTP 2115 LIMIT px=0 REJECTED）。market 不消费价格。
+    if !matches!(input.order_type, OrderType::Market) && input.price <= Decimal::ZERO {
+        return Err(CreateRuleError::Invalid(
+            "limit 平仓规则 price 必须为正数".to_string(),
+        ));
+    }
+    let price = if matches!(input.order_type, OrderType::Market) {
+        Decimal::ZERO
+    } else {
+        input.price
+    };
+
     Ok(WatchRule::new_risk(
         input.account_id,
         position.id,
@@ -191,6 +204,7 @@ fn build_risk(
         input.value,
         input.action,
         input.order_type,
+        price,
         quantity,
         quantity_pct,
     ))
@@ -557,6 +571,49 @@ mod tests {
             build_rule(&input, &lookup).unwrap_err(),
             CreateRuleError::Invalid(_)
         ));
+    }
+
+    #[test]
+    fn risk_limit_rule_carries_positive_price() {
+        // risk 限价平仓规则：正价必须透传进规则（真机缺陷：price 恒 0，
+        // 命中下单 LIMIT px=0 被柜台拒单 2115）。
+        let lookup = FakeLookup::default();
+        lookup.with_position("BTCUSDT", Side::Buy, 42);
+        let mut input = base_input(WatchRuleType::Risk);
+        input.order_type = OrderType::Limit;
+        input.price = dec("4050");
+        let rule = build_rule(&input, &lookup).unwrap();
+        assert_eq!(rule.order_type, OrderType::Limit);
+        assert_eq!(rule.price, dec("4050"));
+    }
+
+    #[test]
+    fn risk_limit_rule_without_positive_price_is_invalid() {
+        // risk 限价却不给正价 → 创建期 Invalid（与 new 限价比齐，消息区分平仓规则）。
+        let lookup = FakeLookup::default();
+        lookup.with_position("BTCUSDT", Side::Buy, 42);
+        let mut input = base_input(WatchRuleType::Risk);
+        input.order_type = OrderType::Limit;
+        input.price = Decimal::ZERO;
+        let err = build_rule(&input, &lookup).unwrap_err();
+        match err {
+            CreateRuleError::Invalid(msg) => assert!(
+                msg.contains("平仓") && msg.contains("price"),
+                "错误消息应区分 risk 平仓限价，实际：{msg}"
+            ),
+            other => panic!("期望 Invalid，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn risk_market_rule_keeps_zero_price() {
+        // risk 市价平仓：price 保持 0（现状不变）。
+        let lookup = FakeLookup::default();
+        lookup.with_position("BTCUSDT", Side::Buy, 42);
+        let input = base_input(WatchRuleType::Risk);
+        let rule = build_rule(&input, &lookup).unwrap();
+        assert_eq!(rule.order_type, OrderType::Market);
+        assert_eq!(rule.price, Decimal::ZERO);
     }
 
     #[test]
