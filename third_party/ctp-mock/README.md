@@ -121,6 +121,7 @@ v6.7.13 `error.xml`：
 | `CTP_MOCK_CTRL_MD` | 行情控制端口（如 43012） | 不启动 |
 | `CTP_MOCK_AUTO_TICK` | 非空/非 0：订阅后自动游走行情 | 关 |
 | `CTP_MOCK_AUTO_INTERVAL_MS` | 自动行情间隔 | 500 |
+| `CTP_MOCK_PRESET` | 非空/非 0：构造时预置主测合约规格（rb2612/cu2611/au2612/ag2701/ru2612/i2701 真实交易所+乘数）并播 rb2612 今2/昨3 多仓，解决宿主冷启动“合约预热先于下单、行情兴趣集为空”两个时序缺口 | 关 |
 
 协议：一行一个 JSON 请求，一行一个 JSON 应答 `{"ok":true,...}` /
 `{"ok":false,"error":...}`。用 `ctp-mock-ctl td|md <cmd>` 驱动，或直接发 JSON。

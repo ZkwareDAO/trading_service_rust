@@ -76,6 +76,9 @@ impl MockTdApi {
             // 端口已占用（多实例/测试并发）时静默复用：首个实例已在服务。
             let _ = ctp_mock_core::control::serve_td(port);
         }
+        // 可选启动预置（默认关闭）：冷启动即注册主测合约规格并播今昨底仓，
+        // 使宿主首次合约预热拿到非空合约表、且有活跃仓驱动行情兴趣集。
+        maybe_apply_startup_preset(&front);
         let api = Box::new(Self {
             vtable: vtable(),
             released: AtomicBool::new(false),
@@ -88,6 +91,52 @@ impl MockTdApi {
 /// 读取形如端口号的环境变量（缺省/非法返回 None）。
 fn env_port(name: &str) -> Option<u16> {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
+}
+
+/// 是否启用启动预置（env `CTP_MOCK_PRESET` 非空且非 0/false/no 时开启，默认关闭）。
+fn startup_preset_enabled() -> bool {
+    matches!(
+        std::env::var("CTP_MOCK_PRESET").ok().as_deref(),
+        Some(v) if !matches!(v, "" | "0" | "false" | "no")
+    )
+}
+
+/// 冷启动预置：注册测试文档主测合约的静态规格（真实交易所/乘数/今昨口径），
+/// 并给 SHFE 主标的 `rb2612` 播一笔今昨并存的多仓（今 2 / 昨 3，均价 3200）。
+///
+/// 仅在显式设置 `CTP_MOCK_PRESET` 时生效；解决宿主冷启动两个时序缺口：
+/// 其一，合约预热在首笔下单/播种之前发起，预置规格使其拿到非空合约表（乘数/is_shfe）；
+/// 其二，行情线程仅启动时按「活跃仓位兴趣集」决定是否建连，预置底仓使其一开始就订阅。
+///
+/// 所有值均为合成测试夹具，非真实合约参数。
+fn maybe_apply_startup_preset(front: &Arc<MockTdFront>) {
+    if !startup_preset_enabled() {
+        return;
+    }
+    use ctp_mock_core::sim::ledger::InstrumentSpec;
+
+    // (合约, 交易所, 品种, 乘数, 是否区分今昨)。
+    const SPECS: [(&str, &str, &str, i32, bool); 6] = [
+        ("rb2612", "SHFE", "rb", 10, true), // 螺纹钢（C10 跨今昨主标的）
+        ("cu2611", "SHFE", "cu", 5, true),  // 沪铜
+        ("au2612", "SHFE", "au", 1000, true), // 黄金
+        ("ag2701", "SHFE", "ag", 15, true), // 白银（跨标的关联）
+        ("ru2612", "SHFE", "ru", 10, true), // 橡胶
+        ("i2701", "DCE", "i", 100, false),  // 铁矿石（非 SHFE 对照）
+    ];
+    for (id, exch, product, multiple, split) in SPECS {
+        front.register_spec(InstrumentSpec {
+            instrument_id: id.into(),
+            exchange_id: exch.into(),
+            product_id: product.into(),
+            volume_multiple: multiple,
+            long_margin_ratio: 0.1,
+            short_margin_ratio: 0.1,
+            today_yesterday_split: split,
+        });
+    }
+    // rb2612 多仓：今 2 + 昨 3（覆盖纯平今/纯平昨/一单两腿三型），均价 3200。
+    front.seed_position("rb2612", true, 5, 2, 3, 3200.0);
 }
 
 /// # Safety
