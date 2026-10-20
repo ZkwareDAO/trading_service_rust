@@ -141,6 +141,9 @@ impl TraderSpi for EventTraderSpi {
                 volume_multiple: i.VolumeMultiple,
                 // 最小变动价位（SHFE 市价转穿价限价取整用）；柜台缺省 0.0 时预检判未就绪。
                 price_tick: i.PriceTick,
+                // 多/空保证金率（合约级静态）：持仓回报 UseMargin=0 时按成本×比率兜底。
+                long_margin_ratio: i.LongMarginRatio,
+                short_margin_ratio: i.ShortMarginRatio,
             }));
         }
         // 与持仓/委托查询一致：分页末条须发 QueryEnd，否则合约预热闸门永不释放。
@@ -273,6 +276,29 @@ mod tests {
         // 末条（末页可能无数据行）：必须发 QueryEnd 释放合约预热闸门。
         spi.on_rsp_qry_instrument(None, None, 1, true);
         assert!(matches!(rx.try_recv(), Ok(CtpEvent::QueryEnd)));
+    }
+
+    #[test]
+    fn rsp_qry_instrument_carries_long_short_margin_ratios() {
+        // Arrange：合约查询回报带多/空保证金率（持仓 UseMargin=0 时的兜底依据）。
+        let mut inst = ctp2rs::v1alpha1::CThostFtdcInstrumentField::default();
+        crate::ctp::core::encoding::encode_fixed(&mut inst.InstrumentID, "rb2510");
+        inst.LongMarginRatio = 0.10;
+        inst.ShortMarginRatio = 0.20;
+
+        // Act
+        let (mut spi, rx) = setup();
+        spi.on_rsp_qry_instrument(Some(&inst), None, 1, false);
+
+        // Assert：比率随 Instrument 事件原样透传，多/空不可错位。
+        match rx.try_recv() {
+            Ok(CtpEvent::Instrument(i)) => {
+                assert_eq!(i.instrument, "rb2510");
+                assert!((i.long_margin_ratio - 0.10).abs() < 1e-12, "多头保证金率");
+                assert!((i.short_margin_ratio - 0.20).abs() < 1e-12, "空头保证金率");
+            }
+            other => panic!("期望 Instrument 事件，实际 {other:?}"),
+        }
     }
 
     #[test]

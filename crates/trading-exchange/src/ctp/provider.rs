@@ -477,6 +477,8 @@ mod tests {
             is_trading: true,
             volume_multiple: 10,
             price_tick: tick,
+            long_margin_ratio: 0.0,
+            short_margin_ratio: 0.0,
         });
         p
     }

@@ -343,6 +343,8 @@ mod tests {
             is_trading: true,
             volume_multiple: 10,
             price_tick: 1.0,
+            long_margin_ratio: 0.0,
+            short_margin_ratio: 0.0,
         });
         let quotes = std::sync::Arc::new(trading_core::quote::QuoteTable::new());
         use trading_models::{Instrument, MarketKind, TopOfBook, Venue};
@@ -444,6 +446,8 @@ mod tests {
             is_trading: true,
             volume_multiple: 100,
             price_tick: 0.5,
+            long_margin_ratio: 0.0,
+            short_margin_ratio: 0.0,
         });
         let req = market_req(Side::Buy, false);
         let api = test_api(

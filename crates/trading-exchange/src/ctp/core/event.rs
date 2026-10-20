@@ -145,6 +145,11 @@ pub struct InstrumentInfo {
     pub volume_multiple: i32,
     /// 最小变动价位（SHFE 市价单转穿价限价时按其取整；缺失/非正为 0.0）。
     pub price_tick: f64,
+    /// 多头保证金率（占用保证金/成交额；柜台持仓回报 UseMargin=0 时按
+    /// 持仓成本×该比率估算多头占用保证金）。合约级静态属性，缺失/非正为 0.0。
+    pub long_margin_ratio: f64,
+    /// 空头保证金率（口径同 [`Self::long_margin_ratio`]，用于空头持仓兜底估算）。
+    pub short_margin_ratio: f64,
 }
 
 /// 登录成功后从柜台取得的会话信息。

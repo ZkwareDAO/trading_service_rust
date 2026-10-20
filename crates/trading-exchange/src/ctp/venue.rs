@@ -1290,7 +1290,9 @@ fn finalize_position_batch(
             continue;
         };
         let mult = ctx.instrument_dir.multiple(&instrument);
-        match merge_position_snapshots(&group, mult) {
+        // 合约多/空保证金率与乘数同源（InstrumentDir）；UseMargin=0 时供 merge 兜底估算。
+        let (long_ratio, short_ratio) = ctx.instrument_dir.margin_ratios(&instrument);
+        match merge_position_snapshots(&group, mult, long_ratio, short_ratio) {
             Some(merged) => {
                 // 快照是真相源：整批覆盖该 (合约,方向) 的今/昨。
                 ctx.position_dir
@@ -2192,6 +2194,8 @@ mod tests {
                 is_trading: true,
                 volume_multiple: 10,
                 price_tick: 1.0,
+                long_margin_ratio: 0.0,
+                short_margin_ratio: 0.0,
             });
         }
         dir
@@ -2557,6 +2561,8 @@ mod tests {
             is_trading: true,
             volume_multiple: 10,
             price_tick: 1.0,
+            long_margin_ratio: 0.0,
+            short_margin_ratio: 0.0,
         });
     }
 
@@ -2688,6 +2694,8 @@ mod tests {
                 is_trading: true,
                 volume_multiple: 10,
                 price_tick: 1.0,
+                long_margin_ratio: 0.0,
+                short_margin_ratio: 0.0,
             }),
             &h,
             &ctx,

@@ -141,7 +141,9 @@ pub struct MergedPosition {
 /// * 总成本 `C = Σ PositionCost`；
 /// * 合并开仓单价 `entry = C / (N × multiplier)`——**先求和再除**
 ///   （手数加权；绝不可先算各行单价再平均）；
-/// * 占用保证金 `margin = Σ UseMargin`；
+/// * 占用保证金 `margin = Σ UseMargin`；柜台对整组回报 0 时按
+///   `Σ PositionCost × 方向合约保证金率`（`long_margin_ratio`/`short_margin_ratio`）
+///   兜底估算，详见 [`effective_total_margin`]；比率也缺失则为 0（不退化为全额成本）；
 /// * `today = Σ TodayPosition`、`yesterday = Σ YdPosition`（喂 PositionDir）。
 ///
 /// 现价/pnl/roi/notional 适配层不计算（`mark_price=None`、`unrealized_pnl=None`），
@@ -153,6 +155,8 @@ pub struct MergedPosition {
 pub fn merge_position_snapshots(
     group: &[PositionSnapshot],
     volume_multiple: i32,
+    long_margin_ratio: f64,
+    short_margin_ratio: f64,
 ) -> Option<MergedPosition> {
     // 乘数缺失/非法：整组不产出（避免退化为"每手成本"污染单价口径）。
     if volume_multiple <= 0 {
@@ -174,7 +178,8 @@ pub fn merge_position_snapshots(
         return None;
     }
     let total_cost: f64 = valid.iter().map(|p| p.position_cost).sum();
-    let total_margin: f64 = valid.iter().map(|p| p.use_margin).sum();
+    // 占用保证金：柜台 ΣUseMargin>0 用之；否则按 Σcost×方向合约保证金率兜底（见纯函数）。
+    let total_margin: f64 = effective_total_margin(&valid, long_margin_ratio, short_margin_ratio);
     let today = saturating_sum(|p| p.today_position.max(0));
     let yesterday = saturating_sum(|p| p.yd_position.max(0));
     let signed = match head.direction {
@@ -209,11 +214,62 @@ pub fn merge_position_snapshots(
 /// 单条持仓快照 → 统一持仓行（单价口径）；[`merge_position_snapshots`] 的单行特例。
 ///
 /// 语义与聚合路径完全一致（同一实现），数量为 0/方向未知/乘数缺失非正时返回 None。
+/// `long_margin_ratio`/`short_margin_ratio` 为合约多/空保证金率（UseMargin=0 兜底用）。
 pub fn position_info_from_snapshot(
     p: &PositionSnapshot,
     volume_multiple: i32,
+    long_margin_ratio: f64,
+    short_margin_ratio: f64,
 ) -> Option<PositionInfo> {
-    merge_position_snapshots(std::slice::from_ref(p), volume_multiple).map(|m| m.info)
+    merge_position_snapshots(
+        std::slice::from_ref(p),
+        volume_multiple,
+        long_margin_ratio,
+        short_margin_ratio,
+    )
+    .map(|m| m.info)
+}
+
+/// 计算同 `(合约,方向)` 持仓分片的**有效占用保证金**（纯 f64 算术，不触 FFI/目录）。
+///
+/// * 柜台 `Σ UseMargin > 0`：以柜台权威值为准，**绝不覆盖**（对锁优惠等真实口径保留）；
+/// * 柜台对整组回报 0/缺失（对锁仓、今昨分片记账、SimNow 回填不全）：按
+///   `Σ PositionCost × 方向合约保证金率` 估算，避免上层在 CTP `leverage=1` 下把
+///   保证金兜底成**全额名义成本**（低估杠杆、止损/强平预警不触发）。
+///
+/// 方向逐行取自 `PosiDirection`：`'2'` 多→`long_ratio`，`'3'` 空→`short_ratio`。
+/// 成本/比率必须有限且为正才计入；任一缺失对应行不计入；全部缺失返回 `0.0`
+/// ——**绝不在此退化为全额名义成本**。
+///
+/// 前置条件：`rows` 须是已过滤的有效持仓行（`position != 0` 且方向为 `'2'`/`'3'`），
+/// 由唯一调用方 [`merge_position_snapshots`] 的 `valid` 过滤保证，本函数不再重复该过滤。
+fn effective_total_margin(rows: &[&PositionSnapshot], long_ratio: f64, short_ratio: f64) -> f64 {
+    // 柜台占用保证金之和：只累加有限、非负值（畸形负/NaN 不计）。
+    let counter: f64 = rows
+        .iter()
+        .map(|p| p.use_margin)
+        .filter(|m| m.is_finite() && *m >= 0.0)
+        .sum();
+    if counter > 0.0 {
+        return counter;
+    }
+    // 「有限且严格为正」：成本与比率同时满足才计入兜底（0/负/NaN/无穷一律按缺失）。
+    let positive = |v: f64| v.is_finite() && v > 0.0;
+    // 柜台整组缺失：逐行 成本 × 该方向有效比率；非法值贡献 0，绝不给全额。
+    rows.iter()
+        .map(|p| {
+            let ratio = match p.direction {
+                '2' => long_ratio,
+                '3' => short_ratio,
+                _ => 0.0,
+            };
+            if positive(p.position_cost) && positive(ratio) {
+                p.position_cost * ratio
+            } else {
+                0.0
+            }
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -345,7 +401,7 @@ mod tests {
 
     #[test]
     fn position_long_divides_cost_by_qty_and_multiple_to_unit_price() {
-        let info = position_info_from_snapshot(&rb_long_snapshot(), 10).unwrap();
+        let info = position_info_from_snapshot(&rb_long_snapshot(), 10, 0.0, 0.0).unwrap();
         assert_eq!(info.signed_quantity, Decimal::from(3));
         assert_eq!(info.position_side, OrderPositionSide::Both);
         // 单价口径：96150 / (3 手 × 10) = 3205，与 tick 现价同量纲。
@@ -363,7 +419,7 @@ mod tests {
             direction: '3',
             ..rb_long_snapshot()
         };
-        let info = position_info_from_snapshot(&short, 10).unwrap();
+        let info = position_info_from_snapshot(&short, 10, 0.0, 0.0).unwrap();
         assert_eq!(info.signed_quantity, -Decimal::from(3));
         assert_eq!(info.entry_price, Decimal::try_from(3205.0f64).unwrap());
     }
@@ -374,19 +430,19 @@ mod tests {
             position: 0,
             ..rb_long_snapshot()
         };
-        assert!(position_info_from_snapshot(&zero, 10).is_none());
+        assert!(position_info_from_snapshot(&zero, 10, 0.0, 0.0).is_none());
         let unknown = PositionSnapshot {
             direction: '9',
             ..zero
         };
-        assert!(position_info_from_snapshot(&unknown, 10).is_none());
+        assert!(position_info_from_snapshot(&unknown, 10, 0.0, 0.0).is_none());
     }
 
     #[test]
     fn position_missing_or_invalid_multiple_filtered() {
         // 合约目录未预热（0）或非法乘数（负）：宁可不产出，也不能退化为错误量纲价。
-        assert!(position_info_from_snapshot(&rb_long_snapshot(), 0).is_none());
-        assert!(position_info_from_snapshot(&rb_long_snapshot(), -5).is_none());
+        assert!(position_info_from_snapshot(&rb_long_snapshot(), 0, 0.0, 0.0).is_none());
+        assert!(position_info_from_snapshot(&rb_long_snapshot(), -5, 0.0, 0.0).is_none());
     }
 
     // ---- 今/昨分片聚合（SHFE 柜台同方向回两行）----
@@ -421,7 +477,7 @@ mod tests {
         ];
 
         // Act
-        let merged = merge_position_snapshots(&group, 10).expect("乘数就绪应聚合成功");
+        let merged = merge_position_snapshots(&group, 10, 0.0, 0.0).expect("乘数就绪应聚合成功");
 
         // Assert：一条、qty=5、entry=163000/(5×10)=3260（手数加权，非 3250），
         // margin=两行和，路由明细 today=2/yd=3。
@@ -441,8 +497,8 @@ mod tests {
         let single = rb_long_snapshot();
 
         // Act
-        let merged = merge_position_snapshots(std::slice::from_ref(&single), 10).unwrap();
-        let direct = position_info_from_snapshot(&single, 10).unwrap();
+        let merged = merge_position_snapshots(std::slice::from_ref(&single), 10, 0.0, 0.0).unwrap();
+        let direct = position_info_from_snapshot(&single, 10, 0.0, 0.0).unwrap();
 
         // Assert：聚合路径与单条映射逐字段一致（回归保护），明细取该行今昨。
         assert_eq!(merged.info.signed_quantity, direct.signed_quantity);
@@ -463,8 +519,8 @@ mod tests {
         let short = vec![rb_shard('3', 4, 1, 3, 132_000.0, 40_000.0)];
 
         // Act
-        let m_long = merge_position_snapshots(&long, 10).unwrap();
-        let m_short = merge_position_snapshots(&short, 10).unwrap();
+        let m_long = merge_position_snapshots(&long, 10, 0.0, 0.0).unwrap();
+        let m_short = merge_position_snapshots(&short, 10, 0.0, 0.0).unwrap();
 
         // Assert：多 +5、空 −4，各自单价独立。
         assert_eq!(m_long.info.signed_quantity, Decimal::from(5));
@@ -482,7 +538,7 @@ mod tests {
         ];
 
         // Act / Assert：空壳行不参与手数/成本/明细。
-        let merged = merge_position_snapshots(&group, 10).unwrap();
+        let merged = merge_position_snapshots(&group, 10, 0.0, 0.0).unwrap();
         assert_eq!(merged.info.signed_quantity, Decimal::from(2));
         assert_eq!(merged.info.entry_price, Decimal::try_from(3200.0).unwrap());
         assert_eq!((merged.today, merged.yesterday), (2, 0));
@@ -495,12 +551,12 @@ mod tests {
             rb_shard('2', 2, 2, 0, 64_000.0, 20_000.0),
             rb_shard('2', 3, 0, 3, 99_000.0, 30_000.0),
         ];
-        assert!(merge_position_snapshots(&group, 0).is_none());
+        assert!(merge_position_snapshots(&group, 0, 0.0, 0.0).is_none());
         // 全是空壳行：无有效持仓。
         let shells = vec![rb_shard('2', 0, 0, 0, 0.0, 0.0)];
-        assert!(merge_position_snapshots(&shells, 10).is_none());
+        assert!(merge_position_snapshots(&shells, 10, 0.0, 0.0).is_none());
         // 空组。
-        assert!(merge_position_snapshots(&[], 10).is_none());
+        assert!(merge_position_snapshots(&[], 10, 0.0, 0.0).is_none());
     }
 
     #[test]
@@ -512,7 +568,7 @@ mod tests {
         ];
 
         // Act
-        let merged = merge_position_snapshots(&group, 10).unwrap();
+        let merged = merge_position_snapshots(&group, 10, 0.0, 0.0).unwrap();
 
         // Assert：signed=−3；entry 为正的加权单价 98000/(3×10)≈3266.667。
         assert_eq!(merged.info.signed_quantity, -Decimal::from(3));
@@ -524,6 +580,160 @@ mod tests {
             merged.info.entry_price
         );
         assert_eq!((merged.today, merged.yesterday), (1, 2));
+    }
+
+    // ---- UseMargin=0 时按「持仓成本 × 合约保证金率」兜底（纯函数，不触 FFI）----
+
+    #[test]
+    fn merge_zero_use_margin_estimates_margin_from_cost_times_ratio() {
+        // Arrange：柜台对该多头仓位回报 UseMargin=0，cost=96150，合约多头保证金率 0.1。
+        let group = vec![rb_shard('2', 3, 2, 1, 96_150.0, 0.0)];
+
+        // Act
+        let merged = merge_position_snapshots(&group, 10, 0.10, 0.20).unwrap();
+
+        // Assert：margin=96150×0.1=9615（约 10 倍杠杆），绝不是全额成本 96150。
+        assert_eq!(
+            merged.info.margin,
+            Some(Decimal::try_from(9_615.0).unwrap()),
+            "UseMargin=0 时应按 cost×多头保证金率估算"
+        );
+    }
+
+    #[test]
+    fn merge_zero_use_margin_short_uses_short_ratio() {
+        // Arrange：空头仓位 UseMargin=0，long=0.10 / short=0.20 故意不同。
+        let group = vec![rb_shard('3', 3, 2, 1, 96_150.0, 0.0)];
+
+        // Act
+        let merged = merge_position_snapshots(&group, 10, 0.10, 0.20).unwrap();
+
+        // Assert：取 ShortMarginRatio → 19230。
+        assert_eq!(
+            merged.info.margin,
+            Some(Decimal::try_from(19_230.0).unwrap()),
+            "空头必须按 ShortMarginRatio 估算"
+        );
+    }
+
+    #[test]
+    fn merge_zero_use_margin_without_ratio_is_zero_never_full_cost() {
+        // Arrange：UseMargin=0 且合约保证金率也缺失（0）。
+        let group = vec![rb_shard('2', 3, 2, 1, 96_150.0, 0.0)];
+
+        // Act
+        let merged = merge_position_snapshots(&group, 10, 0.0, 0.0).unwrap();
+
+        // Assert：margin=0（交上层判未就绪），绝不退化为全额名义成本 96150。
+        assert_eq!(
+            merged.info.margin,
+            Some(Decimal::ZERO),
+            "比率缺失时必须为 0，不可给全额成本假安全值"
+        );
+    }
+
+    #[test]
+    fn merge_positive_counter_margin_is_not_overridden_by_ratio() {
+        // Arrange：柜台给真实 UseMargin=50000，即便传入比率也以柜台为准。
+        let group = vec![
+            rb_shard('2', 2, 2, 0, 64_000.0, 20_000.0),
+            rb_shard('2', 3, 0, 3, 99_000.0, 30_000.0),
+        ];
+
+        // Act
+        let merged = merge_position_snapshots(&group, 10, 0.10, 0.20).unwrap();
+
+        // Assert：仍是 ΣUseMargin=50000，不被 cost×ratio 覆盖。
+        assert_eq!(
+            merged.info.margin,
+            Some(Decimal::try_from(50_000.0).unwrap())
+        );
+    }
+
+    /// 仅喂方向/成本/占用保证金（其余聚合无关字段置默认）；position=1 保证是有效行。
+    fn margin_row(direction: char, cost: f64, use_margin: f64) -> PositionSnapshot {
+        PositionSnapshot {
+            instrument: "rb2510".into(),
+            direction,
+            position: 1,
+            yd_position: 1,
+            today_position: 0,
+            position_cost: cost,
+            use_margin,
+            position_profit: 0.0,
+        }
+    }
+
+    /// 测试薄包装：把自有行切片转成 `&[&PositionSnapshot]` 后调用被测纯函数。
+    fn calc(rows: &[PositionSnapshot], long_ratio: f64, short_ratio: f64) -> f64 {
+        effective_total_margin(&rows.iter().collect::<Vec<_>>(), long_ratio, short_ratio)
+    }
+
+    #[test]
+    fn effective_margin_prefers_counter_use_margin_when_positive() {
+        // 柜台回报真实占用保证金 32050：无论合约比率给多少都不得覆盖。
+        let rows = [margin_row('2', 96_150.0, 32_050.0)];
+        let got = calc(&rows, 0.10, 0.90);
+        assert!(
+            (got - 32_050.0).abs() < 1e-9,
+            "UseMargin>0 必须原样采用，比率不参与"
+        );
+    }
+
+    #[test]
+    fn effective_margin_partial_zero_shard_keeps_counter_sum() {
+        // 今/昨分片一行 32050、一行 0：汇总仍 >0，属柜台正常记账，不触发兜底。
+        let rows = [
+            margin_row('2', 64_100.0, 32_050.0),
+            margin_row('2', 32_050.0, 0.0),
+        ];
+        let got = calc(&rows, 0.10, 0.20);
+        assert!(
+            (got - 32_050.0).abs() < 1e-9,
+            "ΣUseMargin=32050 时不得用比率重算"
+        );
+    }
+
+    #[test]
+    fn effective_margin_zero_use_margin_falls_back_to_cost_times_long_ratio() {
+        // UseMargin 全 0（对锁/仿真回填不全），cost=96150，多头保证金率 0.1。
+        let rows = [margin_row('2', 96_150.0, 0.0)];
+        let got = calc(&rows, 0.10, 0.20);
+        // 96150 × 0.1 = 9615（约 10 倍杠杆口径），不是全额 96150。
+        assert!((got - 9_615.0).abs() < 1e-9, "兜底应为 cost×多头保证金率");
+    }
+
+    #[test]
+    fn effective_margin_short_uses_short_ratio_not_long() {
+        // 空头行，long=0.10 / short=0.20 故意不同，验证选对方向比率。
+        let rows = [margin_row('3', 96_150.0, 0.0)];
+        let got = calc(&rows, 0.10, 0.20);
+        // 取 ShortMarginRatio → 96150 × 0.2 = 19230（而非多头的 9615）。
+        assert!((got - 19_230.0).abs() < 1e-9, "空头必须取 ShortMarginRatio");
+    }
+
+    #[test]
+    fn effective_margin_zero_use_margin_sums_shard_costs_then_applies_ratio() {
+        // 今 2 手@3200(cost 64000) + 昨 3 手@3300(cost 99000)，UseMargin 全 0。
+        let rows = [
+            margin_row('2', 64_000.0, 0.0),
+            margin_row('2', 99_000.0, 0.0),
+        ];
+        let got = calc(&rows, 0.10, 0.20);
+        // 先 Σcost=163000 再 ×0.1 = 16300（逐行 cost 相加，同组比率相同）。
+        assert!((got - 16_300.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn effective_margin_invalid_ratio_returns_zero_never_full_notional() {
+        // UseMargin 全 0；比率为 0/负/NaN/±无穷 均视为缺失 → 输出 0，绝不退化为全额 96150。
+        let bad = [0.0_f64, -0.10, f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        for ratio in bad {
+            let long_rows = [margin_row('2', 96_150.0, 0.0)];
+            assert_eq!(calc(&long_rows, ratio, 0.20), 0.0, "多头非法比率 {ratio}");
+            let short_rows = [margin_row('3', 96_150.0, 0.0)];
+            assert_eq!(calc(&short_rows, 0.10, ratio), 0.0, "空头非法比率 {ratio}");
+        }
     }
 
     #[test]

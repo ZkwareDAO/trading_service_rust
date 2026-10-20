@@ -56,6 +56,18 @@ impl InstrumentDir {
             .map_or(0, |e| e.value().volume_multiple)
     }
 
+    /// 合约多/空保证金率 `(long, short)`（未预热返回 `(0,0)`，调用方据此判比率未就绪）。
+    ///
+    /// 仅供持仓回报 `UseMargin=0` 时在 ctp 映射层做「持仓成本×比率」兜底；
+    /// 非法（0/负/NaN）值的过滤在 `mapping::effective_total_margin` 统一完成，此处只透传。
+    pub fn margin_ratios(&self, instrument: &str) -> (f64, f64) {
+        self.by_instrument
+            .get(instrument.trim())
+            .map_or((0.0, 0.0), |e| {
+                (e.value().long_margin_ratio, e.value().short_margin_ratio)
+            })
+    }
+
     /// 已缓存的合约数（诊断/测试用）。
     pub fn len(&self) -> usize {
         self.by_instrument.len()
@@ -79,6 +91,8 @@ mod tests {
             is_trading: true,
             volume_multiple: multiple,
             price_tick: tick,
+            long_margin_ratio: 0.0,
+            short_margin_ratio: 0.0,
         }
     }
 
@@ -120,5 +134,21 @@ mod tests {
         dir.remember(info("rb2510", "SHFE", 10, 2.0));
         assert_eq!(dir.get("rb2510").map(|i| i.price_tick), Some(2.0));
         assert_eq!(dir.len(), 1);
+    }
+
+    #[test]
+    fn margin_ratios_read_back_and_default_to_zero_pair() {
+        // 已预热合约：多/空保证金率原样读回（持仓 UseMargin=0 兜底依据）。
+        let dir = InstrumentDir::new();
+        dir.remember(InstrumentInfo {
+            long_margin_ratio: 0.10,
+            short_margin_ratio: 0.20,
+            ..info("rb2510", "SHFE", 10, 1.0)
+        });
+        let (long, short) = dir.margin_ratios("rb2510");
+        assert!((long - 0.10).abs() < 1e-12, "多头保证金率");
+        assert!((short - 0.20).abs() < 1e-12, "空头保证金率");
+        // 未预热合约：返回 (0,0)，调用方据此判比率未就绪（不猜测）。
+        assert_eq!(dir.margin_ratios("nope"), (0.0, 0.0));
     }
 }
