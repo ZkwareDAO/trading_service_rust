@@ -39,7 +39,8 @@ pub struct Position {
     pub notional: Decimal,
     /// 杠杆（现货/股票=1）。
     pub leverage: u64,
-    /// 占用保证金/本金 = notional / leverage，定点。
+    /// 占用保证金/本金（建仓口径，持仓量不变时不随现价变）：柜台权威值优先
+    /// （CTP UseMargin、逐仓/HL），无值时由上层按 cost/leverage 兜底，定点。
     pub margin: Decimal,
     /// 结算/盈亏币种（USDT/USD/BTC…），冗余自 spec。
     pub settle_currency: String,
@@ -160,20 +161,25 @@ impl Position {
     ///
     /// 仅刷新行情衍生字段：`current_price` / `notional` / `pnl_value` / `roi` /
     /// `max_roi` / `profit_drawdown`；身份、数量、成本价、杠杆、保证金、已实现盈亏与
-    /// 时间戳均保持不变（`margin` 以交易所回查为权威，不由行情臆造）。
+    /// 时间戳均保持不变。**`margin` 是 ROI 的前置输入（非本函数衍生）**：调用方须在
+    /// 调用前填好（柜台权威值或上层 cost/leverage 兜底），本函数不自行计算保证金。
     ///
     /// 口径（见 `docs/状态机设计.md`）：
     /// * `notional = current_price × quantity × multiplier`
     /// * 多：`pnl = (current_price − pos_price) × qty × mult`；
     ///   空：`pnl = (pos_price − current_price) × qty × mult`
     /// * 成本基准 `cost = pos_price × quantity × multiplier`（建仓投入，不随现价变）
-    /// * `roi = pnl × leverage / cost`（保留 [`ROI_SCALE`] 位小数；=pnl/实际占用保证金）
+    /// * `roi = pnl / margin`（保证金口径，保留 [`ROI_SCALE`] 位小数）：浮盈÷实际占用
+    ///   保证金。margin 为柜台权威占用保证金（CTP `UseMargin`、币安逐仓/HL 等），
+    ///   或由上层按 `cost/leverage` 兜底（全仓/deribit/现货）；持仓量不变时不随现价变。
     /// * `max_roi = max(历史 max_roi, roi)`（盈利峰值只增不减）
     /// * `profit_drawdown`：仅在 `max_roi > 0` 时为 roi 自峰值回落的百分点
     ///   `max_roi − roi`，否则 0
     ///
     /// 边界：负价视为无效、原样返回；成本 ≤ 0（零成本价/零量/零乘数）时不定义 roi，
-    /// 盈亏与比率归零但保留历史峰值，绝不触发除零。
+    /// 盈亏与比率归零但保留历史峰值，绝不触发除零。**margin ≤ 0（保证金未就位）时
+    /// 本次不更新 roi/max_roi/profit_drawdown，保留上一次值**——绝不回退到无保证金
+    /// 口径算出偏小的错误比率。
     pub fn revalued(&self, current_price: Decimal) -> Position {
         let mut next = self.clone();
 
@@ -188,7 +194,8 @@ impl Position {
         // 成本基准（建仓时投入，不随现价变）= 成本价 × 量 × 乘数。
         let cost = multiply_exposure(self.pos_price, self);
 
-        // 成本不可定义（零成本价/零量）：盈亏/比率归零，峰值保留。
+        // 成本不可定义（零成本价/零量，如已减仓到 0）：仓位本身无意义，盈亏/比率
+        // 归零、峰值保留（与 margin<=0 不同——后者仓位有效、仅分母缺失，故冻结旧比率）。
         if cost <= Decimal::ZERO {
             next.pnl_value = Decimal::ZERO;
             next.roi = Decimal::ZERO;
@@ -208,17 +215,19 @@ impl Position {
             .unwrap_or(Decimal::ZERO);
         next.pnl_value = pnl;
 
-        // ROI = pnl/实际投入：杠杆为 0 不应出现（现货=1），下限钳到 1 以免除零。
-        // 分母用成本基准 cost（=pos_price×量×乘数），不随现价变。
-        let leverage = Decimal::from(self.leverage.max(1));
-        let roi = pnl
-            .checked_mul(leverage)
-            .and_then(|v| v.checked_div(cost))
-            .map(|v| v.round_dp(ROI_SCALE))
-            .unwrap_or(Decimal::ZERO);
-        next.roi = roi;
-        next.max_roi = self.max_roi.max(roi);
-        next.profit_drawdown = profit_drawdown(next.max_roi, roi);
+        // ROI = 浮盈 / 实际占用保证金（保证金口径）。margin 是建仓占用、持仓量不变时
+        // 不随现价变的分母（柜台权威值或上层 cost/leverage 兜底）。
+        if self.margin > Decimal::ZERO {
+            let roi = pnl
+                .checked_div(self.margin)
+                .map(|v| v.round_dp(ROI_SCALE))
+                .unwrap_or(Decimal::ZERO);
+            next.roi = roi;
+            next.max_roi = self.max_roi.max(roi);
+            next.profit_drawdown = profit_drawdown(next.max_roi, roi);
+        }
+        // margin <= 0（保证金未就位）：保留 self 的 roi/max_roi/profit_drawdown，
+        // next 由 self.clone 而来、未触碰这三个字段，无需赋值。
 
         next
     }
@@ -404,6 +413,9 @@ mod tests {
         p.quantity = dec(quantity);
         p.pos_price = dec(pos_price);
         p.leverage = leverage;
+        // 占用保证金兜底口径 = 成本/杠杆（mult=1）；与 engine 对无柜台 margin 的所一致，
+        // 保证 roi=pnl/margin 与旧 pnl×lev/cost 恒等，便于这些用例验证比率本身。
+        p.margin = (dec(pos_price) * dec(quantity)) / Decimal::from(leverage.max(1));
         p
     }
 
@@ -427,10 +439,72 @@ mod tests {
 
     #[test]
     fn spot_roi_is_pnl_over_cost_regardless_of_current_price() {
-        // 现货/期权 lev=1：roi = pnl/(pos_price×量)。100→125 → 0.25。
-        let p = position(1, "binance", InstrumentType::Spot, Side::Buy, "1", "100", 1);
+        // 现货/期权 lev=1：保证金=成本，roi = pnl/保证金。100→125 → 0.25。
+        let mut p = position(1, "binance", InstrumentType::Spot, Side::Buy, "1", "100", 1);
+        p.margin = dec("100");
         let r = p.revalued(dec("125"));
         assert_eq!(r.roi, dec("0.25"));
+    }
+
+    #[test]
+    fn ctp_roi_uses_real_margin_to_capture_margin_rate() {
+        // CTP：杠杆恒为 1，但柜台回真实占用保证金 UseMargin。
+        // 合约价值 100000、保证金 10000（10%）、涨 5% pnl=5000 → roi=5000/10000=0.5。
+        let mut p = position(
+            1,
+            "ctp",
+            InstrumentType::Futures,
+            Side::Buy,
+            "1",
+            "100000",
+            1,
+        );
+        p.margin = dec("10000");
+        let r = p.revalued(dec("105000"));
+        assert_eq!(r.pnl_value, dec("5000"));
+        assert_eq!(r.roi, dec("0.5"));
+    }
+
+    #[test]
+    fn roi_is_pnl_over_margin_when_margin_present() {
+        // 通用保证金口径：10x、成本100、保证金10，125 估值 pnl=25 → roi=25/10=2.5。
+        let mut p = position(
+            1,
+            "binance",
+            InstrumentType::Futures,
+            Side::Buy,
+            "1",
+            "100",
+            10,
+        );
+        p.margin = dec("10");
+        let r = p.revalued(dec("125"));
+        assert_eq!(r.roi, dec("2.5"));
+    }
+
+    #[test]
+    fn missing_margin_keeps_previous_roi_peak_and_drawdown() {
+        // margin<=0（未就位）：本次不更新 roi/max_roi/profit_drawdown，保留上一次值。
+        let mut p = position(
+            1,
+            "ctp",
+            InstrumentType::Futures,
+            Side::Buy,
+            "1",
+            "100000",
+            1,
+        );
+        p.margin = dec("0"); // 显式模拟保证金未就位。
+                             // 先给一组历史比率。
+        p.roi = dec("0.12");
+        p.max_roi = dec("0.3");
+        p.profit_drawdown = dec("0.18");
+        let r = p.revalued(dec("105000"));
+        assert_eq!(r.roi, dec("0.12"));
+        assert_eq!(r.max_roi, dec("0.3"));
+        assert_eq!(r.profit_drawdown, dec("0.18"));
+        // pnl/notional 仍正常更新（这些不依赖 margin）。
+        assert_eq!(r.pnl_value, dec("5000"));
     }
 
     #[test]

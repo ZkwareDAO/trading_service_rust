@@ -343,11 +343,18 @@ where
         .filter(|p| *p > Decimal::ZERO)
         .or_else(|| Some(info.entry_price).filter(|p| *p > Decimal::ZERO))
         .unwrap_or(Decimal::ZERO);
-    let mut valued = p.revalued(price);
-    // 保证金：逐仓取交易所口径；交叉（无值）按重算后的 notional/leverage 自算。
-    valued.margin = info
+
+    // 保证金必须在 revalued 算 roi 之前就位（roi=pnl/margin）。
+    // 优先柜台权威占用保证金（CTP UseMargin、逐仓 isolatedMargin、HL marginUsed）；
+    // 柜台不给（全仓/deribit/现货）按**建仓成本**口径兜底 = cost/leverage
+    // （pos_price×量×乘数/lev），固定不随现价漂移；加/减仓随均价×量重算。
+    let cost_basis = p.pos_price * p.quantity * p.multiplier;
+    p.margin = info
         .margin
-        .unwrap_or_else(|| margin_from_notional(valued.notional, valued.leverage));
+        .filter(|m| *m > Decimal::ZERO)
+        .unwrap_or_else(|| margin_from_cost(cost_basis, p.leverage));
+
+    let mut valued = p.revalued(price);
     // 无价但交易所直接回报了未实现盈亏：采纳之（比率仍待行情价补算）。
     if price == Decimal::ZERO {
         if let Some(pnl) = info.unrealized_pnl {
@@ -357,12 +364,13 @@ where
     valued
 }
 
-/// 交叉保证金口径：notional / leverage；杠杆为 0 返回 0，不除零。
-fn margin_from_notional(notional: Decimal, leverage: u64) -> Decimal {
+/// 成本口径保证金兜底：建仓成本 / 杠杆；杠杆为 0 返回 0（不除零）。
+/// 锚定建仓成本而非当前 notional，保证 ROI 分母不随现价漂移。
+fn margin_from_cost(cost: Decimal, leverage: u64) -> Decimal {
     if leverage == 0 {
         Decimal::ZERO
     } else {
-        notional / Decimal::from(leverage)
+        cost / Decimal::from(leverage)
     }
 }
 
@@ -518,7 +526,9 @@ mod tests {
         assert_eq!(p.pos_price, dec("80000"));
         assert_eq!(p.current_price, dec("80100"));
         assert_eq!(p.notional, dec("8010"));
-        assert_eq!(p.margin, dec("801"));
+        // 无柜台 margin 时按建仓成本兜底（cost/lev=80000×0.1/10=800），
+        // 锚定成本而非现价 notional，ROI 分母不随行情漂移。
+        assert_eq!(p.margin, dec("800"));
         assert_eq!(p.leverage, 10);
         assert_eq!(p.exchange_update_time, 1000);
     }
@@ -582,6 +592,33 @@ mod tests {
         assert_eq!(p.pnl_value, dec("0"));
         // notional = entry × 手 × 乘数 = 3205×3×10 = 96150（成本口径，非 0）。
         assert_eq!(p.notional, dec("96150"));
+    }
+
+    #[test]
+    fn ctp_snapshot_roi_uses_real_use_margin_for_margin_rate() {
+        // CTP 不回 leverage（恒为 1），但回真实占用保证金 UseMargin。
+        // entry=3205、3 手、乘数10 → 合约成本 96150；UseMargin=9615（10%）。
+        // 行情 3365.25：每手赚 160.25×10=1602.5，3 手 pnl=4807.5。
+        // ROI（保证金口径）= 4807.5 / 9615 = 0.5（涨约 5% 价格、保证金率 10% → +50%）。
+        let ctp = PositionInfo {
+            instrument: "rb2510".into(),
+            instrument_type: InstrumentType::Futures,
+            position_side: OrderPositionSide::Both,
+            signed_quantity: dec("3"),
+            entry_price: dec("3205"),
+            mark_price: None,
+            unrealized_pnl: None,
+            leverage: None,
+            multiplier: Some(dec("10")),
+            notional: None,
+            margin: Some(dec("9615")),
+            update_ms: Some(1_000),
+        };
+        let quote = |sym: &str| (sym == "rb2510").then(|| dec("3365.25"));
+        let v = snapshot_positions(7, "ctp", &[ctp], &quote, 2_000);
+        let p = &v[0];
+        assert_eq!(p.margin, dec("9615"), "采用柜台真实 UseMargin");
+        assert_eq!(p.roi, dec("0.5"), "roi=pnl/UseMargin，体现 10% 保证金率");
     }
 
     #[test]
@@ -829,6 +866,8 @@ mod tests {
         btc.quantity = dec("1");
         btc.pos_price = dec("100");
         btc.leverage = 10;
+        // 占用保证金 = cost/lev = 10（与生产对账填充一致）。
+        btc.margin = dec("10");
         let mut xili = Position::new(7, "xili", "BTCUSDT", Side::Buy);
         xili.quantity = dec("1");
         xili.pos_price = dec("100");
@@ -874,6 +913,8 @@ mod tests {
         btc.quantity = dec("0.001");
         btc.pos_price = dec("80000");
         btc.leverage = 3;
+        // 占用保证金 = cost/lev = 80/3（生产为柜台 marginUsed，此处取成本兜底口径）。
+        btc.margin = dec("80") / Decimal::from(3);
         repo.apply_diffs(diff_positions(vec![btc], vec![], 1))
             .unwrap();
 

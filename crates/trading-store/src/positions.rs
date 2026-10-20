@@ -296,6 +296,8 @@ mod tests {
         p.pos_price = dec("100");
         p.current_price = dec(current);
         p.leverage = 10;
+        // 占用保证金兜底 = cost/lev = 100×qty/10（生产由快照填充）。
+        p.margin = (dec("100") * dec(qty)) / Decimal::from(10);
         p
     }
 

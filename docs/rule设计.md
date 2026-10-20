@@ -94,7 +94,7 @@ risk 规则命中且动作是 `self` 时，平仓数量在同一行里二选一�
 
 | condition_kind | condition_name 拼回 | 判定输入 | value 口径 |
 |---|---|---|---|
-| `roi` | `roi` | **价格涨跌幅口径** = `Position.roi ÷ leverage`（Position.roi 是保证金口径、已乘杠杆；+0.1% 存 0.001） | 比率 |
+| `roi` | `roi` | **保证金收益率口径** = 直接取 `Position.roi`（`pnl ÷ 占用保证金`），不再 ÷ leverage；+10% 存 0.1。deribit/现货 lev=1 与旧价格涨跌幅口径数值一致，binance/HL 等含杠杆所阈值按保证金收益率表达 | 比率 |
 | `price` | `price_{instrument}` | 指定标的最新价（空后缀=仓位标的） | 价格 |
 | `position` | `position_{instrument}` | 指定标的持仓数量（空后缀=仓位标的） | 数量 |
 | `profit_drawdown` | `profit_drawdown` | 盈利自最高盈利的回落幅度 | 百分点（保证金口径：max_roi − roi） |
@@ -162,7 +162,7 @@ repo.retire(rule.id)?;   // 幂等
 |---|---|---|
 | `create.rs` | 远程 `create_rule` 的纯构造/校验：risk 必须解析到 deleted=0 绑定仓位（账户+所+合约类型+标的+方向），`position_X` 条件标的也必须有活跃仓位；链式动作透传（目标 pending 校验在 service） | 经仓位查询端口，零网络 |
 | `eval.rs` | 操作符 `>= <= > < ==` 的纯 Decimal 判定 | 纯函数 |
-| `metrics.rs` | `Position + Market → EvaluationContext`：**规则 roi = 仓位 roi ÷ leverage（价格涨跌幅口径）**，profit_drawdown 取仓位字段，price/position 跨标的经注入闭包；price 缺价本轮不触发，跨标的**持仓量**无仓补 0 | 零 IO |
+| `metrics.rs` | `Position + Market → EvaluationContext`：**规则 roi 直接取仓位 roi（`pnl÷占用保证金`，保证金收益率口径）**，profit_drawdown 取仓位字段，price/position 跨标的经注入闭包；price 缺价本轮不触发，跨标的**持仓量**无仓补 0 | 零 IO |
 | `order.rs` | 命中规则 → `Order`/`PlaceOrderRequest`：risk 取持仓反向 + `reduce_only`，平仓量 `quantity>0 ? quantity : 持仓量×quantity_pct`，杠杆随持仓；new 用规则行 `side`/价/量/`leverage`；统一写 `Order.rule_id`；另有纯判定 `terminal_rule_id` | 纯构造 |
 | `engine.rs` | 一轮扫描：只评估 `active` 规则 → risk 绑定仓位消失即 retire；命中后链式 `chain_fire`，或预检→`claim_self`→落内存订单→下单端口；跨标的价 **QuoteTable 优先、缺失回退活跃仓位 current_price**；另有 `reconcile_terminal_orders` REST 终态兜底 | 状态走 store，网络经端口 |
 | `placer.rs` | 生产下单口（futures 且 leverage>1 先 `set_leverage`：开仓失败按拒单 retire、平仓失败不阻断）；另有 `ExchangeRuleOrderQuerier` REST 查单口 | 网络 |

@@ -217,6 +217,8 @@ mod tests {
         p.pos_price = dec(pos_price);
         p.current_price = dec(current);
         p.leverage = leverage;
+        // 占用保证金兜底口径 = 成本/杠杆（mult=1），与 engine 无柜台 margin 时一致。
+        p.margin = (dec(pos_price) * dec(qty)) / Decimal::from(leverage.max(1));
         p.exchange_update_time = 9000;
         p
     }

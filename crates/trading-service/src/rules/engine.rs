@@ -1081,7 +1081,8 @@ mod tests {
     }
 
     /// 插入指定杠杆的 BTC 多仓，并用真实重估（revalued）设置入场价/标记价，
-    /// 使 Position.roi 为保证金口径（价格涨幅×杠杆），回读落库行。
+    /// 使 Position 带成本口径保证金（margin=cost/lev），roi 经 revalued 成为
+    /// 保证金口径收益率（pnl/margin = 价格涨幅×杠杆），回读落库行。
     fn seed_lev_position(
         h: &Harness,
         instrument: &str,
@@ -1094,6 +1095,7 @@ mod tests {
         p.quantity = dec(qty);
         p.pos_price = dec(entry);
         p.leverage = leverage;
+        p.margin = (dec(entry) * dec(qty)) / Decimal::from(leverage.max(1));
         p = p.revalued(dec(mark));
         h.positions
             .apply_diffs(trading_models::diff_positions(vec![p], vec![], 1))
@@ -1163,45 +1165,43 @@ mod tests {
         );
     }
 
-    // —— 用例③：roi > 0.001 按「价格涨跌幅」口径（Position.roi 已乘杠杆，判定再除杠杆）——
+    // —— 用例③：roi 规则按「保证金收益率」口径（Position.roi=pnl/占用保证金）——
     #[tokio::test]
-    async fn case3_roi_threshold_uses_price_movement_not_margin_roi() {
-        // 场景 A（关键反例）：价格涨 0.05%（60000→60030），价格 roi=0.0005（≤0.001），
-        // 但 3x 保证金 roi=0.0015（>0.001）——若误用保证金口径会误触发，正确口径不触发。
+    async fn case3_roi_threshold_uses_margin_roi() {
+        // 3x：价格涨 0.05%（60000→60030）→ 保证金 roi=0.0015。阈值 0.002 不触发。
         let h = Harness::new(false);
         let pos = seed_lev_position(&h, "BTCUSDT", "0.01", "60000", "60030", 3);
-        let rule = roi_rule(&h, pos.id, ">", "0.001");
+        let rule = roi_rule(&h, pos.id, ">", "0.002");
         assert_eq!(h.engine.run_scan().await.fired, 0);
         assert_eq!(
             h.rules.get(rule.id).unwrap().status,
             WatchRuleStatus::Active
         );
 
-        // 场景 B：价格涨 0.1667%（>0.001）→ 触发全平。
+        // 同阈值 0.002：价格涨 0.1%（60000→60060）→ 保证金 roi=0.003 > 0.002 → 触发。
         let h = Harness::new(false);
-        let pos = seed_lev_position(&h, "BTCUSDT", "0.01", "60000", "60100", 3);
-        let _rule = roi_rule(&h, pos.id, ">", "0.001");
+        let pos = seed_lev_position(&h, "BTCUSDT", "0.01", "60000", "60060", 3);
+        let _rule = roi_rule(&h, pos.id, ">", "0.002");
         assert_eq!(h.engine.run_scan().await.fired, 1);
     }
 
-    // —— 用例④：roi < -0.003 全部平仓（亏损方向，同样是价格口径）——
+    // —— 用例④：负向保证金收益率全部平仓 ——
     #[tokio::test]
-    async fn case4_negative_roi_uses_price_movement() {
-        // 关键反例：价格跌 0.15%（60000→59910），价格 roi=-0.0015（>-0.003），
-        // 但 3x 保证金 roi=-0.0045（<-0.003）——保证金口径会误平，价格口径不平。
+    async fn case4_negative_margin_roi_closes() {
+        // 3x：价格跌 0.1%（60000→59940）→ 保证金 roi=-0.003（>-0.005），不触发。
         let h = Harness::new(false);
-        let pos = seed_lev_position(&h, "BTCUSDT", "0.01", "60000", "59910", 3);
-        let rule = roi_rule(&h, pos.id, "<", "-0.003");
+        let pos = seed_lev_position(&h, "BTCUSDT", "0.01", "60000", "59940", 3);
+        let rule = roi_rule(&h, pos.id, "<", "-0.005");
         assert_eq!(h.engine.run_scan().await.fired, 0);
         assert_eq!(
             h.rules.get(rule.id).unwrap().status,
             WatchRuleStatus::Active
         );
 
-        // 价格跌 0.4%（<-0.003）→ 触发。
+        // 价格跌 0.2%（→保证金 roi=-0.006 < -0.005）→ 触发。
         let h = Harness::new(false);
-        let pos = seed_lev_position(&h, "BTCUSDT", "0.01", "60000", "59760", 3);
-        let _rule = roi_rule(&h, pos.id, "<", "-0.003");
+        let pos = seed_lev_position(&h, "BTCUSDT", "0.01", "60000", "59880", 3);
+        let _rule = roi_rule(&h, pos.id, "<", "-0.005");
         assert_eq!(h.engine.run_scan().await.fired, 1);
     }
 

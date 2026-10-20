@@ -46,15 +46,11 @@ impl EvaluationContext {
 
     /// 从一条已重估的活跃仓位提取自身指标。
     pub fn from_position(position: &Position) -> Self {
-        // 规则 ROI = 价格涨跌幅 = 保证金口径 roi ÷ 杠杆（杠杆钳到 >=1，杜绝除零）。
-        let leverage = Decimal::from(position.leverage.max(1));
-        let price_roi = position
-            .roi
-            .checked_div(leverage)
-            .map(|v| v.round_dp(trading_models::ROI_SCALE))
-            .unwrap_or(position.roi);
+        // 规则 ROI 直接采用仓位的保证金口径收益率（pnl/占用保证金），各所统一：
+        // deribit/现货 lev=1 与旧口径一致；binance/HL 由「价格涨跌幅」改为
+        // 「保证金收益率」（用户设阈值时直接按真实 ROI 表达）。
         Self {
-            roi: Some(price_roi),
+            roi: Some(position.roi),
             profit_drawdown: Some(position.profit_drawdown),
             // 0 价视为尚无有效行情，不参与价格类条件。
             own_price: if position.current_price > Decimal::ZERO {
@@ -220,19 +216,18 @@ mod tests {
     }
 
     #[test]
-    fn roi_metric_is_price_movement_divided_by_leverage() {
+    fn roi_metric_uses_position_roi_directly_without_leverage_division() {
         let b = builder();
-        // 保证金口径 roi=0.003、3x 杠杆 → 规则 ROI（价格涨跌幅）=0.001。
+        // 规则 ROI 直接用仓位保证金口径收益率，不再除以杠杆。
         let mut p = position();
         p.roi = dec("0.003");
         p.leverage = 3;
         p.current_price = dec("91000");
         let ctx = EvaluationContext::from_position(&p);
-        assert_eq!(ctx.roi, Some(dec("0.001")));
-        // 0.001 价格涨幅命中 > 0.0005；而若误用保证金口径 0.003 也会过，
-        // 故再断言恰处于两者之间：阈值 0.002（价格口径不过、保证金口径会误过）。
-        assert!(b.evaluate(&rule(WatchConditionKind::Roi, None, ">", "0.0005"), &ctx));
-        assert!(!b.evaluate(&rule(WatchConditionKind::Roi, None, ">", "0.002"), &ctx));
+        assert_eq!(ctx.roi, Some(dec("0.003")));
+        // 阈值按保证金收益率判定：0.003 命中 > 0.002，不命中 > 0.005。
+        assert!(b.evaluate(&rule(WatchConditionKind::Roi, None, ">", "0.002"), &ctx));
+        assert!(!b.evaluate(&rule(WatchConditionKind::Roi, None, ">", "0.005"), &ctx));
     }
 
     #[test]
