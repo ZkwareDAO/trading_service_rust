@@ -21,7 +21,12 @@ use crate::ctp::gateway::spi::EventTraderSpi;
 pub fn apply_event(session: &mut SessionState, event: &CtpEvent) {
     match event {
         CtpEvent::Login(info) => {
-            session.on_login(info.front_id, info.session_id, &info.max_order_ref);
+            session.on_login(
+                info.front_id,
+                info.session_id,
+                &info.max_order_ref,
+                &info.trading_day,
+            );
         }
         CtpEvent::FrontDisconnected(_) => session.on_disconnect(),
         _ => {}
@@ -207,6 +212,12 @@ impl TraderHandle {
     /// 当前会话编号。
     pub fn session_id(&self) -> i32 {
         self.session.session_id()
+    }
+
+    /// 当前登录交易日（`YYYYMMDD`；未登录为空）。前台查单发起时快照进在途闸门，
+    /// 供 QueryEnd 判定非今日历史单查无应收口为取消。
+    pub fn trading_day(&self) -> &str {
+        self.session.trading_day()
     }
 
     /// 显式释放底层连接。

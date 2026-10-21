@@ -16,6 +16,9 @@ pub struct SessionState {
     front_id: i32,
     /// 会话编号（登录后填充）。
     session_id: i32,
+    /// 当前交易日（登录回报填充，`YYYYMMDD`；夜盘由柜台归属到次日，断连清空）。
+    /// 查单只支持当日报单：用它判定非今日历史单查无应收口为取消。
+    trading_day: String,
     /// 是否已登录。
     logged_in: bool,
 }
@@ -56,18 +59,31 @@ impl SessionState {
     }
 
     /// 登录成功：记录会话要素，并把下一 OrderRef 对齐到 MaxOrderRef 之后。
-    pub fn on_login(&mut self, front_id: i32, session_id: i32, max_order_ref: &str) {
+    pub fn on_login(
+        &mut self,
+        front_id: i32,
+        session_id: i32,
+        max_order_ref: &str,
+        trading_day: &str,
+    ) {
         self.front_id = front_id;
         self.session_id = session_id;
+        self.trading_day = trading_day.trim().to_string();
         self.logged_in = true;
         // 已用最大引用之后继续；非数字按 0 处理，从 1 起。
         let max = max_order_ref.trim().parse::<i32>().unwrap_or(0);
         self.next_order_ref = max + 1;
     }
 
-    /// 连接断开：清除登录标志；下一连接重新登录后会再次对齐。
+    /// 连接断开：清除登录标志与交易日；下一连接重新登录后会再次对齐。
     pub fn on_disconnect(&mut self) {
         self.logged_in = false;
+        self.trading_day.clear();
+    }
+
+    /// 当前登录交易日（`YYYYMMDD`；未登录/断连为空串）。
+    pub fn trading_day(&self) -> &str {
+        &self.trading_day
     }
 
     /// 是否已登录。
@@ -108,7 +124,7 @@ mod tests {
     #[test]
     fn order_ref_continues_after_max_order_ref_on_login() {
         let mut s = SessionState::new();
-        s.on_login(1, 9001, "12");
+        s.on_login(1, 9001, "12", "20261021");
         // 后续 OrderRef 从柜台 MaxOrderRef 之后递增。
         assert_eq!(s.order_ref(), "13");
         assert_eq!(s.order_ref(), "14");
@@ -118,7 +134,7 @@ mod tests {
     fn login_records_front_and_session_and_flag() {
         let mut s = SessionState::new();
         assert!(!s.is_logged_in());
-        s.on_login(7, 5002, "3");
+        s.on_login(7, 5002, "3", "20261021");
         assert!(s.is_logged_in());
         assert_eq!(s.front_id(), 7);
         assert_eq!(s.session_id(), 5002);
@@ -127,16 +143,26 @@ mod tests {
     #[test]
     fn non_numeric_max_order_ref_is_treated_as_zero() {
         let mut s = SessionState::new();
-        s.on_login(1, 1, "");
+        s.on_login(1, 1, "", "");
         assert_eq!(s.order_ref(), "1");
     }
 
     #[test]
     fn reset_on_disconnect_clears_login_flag() {
         let mut s = SessionState::new();
-        s.on_login(1, 1, "5");
+        s.on_login(1, 1, "5", "20261021");
         s.on_disconnect();
         assert!(!s.is_logged_in());
+        // 断连后交易日一并清空（下一连接重新登录前不得用旧交易日判历史单）。
+        assert_eq!(s.trading_day(), "");
+    }
+
+    #[test]
+    fn login_records_trading_day() {
+        let mut s = SessionState::new();
+        assert_eq!(s.trading_day(), "");
+        s.on_login(7, 5002, "3", "20261021");
+        assert_eq!(s.trading_day(), "20261021");
     }
 
     #[test]
@@ -156,7 +182,7 @@ mod tests {
     fn order_action_ref_not_affected_by_login_max_order_ref() {
         // Arrange：登录把下一 OrderRef 对齐到 MaxOrderRef 之后。
         let mut s = SessionState::new();
-        s.on_login(1, 9001, "12");
+        s.on_login(1, 9001, "12", "20261021");
 
         // Act / Assert：撤单操作引用不参与 MaxOrderRef 对齐，仍从 1 起。
         assert_eq!(s.order_action_ref(), 1);

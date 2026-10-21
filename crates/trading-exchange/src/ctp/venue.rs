@@ -334,10 +334,14 @@ enum ActiveQuery {
     Contracts,
     /// 前台按需查单：缓冲当日委托行，QueryEnd 选定后回 OrderLookup。
     FrontOrder {
+        /// 合约代码（历史单查无收口为 Canceled 时回填 OrderState 用）。
+        instrument: String,
         /// 首选匹配值（OrderSysID / 受理态 OrderRef）。
         exchange_order_id: String,
         /// cid→registry 反查的 OrderRef 兜底。
         hint: Option<String>,
+        /// 发起查询时的当前登录交易日快照（`YYYYMMDD`），用于判定非今日历史单。
+        trading_day: String,
         /// 查询应答行缓冲。
         rows: Vec<crate::ctp::core::event::OrderSnapshot>,
         /// 三态结果回执（断线随枚举 drop 关闭 → 接收端 RecvError）。
@@ -799,9 +803,13 @@ fn issue_front_query(
             reply,
         }) => {
             if h.query_orders(&instrument) == 0 {
+                // 快照当前登录交易日（夜盘由柜台归属次日），QueryEnd 据此判非今日历史单。
+                let trading_day = h.trading_day().to_string();
                 *active = Some(ActiveQuery::FrontOrder {
+                    instrument,
                     exchange_order_id,
                     hint: order_ref_hint,
+                    trading_day,
                     rows: Vec::new(),
                     reply: Some(reply),
                 });
@@ -1361,8 +1369,10 @@ fn finish_active_query(ctx: &EventContext, active: &mut Option<ActiveQuery>) {
         // 合约预热收尾：Instrument 行已逐条写入共享 InstrumentDir，这里仅释放闸门。
         ActiveQuery::Contracts => {}
         ActiveQuery::FrontOrder {
+            instrument,
             exchange_order_id,
             hint,
+            trading_day,
             rows,
             reply,
         } => {
@@ -1371,8 +1381,13 @@ fn finish_active_query(ctx: &EventContext, active: &mut Option<ActiveQuery>) {
                 Some(s) => crate::api::OrderLookup::Found(
                     crate::ctp::mapping::order_state_from_snapshot(s),
                 ),
-                // 空/不匹配/只查当日：一律 Unavailable，绝不判 NotExists（避免把
-                // UNKNOWN 单错误收敛成 REJECTED）。
+                // 查无分流：CTP 只查当日报单——eid 交易日早于当前交易日的历史单查无是
+                // 确定的，收口 Found(Canceled)；其余（当日报单/无日期/参照日缺失）保持
+                // Unavailable，下轮再试，绝不把在途 UNKNOWN 单误判（也不返回 NotExists
+                // 以避免上层 REJECTED 语义）。
+                None if is_stale_historical_order(&exchange_order_id, &trading_day) => {
+                    canceled_historical_lookup(&instrument, &exchange_order_id)
+                }
                 None => crate::api::OrderLookup::Unavailable,
             };
             if let Some(reply) = reply {
@@ -1490,6 +1505,55 @@ fn select_order<'a>(
     order_ref_hint.and_then(|hint| {
         rows.iter()
             .find(|r| !hint.trim().is_empty() && r.order_ref == hint)
+    })
+}
+
+/// 从 OrderSysID 解析交易日前缀。
+///
+/// 柜台系统号标准形态为 `YYYYMMDD-序号`（交易日前 8 位为 ASCII 数字、第 9 字节为
+/// '-'）；仅严格满足该形态才返回日期。受理前 eid 还是自产纯数字 OrderRef（无 '-'）、
+/// 空串或脏格式一律返回 `None`——调用方据此**不**做历史单推断。
+fn order_sysid_trading_day(sys_id: &str) -> Option<&str> {
+    let bytes = sys_id.as_bytes();
+    if bytes.len() > 8 && bytes[8] == b'-' && bytes[..8].iter().all(|b| b.is_ascii_digit()) {
+        // 前 8 字节已确认全 ASCII 数字，切片必然落在 UTF-8 字符边界上。
+        Some(&sys_id[..8])
+    } else {
+        None
+    }
+}
+
+/// 判断该订单是否为「非今日历史单」。
+///
+/// 仅当 eid 可解析出交易日前缀、当前登录交易日为合法 8 位日期、且两者**不相等**时
+/// 返回 true。CTP 只支持查当日报单：历史单在当日委托簿查无是确定的，可据此收口；
+/// 任一日期缺失或就是当日报单则返回 false（查无维持 `Unavailable`，绝不误杀在途单）。
+fn is_stale_historical_order(exchange_order_id: &str, current_trading_day: &str) -> bool {
+    let Some(day) = order_sysid_trading_day(exchange_order_id) else {
+        return false;
+    };
+    let today = current_trading_day.trim();
+    today.len() == 8 && today.bytes().all(|b| b.is_ascii_digit()) && day != today
+}
+
+/// 构造非今日历史单「查无」时的取消终态（`Found(Canceled)`）。
+///
+/// CTP 只能查当日报单：非今日单在当日簿查无是确定的，业务约定按已取消收口。
+/// 0 成交、无均价；`client_order_id=None`——上层 reconcile 用本地订单自身的 cid，
+/// 此状态只提供终态/成交/eid，不参与单号定位。
+fn canceled_historical_lookup(
+    instrument: &str,
+    exchange_order_id: &str,
+) -> crate::api::OrderLookup {
+    crate::api::OrderLookup::Found(crate::api::OrderState {
+        client_order_id: None,
+        exchange_order_id: Some(exchange_order_id.to_string()),
+        instrument: instrument.to_string(),
+        status: trading_models::OrderStatus::Canceled,
+        filled_quantity: rust_decimal::Decimal::ZERO,
+        average_price: None,
+        position_side: crate::api::OrderPositionSide::Both,
+        venue_extra: None,
     })
 }
 
@@ -2569,12 +2633,15 @@ mod tests {
     fn front_order_active(
         eid: &str,
         hint: Option<&str>,
+        trading_day: &str,
     ) -> (Option<ActiveQuery>, OneRx<crate::api::OrderLookup>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (
             Some(ActiveQuery::FrontOrder {
+                instrument: "rb2510".into(),
                 exchange_order_id: eid.into(),
                 hint: hint.map(str::to_string),
+                trading_day: trading_day.into(),
                 rows: Vec::new(),
                 reply: Some(tx),
             }),
@@ -2587,7 +2654,7 @@ mod tests {
         // Arrange：前台查单在途，喂一行系统号匹配的查询行。
         let (ctx, mut bridge_rx) = ctx_and_rx();
         let h = handle();
-        let (mut active, mut lookup_rx) = front_order_active("20260101-2", None);
+        let (mut active, mut lookup_rx) = front_order_active("20260101-2", None, "20260101");
         dispatch_event(
             CtpEvent::OrderQuery(qrow("101", "20260101-2", "SHFE", "rb2510")),
             &h,
@@ -2610,11 +2677,38 @@ mod tests {
     }
 
     #[test]
+    fn order_sysid_trading_day_parses_strict_yyyymmdd_prefix() {
+        // 标准 OrderSysID：YYYYMMDD-序号 → 解析出交易日前缀。
+        assert_eq!(order_sysid_trading_day("20261015-7"), Some("20261015"));
+        assert_eq!(order_sysid_trading_day("20261015-000007"), Some("20261015"));
+        // 自产 OrderRef（纯数字/短号）无日期分隔符 → None。
+        assert_eq!(order_sysid_trading_day("101"), None);
+        assert_eq!(order_sysid_trading_day(""), None);
+        // 前缀非 8 位数字或第 9 字节非 '-' → None（拒绝脏格式，绝不猜测）。
+        assert_eq!(order_sysid_trading_day("20261-7"), None);
+        assert_eq!(order_sysid_trading_day("2026101x-7"), None);
+        assert_eq!(order_sysid_trading_day("202610157"), None);
+    }
+
+    #[test]
+    fn stale_historical_order_true_only_when_prefix_differs_from_current_day() {
+        // eid 交易日 ≠ 当前登录交易日 → 历史单。
+        assert!(is_stale_historical_order("20261015-7", "20261021"));
+        // 同一交易日 → 非历史。
+        assert!(!is_stale_historical_order("20261021-3", "20261021"));
+        // 当前交易日缺失（未登录/未取到）→ 不判历史（安全侧）。
+        assert!(!is_stale_historical_order("20261015-7", ""));
+        // eid 无日期（受理前自产 ref / 格式异常）→ 不判历史。
+        assert!(!is_stale_historical_order("101", "20261021"));
+        assert!(!is_stale_historical_order("", "20261021"));
+    }
+
+    #[test]
     fn front_order_no_match_replies_unavailable_not_notexists() {
         // Arrange：查询返回的行无一匹配。
         let (ctx, _rx) = ctx_and_rx();
         let h = handle();
-        let (mut active, mut lookup_rx) = front_order_active("missing", None);
+        let (mut active, mut lookup_rx) = front_order_active("missing", None, "20260101");
         dispatch_event(
             CtpEvent::OrderQuery(qrow("101", "20260101-9", "SHFE", "rb2510")),
             &h,
@@ -2630,6 +2724,61 @@ mod tests {
             lookup_rx.try_recv(),
             Ok(crate::api::OrderLookup::Unavailable)
         ));
+    }
+
+    #[test]
+    fn front_order_stale_historical_no_match_replies_found_canceled() {
+        // Arrange：eid 交易日(20260901) ≠ 当前登录交易日(20261021)，当日委托簿查无此历史单。
+        let (ctx, _rx) = ctx_and_rx();
+        let h = handle();
+        let (mut active, mut lookup_rx) = front_order_active("20260901-2", None, "20261021");
+        // 柜台只回当日报单，无一匹配该历史系统号。
+        dispatch_event(
+            CtpEvent::OrderQuery(qrow("101", "20261021-9", "SHFE", "rb2510")),
+            &h,
+            &ctx,
+            &mut active,
+        );
+
+        // Act
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+
+        // Assert：历史单查无 → Found(Canceled)，0 成交、回填 eid（交上层 Found 终态分支收口）。
+        match lookup_rx.try_recv() {
+            Ok(crate::api::OrderLookup::Found(st)) => {
+                assert_eq!(st.status, trading_models::OrderStatus::Canceled);
+                assert_eq!(st.exchange_order_id.as_deref(), Some("20260901-2"));
+                assert_eq!(st.filled_quantity, rust_decimal::Decimal::ZERO);
+                assert_eq!(st.average_price, None);
+            }
+            other => panic!("期望历史单查无 Found(Canceled)，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn front_order_stale_id_but_row_matches_replies_real_row_not_canceled() {
+        // Arrange：即便 eid 非今日，只要当日簿里确实匹配到行，就以真实行为准（select 优先）。
+        let (ctx, _rx) = ctx_and_rx();
+        let h = handle();
+        let (mut active, mut lookup_rx) = front_order_active("20260901-2", None, "20261021");
+        dispatch_event(
+            CtpEvent::OrderQuery(qrow("101", "20260901-2", "SHFE", "rb2510")),
+            &h,
+            &ctx,
+            &mut active,
+        );
+
+        // Act
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+
+        // Assert：命中真实行 → Found(New)，绝不被历史兜底覆盖成 Canceled。
+        match lookup_rx.try_recv() {
+            Ok(crate::api::OrderLookup::Found(st)) => {
+                assert_eq!(st.status, trading_models::OrderStatus::New);
+                assert_eq!(st.exchange_order_id.as_deref(), Some("20260901-2"));
+            }
+            other => panic!("期望命中真实行 Found，实际 {other:?}"),
+        }
     }
 
     #[test]
@@ -2967,7 +3116,7 @@ mod tests {
         // Arrange：前台查单在途（查询行进缓冲），此时来一帧**实时**委托回报。
         let (ctx, mut bridge_rx) = ctx_and_rx();
         let h = handle();
-        let (mut active, _lookup_rx) = front_order_active("20260101-2", None);
+        let (mut active, _lookup_rx) = front_order_active("20260101-2", None, "20260101");
 
         // Act：先发查询行（被缓冲），再发实时回报（必须透传）。
         dispatch_event(
@@ -2992,7 +3141,7 @@ mod tests {
         // Arrange：前台查单在途，持有未回执 oneshot。
         let (ctx, _rx) = ctx_and_rx();
         let h = handle();
-        let (active, mut lookup_rx) = front_order_active("20260101-2", None);
+        let (active, mut lookup_rx) = front_order_active("20260101-2", None, "20260101");
 
         // Act：模拟断线/循环退出——inner_loop return 时 active 被 drop（发送端关闭）。
         drop(active);
