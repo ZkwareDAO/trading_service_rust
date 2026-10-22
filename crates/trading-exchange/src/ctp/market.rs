@@ -337,7 +337,28 @@ fn run_md_session(
     // tick 消费：断开即结束本会话交外循环重连；停机即整体退出。
     while !stop.load(Ordering::SeqCst) {
         match md.next_event(MD_POLL_TIMEOUT) {
+            // 逐符号订阅应答：成功码 0 记 debug（避免 62 条刷屏），非 0 显式 warn，
+            // 用于定位「整批订阅中部分合约（如某交易所批次）被柜台静默拒绝」。
+            Some(MdEvent::Subscribed {
+                instrument,
+                code,
+                msg,
+            }) => {
+                if code == 0 {
+                    tracing::debug!(instrument, code, "CTP 行情订阅应答：成功");
+                } else {
+                    tracing::warn!(instrument, code, error = %msg, "CTP 行情订阅应答：该合约被拒绝");
+                }
+            }
             Some(MdEvent::Tick(t)) => {
+                // 诊断：逐笔 tick 合约/最新价/买卖一（debug，用于确认各所实时行情是否进表）。
+                tracing::debug!(
+                    instrument = %t.instrument,
+                    last = t.last_price,
+                    bid = t.bid_price,
+                    ask = t.ask_price,
+                    "CTP 行情 tick 到达"
+                );
                 let now = now_ms();
                 quotes.apply(&instrument_key(&t.instrument), tick_to_update(&t, now));
                 if let Some(obs) = observer {

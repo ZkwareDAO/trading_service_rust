@@ -21,8 +21,12 @@ pub enum MdEvent {
     FrontDisconnected(i32),
     /// 行情登录应答；错误码 0=通过。
     LoggedIn { code: i32, msg: String },
-    /// 订阅应答；错误码 0=成功。
-    Subscribed { code: i32, msg: String },
+    /// 订阅应答；逐符号回调，instrument=合约号，错误码 0=成功。
+    Subscribed {
+        instrument: String,
+        code: i32,
+        msg: String,
+    },
     /// 一笔行情 tick。
     Tick(TickSnapshot),
     /// 错误。
@@ -67,13 +71,21 @@ impl MdSpi for EventMdSpi {
 
     fn on_rsp_sub_market_data(
         &mut self,
-        _specific: Option<&ctp2rs::v1alpha1::CThostFtdcSpecificInstrumentField>,
+        specific: Option<&ctp2rs::v1alpha1::CThostFtdcSpecificInstrumentField>,
         info: Option<&ctp2rs::v1alpha1::CThostFtdcRspInfoField>,
         _request_id: i32,
         _is_last: bool,
     ) {
+        // 逐符号订阅应答：带上合约号，便于定位「整批订阅中某些符号被柜台静默拒绝」。
+        let instrument = specific
+            .map(|s| decode_fixed(&s.InstrumentID))
+            .unwrap_or_default();
         let (code, msg) = read_rsp(info);
-        self.emit(MdEvent::Subscribed { code, msg });
+        self.emit(MdEvent::Subscribed {
+            instrument,
+            code,
+            msg,
+        });
     }
 
     fn on_rsp_error(
@@ -268,6 +280,7 @@ mod tests {
     fn md_event_variants_constructible() {
         let _ = MdEvent::FrontConnected;
         let _ = MdEvent::Subscribed {
+            instrument: String::new(),
             code: 0,
             msg: String::new(),
         };

@@ -52,7 +52,10 @@ pub(crate) fn login_ready(
             anyhow::bail!("CTP 登录超时：前置连接事件未到达");
         }
         match h.next_event(EVENT_POLL_TIMEOUT) {
-            Some(CtpEvent::FrontConnected) => break,
+            Some(CtpEvent::FrontConnected) => {
+                tracing::debug!("CTP 登录步骤①：前置已连接 FrontConnected");
+                break;
+            }
             Some(CtpEvent::FrontDisconnected(reason)) => {
                 anyhow::bail!("CTP 前置断开（连接阶段）: {reason}")
             }
@@ -65,6 +68,7 @@ pub(crate) fn login_ready(
     if ret != 0 {
         anyhow::bail!("CTP 认证请求受理失败 code={ret}");
     }
+    tracing::debug!(code = ret, "CTP 登录步骤②：认证请求已受理");
 
     // ③ 登录三步状态机（每步受理码同样检查）。
     let mut stage = LoginStage::Authenticating;
@@ -86,13 +90,16 @@ pub(crate) fn login_ready(
                 if code != 0 {
                     anyhow::bail!("CTP 认证被拒 code={code} msg={msg}");
                 }
+                tracing::debug!("CTP 登录步骤②：认证通过 Authenticated");
                 let ret = h.login();
                 if ret != 0 {
                     anyhow::bail!("CTP 登录请求受理失败 code={ret}");
                 }
+                tracing::debug!(code = ret, "CTP 登录步骤③：登录请求已受理");
                 stage = LoginStage::LoggingIn;
             }
             (LoginStage::LoggingIn, CtpEvent::Login(_)) => {
+                tracing::debug!("CTP 登录步骤③：登录回报 Login，发起结算确认");
                 let ret = h.confirm_settlement();
                 if ret != 0 {
                     anyhow::bail!("CTP 结算确认请求受理失败 code={ret}");
@@ -100,6 +107,7 @@ pub(crate) fn login_ready(
                 stage = LoginStage::ConfirmingSettlement;
             }
             (LoginStage::ConfirmingSettlement, CtpEvent::SettlementConfirmed) => {
+                tracing::debug!("CTP 登录步骤③：结算确认完成 SettlementConfirmed");
                 return Ok(());
             }
             // 其余事件（如报单拒的 Error）在登录阶段忽略。
