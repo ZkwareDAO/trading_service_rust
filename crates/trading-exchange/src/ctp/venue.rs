@@ -1488,7 +1488,9 @@ fn resolve_cancel_target(
 /// 2. `order_ref == exchange_order_id`（受理态：此时 eid 还是自产 OrderRef）；
 /// 3. `order_ref == order_ref_hint`（同进程 cid→registry 反查值）。
 ///
-/// 查无（空/不匹配/只查当日）由调用方判 `Unavailable`，不判 NotExists。
+/// 查无（返回 None）由调用方 `finish_active_query` 分流：OrderSysID 交易日早于当前
+/// 登录交易日的跨日历史单→`Found(Canceled)`，其余（当日报单/无日期/参照日缺失）→
+/// `Unavailable`。本函数只做匹配，两种情况都不判 `NotExists`。
 fn select_order<'a>(
     rows: &'a [crate::ctp::core::event::OrderSnapshot],
     exchange_order_id: &str,

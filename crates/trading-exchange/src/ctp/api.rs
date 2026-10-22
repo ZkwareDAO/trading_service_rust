@@ -215,7 +215,11 @@ impl ExchangeApi for CtpApi {
     /// 查单：柜台只支持按 InstrumentID 拉当日全部委托，会话线程拉回后客户端匹配。
     ///
     /// 重启后以 exchange_order_id（OrderSysID）为准；同进程附 cid→registry
-    /// 反查出的 OrderRef 兜底。空/不匹配/断线/超时一律 Unavailable（不判 NotExists）。
+    /// 反查出的 OrderRef 兜底。查无分流（CTP 无历史委托查询，均不判 `NotExists`）：
+    /// * 当日报单 / eid 无日期 / 登录交易日缺失 / 断线超时 → `Unavailable`（下轮再试，
+    ///   绝不把在途 UNKNOWN 单误收敛）；
+    /// * OrderSysID 交易日前缀早于当前登录交易日（跨日历史单）且当日簿查无 →
+    ///   `Found(Canceled, 0 成交)`，交上层 `Found(终态)` 分支收口为已取消。
     async fn query_order(&self, instrument: &str, order: &OrderRef) -> OrderLookup {
         // 同进程：cid 反查本会话 OrderRef 作兜底匹配值（重启后 registry 空 → None）。
         let hint = self.order_refs.order_ref_of_cid(&order.client_order_id);
