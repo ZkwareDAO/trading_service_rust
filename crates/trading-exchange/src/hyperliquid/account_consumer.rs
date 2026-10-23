@@ -3,17 +3,16 @@
 //! 消费循环（订单→sink、脏信号→去抖→REST 对账、退避重连、在途防重叠）全部
 //! 复用 venue 无关的 [`crate::account_stream`]；本模块只保留：
 //! - [`HlUserProvider`]：按账户名取 [`HyperliquidUser`]（provider 实现）；
-//! - [`HlVenueConnector`]：supervisor 用的 per-account 工厂；
-//! - [`HlAccountUser`]：把 HyperliquidUser 适配为 [`crate::account_stream::AccountUser`]。
+//! - [`HlVenueConnector`]：supervisor 用的 per-account 工厂。
+//!
+//! [`HyperliquidUser`] 同时实现 `ExchangeApi + AccountEventStream`，经
+//! [`crate::account_stream`] 的 blanket impl 直接就是 `AccountUser`，
+//! 无需再写机械转发壳。
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use futures_util::stream::BoxStream;
-
 use crate::account_stream::{self, AccountUser};
-use crate::api::{AccountEvent, AccountEventStream, ExchangeApi};
 use crate::hyperliquid::venue::HyperliquidUser;
 use crate::port::{OrderEventSink, PositionSnapshotSink};
 
@@ -72,10 +71,10 @@ impl HlVenueConnector {
         let account_name = account.to_string();
 
         Some(tokio::spawn(async move {
-            // 闭包：把具体 HyperliquidUser 适配为 venue 无关 AccountUser。
+            // HyperliquidUser 经 blanket impl 直接就是 AccountUser，连接器直传主体。
             let user_for = |acc: &str| -> anyhow::Result<Arc<dyn AccountUser>> {
                 let user = users.hl_user(acc)?;
-                Ok(Arc::new(HlAccountUser(user)))
+                Ok(user as Arc<dyn AccountUser>)
             };
             account_stream::run(
                 EXCHANGE_NAME,
@@ -88,19 +87,5 @@ impl HlVenueConnector {
             )
             .await;
         }))
-    }
-}
-
-/// HyperliquidUser → AccountUser 适配（单元包装）。
-struct HlAccountUser(Arc<HyperliquidUser>);
-
-#[async_trait]
-impl AccountUser for HlAccountUser {
-    async fn subscribe_events(&self) -> anyhow::Result<BoxStream<'static, AccountEvent>> {
-        self.0.subscribe_account_events().await
-    }
-
-    async fn fetch_positions(&self) -> anyhow::Result<Vec<crate::api::PositionInfo>> {
-        self.0.get_positions().await
     }
 }

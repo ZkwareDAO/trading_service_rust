@@ -3,17 +3,16 @@
 //! 消费循环（订单→sink、脏信号→去抖→REST 对账、退避重连、在途防重叠）全部
 //! 复用 venue 无关的 [`crate::account_stream`]；本模块只保留：
 //! - [`DeribitUserProvider`]：按账户名取 [`DeribitUser`]（provider 实现）；
-//! - [`DeribitVenueConnector`]：supervisor 用的 per-account 工厂；
-//! - [`DeribitAccountUser`]：把 DeribitUser 适配为 [`crate::account_stream::AccountUser`]。
+//! - [`DeribitVenueConnector`]：supervisor 用的 per-account 工厂。
+//!
+//! [`DeribitUser`] 同时实现 `ExchangeApi + AccountEventStream`，经
+//! [`crate::account_stream`] 的 blanket impl 直接就是 `AccountUser`，
+//! 无需再写机械转发壳。
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use futures_util::stream::BoxStream;
-
 use crate::account_stream::{self, AccountUser};
-use crate::api::{AccountEvent, AccountEventStream, ExchangeApi};
 use crate::deribit::venue::DeribitUser;
 use crate::port::{OrderEventSink, PositionSnapshotSink};
 
@@ -65,10 +64,10 @@ impl DeribitVenueConnector {
         let account_name = account.to_string();
 
         Some(tokio::spawn(async move {
-            // 闭包：按账户名把具体 DeribitUser 适配为 venue 无关 AccountUser。
+            // DeribitUser 经 blanket impl 直接就是 AccountUser，连接器直传主体。
             let user_for = |acc: &str| -> anyhow::Result<Arc<dyn AccountUser>> {
                 let user = users.deribit_user(acc)?;
-                Ok(Arc::new(DeribitAccountUser(user)))
+                Ok(user as Arc<dyn AccountUser>)
             };
             account_stream::run(
                 EXCHANGE_NAME,
@@ -81,19 +80,5 @@ impl DeribitVenueConnector {
             )
             .await;
         }))
-    }
-}
-
-/// DeribitUser → AccountUser 适配（单元包装，不含额外状态）。
-struct DeribitAccountUser(Arc<DeribitUser>);
-
-#[async_trait]
-impl AccountUser for DeribitAccountUser {
-    async fn subscribe_events(&self) -> anyhow::Result<BoxStream<'static, AccountEvent>> {
-        self.0.subscribe_account_events().await
-    }
-
-    async fn fetch_positions(&self) -> anyhow::Result<Vec<crate::api::PositionInfo>> {
-        self.0.get_positions().await
     }
 }

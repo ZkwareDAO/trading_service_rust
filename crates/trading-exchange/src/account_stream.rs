@@ -18,7 +18,7 @@ use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use tokio::sync::Mutex;
 
-use crate::api::AccountEvent;
+use crate::api::{AccountEvent, AccountEventStream, ExchangeApi};
 use crate::backoff::ReconnectBackoff;
 use crate::port::{OrderEventSink, PositionSnapshotSink};
 use crate::reconcile::{ReconcileAction, ReconcileDebouncer};
@@ -38,6 +38,27 @@ pub trait AccountUser: Send + Sync {
 
     /// 拉 REST 持仓快照。
     async fn fetch_positions(&self) -> anyhow::Result<Vec<crate::api::PositionInfo>>;
+}
+
+///  blanket impl：任何同时具备交易 REST（[`ExchangeApi`]）与账户事件流
+/// （[`AccountEventStream`]）的用户主体，天然就是 [`AccountUser`]——
+///
+/// `subscribe_events` 直接委托 `subscribe_account_events`，`fetch_positions`
+/// 直接委托 `ExchangeApi::get_positions`，两方法签名一一对应，无需各交易所
+/// 再写仅做转发的机械适配壳（BinanceAccountUser / DeribitAccountUser /
+/// HlAccountUser 因此全部删除）。
+#[async_trait]
+impl<T> AccountUser for T
+where
+    T: ExchangeApi + AccountEventStream,
+{
+    async fn subscribe_events(&self) -> anyhow::Result<BoxStream<'static, AccountEvent>> {
+        AccountEventStream::subscribe_account_events(self).await
+    }
+
+    async fn fetch_positions(&self) -> anyhow::Result<Vec<crate::api::PositionInfo>> {
+        ExchangeApi::get_positions(self).await
+    }
 }
 
 /// 时序参数转毫秒（下限 1ms，避免零窗口忙循环）。
@@ -191,4 +212,87 @@ fn spawn_fetch(
         }
         // `_guard` 在此 drop，在途标记复位。
     });
+}
+
+#[cfg(test)]
+mod blanket_impl_tests {
+    //! Phase A：任何同时实现 ExchangeApi + AccountEventStream 的用户主体，
+    //! 都应能直接作为 AccountUser 使用（blanket impl），无需各所再写机械转发壳。
+
+    use super::*;
+    use crate::api::{
+        AccountEventStream, ExchangeApi, OrderAck, OrderLookup, OrderRef, PlaceOrderRequest,
+        PositionInfo, ReferencePrice,
+    };
+    use futures_util::stream::{self, BoxStream};
+    use rust_decimal::Decimal;
+    use trading_models::InstrumentType;
+
+    /// 最小双能力用户主体：仅本测试需要的两个方法有真实返回，其余 REST 方法 bail。
+    struct DualUser;
+
+    #[async_trait]
+    impl ExchangeApi for DualUser {
+        fn exchange(&self) -> &str {
+            "dual"
+        }
+        async fn place_order(&self, _: &PlaceOrderRequest) -> anyhow::Result<OrderAck> {
+            anyhow::bail!("unused")
+        }
+        async fn cancel_order(&self, _: &str, _: &OrderRef) -> anyhow::Result<OrderAck> {
+            anyhow::bail!("unused")
+        }
+        async fn query_order(&self, _: &str, _: &OrderRef) -> OrderLookup {
+            OrderLookup::Unavailable
+        }
+        async fn get_positions(&self) -> anyhow::Result<Vec<PositionInfo>> {
+            Ok(vec![PositionInfo {
+                instrument: "BTCUSDT".into(),
+                instrument_type: InstrumentType::Futures,
+                position_side: crate::api::OrderPositionSide::Both,
+                signed_quantity: Decimal::ONE,
+                entry_price: Decimal::new(100, 0),
+                mark_price: None,
+                unrealized_pnl: None,
+                leverage: None,
+                multiplier: None,
+                notional: None,
+                margin: None,
+                update_ms: None,
+            }])
+        }
+        async fn set_leverage(&self, _: &str, _: u32) -> anyhow::Result<()> {
+            anyhow::bail!("unused")
+        }
+        async fn get_reference_price(&self, _: &str) -> anyhow::Result<ReferencePrice> {
+            anyhow::bail!("unused")
+        }
+    }
+
+    #[async_trait]
+    impl AccountEventStream for DualUser {
+        async fn subscribe_account_events(
+            &self,
+        ) -> anyhow::Result<BoxStream<'static, crate::api::AccountEvent>> {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn dual_user_is_account_user_via_blanket_impl() {
+        // Arrange：一个只实现 ExchangeApi + AccountEventStream、没有任何手工壳的主体。
+        let dual = Arc::new(DualUser);
+
+        // Act：若无 blanket impl，本行编译失败（trait AccountUser 未实现）——即 RED。
+        let account_user: Arc<dyn AccountUser> = dual.clone();
+
+        // Assert：经 AccountUser trait 对象调度到的就是两个底层 trait 方法。
+        // subscribe_events 直接对应 subscribe_account_events（空流可立即取空）。
+        let mut events = account_user.subscribe_events().await.expect("empty stream");
+        assert!(events.next().await.is_none());
+        // fetch_positions 直接对应 ExchangeApi::get_positions。
+        let positions = account_user.fetch_positions().await.expect("positions");
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].instrument, "BTCUSDT");
+    }
 }
