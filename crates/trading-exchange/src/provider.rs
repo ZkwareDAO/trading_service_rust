@@ -144,6 +144,17 @@ pub trait VenueProvider: Send + Sync {
         account: &str,
     ) -> anyhow::Result<Arc<dyn ExchangeApi>>;
 
+    /// 构造某 (交易所, 标的类别) 的交易所级行情流单例（无认证、所有用户共享）。
+    ///
+    /// 与 build_api 对称；默认返回 Unsupported——xili 等不支持按需行情的所无需覆盖。
+    fn build_market_stream(
+        &self,
+        _exchange: &str,
+        _instrument_type: Option<&str>,
+    ) -> anyhow::Result<Arc<dyn crate::market::MarketDataStream>> {
+        anyhow::bail!("该交易所不支持统一行情流 MarketDataStream")
+    }
+
     /// 为某账户起一条账户事件 WS 任务；该所不支持 per-account 流时返回 None
     /// （未知所由注册表兜底为占位任务）。
     fn spawn_account_stream(

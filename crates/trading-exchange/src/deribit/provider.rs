@@ -2,14 +2,17 @@
 //! 唯一精确名；构造 [`DeribitUser`]、按需 spawn per-account 账户事件消费任务与
 //! 公共行情 worker。与 binance provider 平级、同构。
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio::task::JoinHandle;
+use trading_models::MarketKind;
 
 use crate::api::ExchangeApi;
 use crate::deribit::account_consumer::{DeribitUserProvider, DeribitVenueConnector};
-use crate::deribit::market;
+use crate::deribit::market::DeribitMarketFeed;
 use crate::deribit::venue::DeribitUser;
+use crate::market::{InterestSource, MarketDataStream};
+use crate::market_ws::{self, WsHubStream};
 use crate::port::OrderEventSink;
 use crate::provider::{ProviderDeps, VenueProvider};
 
@@ -19,11 +22,33 @@ const NAME: &str = "deribit";
 /// Deribit 套件 provider（持有装配依赖）。
 pub struct DeribitProvider {
     deps: ProviderDeps,
+    /// 交易所级行情流单例（首次取用即 spawn hub 驱动，进程内复用同一条连接）。
+    market_stream: OnceLock<Arc<WsHubStream>>,
 }
 
 impl DeribitProvider {
     pub fn new(deps: ProviderDeps) -> Self {
-        Self { deps }
+        Self {
+            deps,
+            market_stream: OnceLock::new(),
+        }
+    }
+
+    /// 懒创建并返回 deribit 行情 hub 单例（建一条 WsDriver 连接）。
+    fn ensure_market_stream(&self) -> anyhow::Result<Arc<WsHubStream>> {
+        let stream = self.market_stream.get_or_init(|| {
+            let feed = Arc::new(DeribitMarketFeed::new(
+                self.deps.http.clone(),
+                Arc::clone(&self.deps.rules),
+            ));
+            market_ws::spawn_hub(
+                "deribit-option",
+                feed,
+                Arc::clone(&self.deps.quotes),
+                self.deps.quote_observer.clone(),
+            )
+        });
+        Ok(Arc::clone(stream))
     }
 
     /// 构造某账户的具体用户主体（REST 与账户事件共用）。
@@ -88,6 +113,18 @@ impl VenueProvider for DeribitProvider {
         }
     }
 
+    fn build_market_stream(
+        &self,
+        _exchange: &str,
+        instrument_type: Option<&str>,
+    ) -> anyhow::Result<Arc<dyn MarketDataStream>> {
+        let product = trading_core::protocol::normalize_instrument_type(instrument_type);
+        if product != "option" {
+            anyhow::bail!("deribit 行情仅支持期权（instrument_type=option），收到 `{product}`");
+        }
+        Ok(self.ensure_market_stream()? as Arc<dyn MarketDataStream>)
+    }
+
     fn prepare_placement(
         &self,
         _venue: &str,
@@ -141,14 +178,16 @@ impl VenueProvider for DeribitProvider {
             tracing::warn!(provider = NAME, "未提供行情兴趣端口，跳过公共行情");
             return;
         };
-        market::spawn_worker(
-            self.deps.http.clone(),
-            Arc::clone(&self.deps.rules),
-            Arc::clone(&self.deps.quotes),
-            interests,
-            self.deps.quote_observer.clone(),
-            std::time::Duration::from_millis(500),
-        );
+        // 建 hub 单例并把系统行情来源（活跃仓位 ∪ 规则，过滤到 deribit/option）
+        // 注册为与句柄同寿的托管来源；驱动任务在 ensure 内已 spawn，空集也建连保活。
+        match self.ensure_market_stream() {
+            Ok(stream) => stream.register_managed_prices(Arc::new(InterestSource::new(
+                interests,
+                trading_models::Venue::Deribit,
+                MarketKind::Option,
+            ))),
+            Err(e) => tracing::error!(provider = NAME, error = %e, "deribit 行情 hub 启动失败"),
+        }
     }
 }
 

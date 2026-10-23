@@ -5,15 +5,17 @@
 //! * [`BinanceProvider`]：注册表用的套件入口，仅覆盖 binance 唯一精确名，
 //!   并在进程级启动规则同步与公共行情任务。
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio::task::JoinHandle;
 
 use crate::api::ExchangeApi;
 use crate::binance::client::{BinanceFuturesClientCache, BinanceFuturesOptions};
-use crate::binance::services::spawn_shared;
+use crate::binance::services::{self, spawn_market_hubs};
 use crate::binance::user_stream::{BinanceUserProvider, BinanceVenueConnector};
 use crate::binance::venue::BinanceUser;
+use crate::market::MarketDataStream;
+use crate::market_ws::WsHubStream;
 use crate::port::{CredentialResolver, OrderEventSink};
 use crate::provider::{ProviderDeps, VenueProvider};
 
@@ -83,6 +85,8 @@ impl BinanceUserProvider for BinanceUsers {
 pub struct BinanceProvider {
     users: Arc<BinanceUsers>,
     deps: ProviderDeps,
+    /// 现货/合约两条全市场行情 hub（首次取用即一起构造，进程单例）。
+    market_hubs: OnceLock<(Arc<WsHubStream>, Arc<WsHubStream>)>,
 }
 
 impl BinanceProvider {
@@ -92,7 +96,21 @@ impl BinanceProvider {
             Arc::clone(&deps.rules),
             deps.rest_timeout.as_millis().max(1) as u64,
         ));
-        Self { users, deps }
+        Self {
+            users,
+            deps,
+            market_hubs: OnceLock::new(),
+        }
+    }
+
+    /// 懒构造并返回 (现货, 合约) 两条全市场行情 hub 单例。
+    fn ensure_market_hubs(&self) -> &(Arc<WsHubStream>, Arc<WsHubStream>) {
+        self.market_hubs.get_or_init(|| {
+            spawn_market_hubs(
+                Arc::clone(&self.deps.quotes),
+                self.deps.quote_observer.clone(),
+            )
+        })
     }
 }
 
@@ -128,6 +146,21 @@ impl VenueProvider for BinanceProvider {
         }
     }
 
+    fn build_market_stream(
+        &self,
+        _exchange: &str,
+        instrument_type: Option<&str>,
+    ) -> anyhow::Result<Arc<dyn MarketDataStream>> {
+        let (spot, futures) = self.ensure_market_hubs();
+        let product = trading_core::protocol::normalize_instrument_type(instrument_type);
+        match product.as_str() {
+            // 现货行情 hub 提供（现货下单 REST 尚未接入，但公共行情可用）。
+            "spot" => Ok(Arc::clone(spot) as Arc<dyn MarketDataStream>),
+            "futures" => Ok(Arc::clone(futures) as Arc<dyn MarketDataStream>),
+            other => anyhow::bail!("binance 行情不支持产品 `{other}`"),
+        }
+    }
+
     fn spawn_account_stream(
         &self,
         exchange: &str,
@@ -157,13 +190,13 @@ impl VenueProvider for BinanceProvider {
             );
             return;
         }
-        // 交易所级公共任务：规则同步/公共行情恒定正式网，与账户无关。
-        // 行情写价后经观察口驱动仅本交易所仓位的重估（现货会在观察口内被忽略）。
-        spawn_shared(
+        // 规则同步（保留）：启动全量 + 定时整表刷新，恒定正式网、与账户无关。
+        services::spawn_rule_sync(
             Arc::clone(&self.deps.rules),
-            Arc::clone(&self.deps.quotes),
             self.deps.rule_refresh_interval,
-            self.deps.quote_observer.clone(),
         );
+        // 公共行情：现货 last + 合约 mark 两条全市场 hub（URL 即订阅全市场，
+        // 空集=全市场、建连即推）。ensure 内已 spawn 驱动任务。
+        let _ = self.ensure_market_hubs();
     }
 }

@@ -7,8 +7,9 @@
 //! ## 两类主体
 //! * **用户主体**：一个「用户 × 交易所」一个对象、一套凭据，同时实现
 //!   [`ExchangeApi`] + [`AccountEventStream`]。
-//! * **交易所主体**：进程内每交易所一个无认证对象，实现 [`MarketDataStream`] 与
-//!   [`RuleFetcher`]（公开行情 + 公开交易规则），所有用户共享。规则不随用户重复拉取。
+//! * **交易所主体**：进程内每交易所一个无认证对象，实现公开行情
+//!   （`crate::market::MarketDataStream`）与 [`RuleFetcher`]（公开交易规则），
+//!   所有用户共享。规则不随用户重复拉取。
 //!
 //! ## 两套订单号
 //! * `client_order_id`：本系统 `0x`+32hex，下单即有、全局唯一、始终携带；
@@ -201,7 +202,7 @@ pub struct ReferencePrice {
 }
 
 // =====================================================================
-// 私有 / 公开数据流事件
+// 私有数据流事件
 // =====================================================================
 
 /// 账户级"脏信号"：只通知仓位可能变了，**真值一律再走 REST `get_positions` 拉取**，
@@ -220,17 +221,6 @@ pub enum AccountEvent {
     Order(OrderState),
     /// 账户/仓位变化脏信号（ACCOUNT_UPDATE / clearinghouseState / user.changes.*）。
     Account(AccountDirty),
-}
-
-/// 公开行情逐档/聚合价。
-#[derive(Debug, Clone)]
-pub struct PriceTick {
-    pub instrument: String,
-    /// 最新/中间/标记价（按订阅口径）。
-    pub price: Decimal,
-    pub best_bid: Option<Decimal>,
-    pub best_ask: Option<Decimal>,
-    pub event_ms: i64,
 }
 
 // =====================================================================
@@ -373,7 +363,8 @@ pub trait ExchangeApi: Send + Sync {
 /// 交易规则抓取能力（REST、**公开数据、无认证**）。
 ///
 /// 规则不属于某个用户：进程内每个交易所一个无认证对象实现本 trait（可与
-/// [`MarketDataStream`] 同对象），在所有用户间共享，**全所只同步一次**，不随账户重复。
+/// 统一行情流 `crate::market::MarketDataStream` 同对象），在所有用户间共享，
+/// **全所只同步一次**，不随账户重复。
 #[async_trait]
 pub trait RuleFetcher: Send + Sync {
     fn exchange(&self) -> &str;
@@ -399,20 +390,6 @@ pub trait AccountEventStream: Send + Sync {
     /// 实现需自行保活，并在断线后按退避重连、重连后补发一次账户快照信号。
     async fn subscribe_account_events(&self) -> anyhow::Result<BoxStream<'static, AccountEvent>>;
 }
-
-/// 公开行情流：交易所主体、无认证、所有用户共享。
-#[async_trait]
-pub trait MarketDataStream: Send + Sync {
-    /// 订阅给定标的的价格/盘口；空列表表示订阅全市场（如币安 !miniTicker、HL allMids）。
-    async fn subscribe_prices(
-        &self,
-        instruments: &[String],
-    ) -> anyhow::Result<BoxStream<'static, PriceTick>>;
-}
-
-/// 需要完整能力（交易 + 账户事件回报）处使用的组合约束。
-pub trait UserVenue: ExchangeApi + AccountEventStream {}
-impl<T: ExchangeApi + AccountEventStream> UserVenue for T {}
 
 #[cfg(test)]
 mod order_ref_tests {

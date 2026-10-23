@@ -1,118 +1,94 @@
-//! Deribit 公共行情 WS：一条**恒定主网**连接，按「持仓 ∪ 规则」兴趣集动态
-//! subscribe/unsubscribe `ticker.<instrument>.100ms`；断线清空已订阅集整体重放。
+//! Deribit 公共行情 **协议层（feed）**：只保留该所协议纯函数 + 一个 [`DeribitMarketFeed`]。
 //!
-//! ticker 帧原子携带 mark 与 best bid/ask → 字段级写 `QuoteTable{mark, book}`，
-//! 并回调 QuoteObserver 驱动期权仓位重估。
-//!
-//! 订阅规划与 ticker 解析做成纯函数（TDD）；连接/重连为 worker。
+//! 生命周期（建连/退避/Ping/看门狗/500ms 对账/重连整体重放）已收口到
+//! [`crate::market_ws`] 的 `WsDriver`；本模块只描述 deribit：
+//! - 价格频道 `ticker.<instrument>.100ms`：ticker 帧原子带 mark + best bid/ask，
+//!   `write_quote` 字段级写 `QuoteTable{mark, book}` 并回调 observer（与旧 worker 等价）；
+//! - K线频道 `chart.trades.<instrument>.1`：仅在分钟桶翻转（收盘）时回调定稿 bar；
+//! - `on_desired_async` 对缺规格标的拉 `public/get_instrument` 预热（旧 warm_specs 搬入）。
 //!
 //! 见 `docs/行情订阅模型.md` §4.3/5.4。
 
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
-use futures_util::{SinkExt, StreamExt};
+use async_trait::async_trait;
+use futures_util::SinkExt;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-
+use trading_core::order_rule::OrderRuleTable;
 use trading_core::quote::{QuoteTable, QuoteUpdate};
 use trading_models::{Instrument, MarketKind, TopOfBook, Venue};
 
-use crate::backoff::ReconnectBackoff;
-use crate::deribit::mapping::parse_subscription;
-use crate::deribit::rpc;
-use crate::deribit::spec;
-use crate::port::{InterestKey, MarketInterest, QuoteObserver};
+use crate::market::{Kline, KlineInterval, PriceBasis, PriceTick};
+use crate::market_hub::SubsPlan;
+use crate::market_ws::{ChannelPlan, FeedMessage, WsMarketFeed};
+use crate::port::QuoteObserver;
+use crate::ws::WsStream;
 
-/// 行情流主动 Ping 间隔：即使订阅集为空（无持仓/规则、无 ticker 推帧）也保持有帧，
-/// 重置服务端/代理/NAT 空闲计时。
-const PING_INTERVAL: Duration = Duration::from_secs(10);
-/// 半开看门狗检查周期 / 空闲上限：超过该时长无任何帧即判死连重连。
-const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// deribit 交易所标识（写入 Kline.venue）。
+pub const VENUE: &str = "deribit";
 
-/// ticker 频道名：`ticker.<instrument>.100ms`。
+/// 价格频道名：`ticker.<instrument>.100ms`。
 pub(crate) fn ticker_channel(symbol: &str) -> String {
     format!("ticker.{symbol}.100ms")
 }
 
-/// 订阅规划：desired 与 subscribed 的差集。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SubsPlan {
-    pub to_sub: Vec<String>,
-    pub to_unsub: Vec<String>,
+/// 1 分钟 K线频道名：`chart.trades.<instrument>.1`（resolution=1 分钟）。
+pub(crate) fn chart_channel(symbol: &str) -> String {
+    format!("chart.trades.{symbol}.1")
 }
 
-/// 计算 desired vs subscribed 的差集：新增加订阅、多余的退订（排序保证确定性）。
-pub fn reconcile_subs(desired: &HashSet<String>, subscribed: &HashSet<String>) -> SubsPlan {
-    let mut to_sub: Vec<String> = desired.difference(subscribed).cloned().collect();
-    let mut to_unsub: Vec<String> = subscribed.difference(desired).cloned().collect();
-    to_sub.sort();
-    to_unsub.sort();
-    SubsPlan { to_sub, to_unsub }
+/// 从合约集合得到要订阅的 ticker 频道集合。
+fn price_channels(symbols: &BTreeSet<String>) -> HashSet<String> {
+    symbols.iter().map(|s| ticker_channel(s)).collect()
 }
 
-/// 从兴趣集（已在宿主侧只给 deribit/option）得到要订阅的 ticker 频道集合（去重）。
-///
-/// 防御性再过滤一次 venue/kind：只订阅 deribit option 标的。
-pub fn desired_channels(keys: &[InterestKey]) -> HashSet<String> {
-    keys.iter()
-        .filter(|k| k.venue == Venue::Deribit && k.kind == MarketKind::Option)
-        .map(|k| ticker_channel(&k.symbol))
+/// 从合约集合得到要订阅的 chart.trades 频道集合。
+fn bar_channels(symbols: &BTreeSet<String>) -> HashSet<String> {
+    symbols.iter().map(|s| chart_channel(s)).collect()
+}
+
+/// 找出「属于 deribit 期权、但规格表尚无行」的标的（有序去重）。
+pub fn missing_spec_symbols(symbols: &BTreeSet<String>, rules: &OrderRuleTable) -> Vec<String> {
+    symbols
+        .iter()
+        .filter(|symbol| {
+            let key = trading_models::OrderRuleKey::new(
+                VENUE,
+                trading_models::InstrumentType::Option,
+                symbol.as_str(),
+            );
+            rules.get(&key).is_none()
+        })
+        .cloned()
         .collect()
 }
 
-/// 从兴趣集中找出「属于 deribit option、但规格表尚无行」的标的（去重、有序）。
+/// 对缺规格标的逐个拉 public `get_instrument`、解析后写规格表。
 ///
-/// worker 据此用 public `get_instrument` 预热静态规格（tick/步长/合约面值），
-/// 使规则引擎的同步预检一定能取到规格，不必在预检里做网络 IO。
-pub fn missing_spec_symbols(
-    keys: &[InterestKey],
-    rules: &trading_core::order_rule::OrderRuleTable,
-) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for k in keys {
-        if k.venue != Venue::Deribit || k.kind != MarketKind::Option {
-            continue;
-        }
-        if out.iter().any(|s| s == &k.symbol) {
-            continue;
-        }
-        let spec_key = trading_models::OrderRuleKey::new(
-            "deribit",
-            trading_models::InstrumentType::Option,
-            &k.symbol,
-        );
-        if rules.get(&spec_key).is_none() {
-            out.push(k.symbol.clone());
-        }
-    }
-    out.sort();
-    out
-}
-
-/// 对兴趣集中缺规格的标的逐个拉取 public `get_instrument`、解析后写入规格表。
-///
-/// 泛型注入 `fetcher`（生产侧走 [`rpc::call`]），便于单测；单个标的拉取/解析
-/// 失败仅告警并跳过（下轮 reconcile 重试），不影响订阅 diff。返回本次新写入条数。
-pub async fn warm_missing_specs<F, Fut>(
-    keys: &[InterestKey],
-    rules: &trading_core::order_rule::OrderRuleTable,
-    fetcher: F,
-) -> usize
-where
-    F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<Value>>,
-{
-    let wanted = missing_spec_symbols(keys, rules);
+/// 单个标的拉取/解析失败仅告警跳过（下轮重试），不影响订阅 diff。返回本次新写入条数。
+pub async fn warm_missing_specs(
+    symbols: &BTreeSet<String>,
+    rules: &OrderRuleTable,
+    http: &reqwest::Client,
+) -> usize {
+    let wanted = missing_spec_symbols(symbols, rules);
     let mut written = 0usize;
     for symbol in wanted {
-        match fetcher(symbol.clone()).await {
+        let result = crate::deribit::rpc::call(
+            http.clone(),
+            crate::deribit::rpc::rest_base(false),
+            "public/get_instrument",
+            serde_json::json!({ "instrument_name": symbol }),
+            None,
+        )
+        .await;
+        match result {
             Ok(result) => {
                 let fetched = chrono::Utc::now().timestamp_millis();
-                match spec::parse_instrument(&result.to_string(), fetched) {
+                match crate::deribit::spec::parse_instrument(&result.to_string(), fetched) {
                     Ok(row) => {
                         tracing::info!(instrument = symbol, "合约规格已预热写表");
                         rules.put(row);
@@ -137,6 +113,15 @@ pub struct TickerTick {
     pub ask: Option<Decimal>,
 }
 
+fn dec_field(v: Option<&Value>) -> Option<Decimal> {
+    v.and_then(|x| match x {
+        Value::String(s) => s.parse().ok(),
+        Value::Number(_) => Decimal::from_str_exact(&x.to_string()).ok(),
+        Value::Null => None,
+        _ => None,
+    })
+}
+
 /// 解析 ticker data：mark_price 必填；best_bid_price/best_ask_price 可缺侧。
 pub fn parse_ticker(data: &Value) -> Option<TickerTick> {
     let mark = dec_field(data.get("mark_price"))?;
@@ -147,18 +132,9 @@ pub fn parse_ticker(data: &Value) -> Option<TickerTick> {
     })
 }
 
-fn dec_field(v: Option<&Value>) -> Option<Decimal> {
-    v.and_then(|x| match x {
-        Value::String(s) => s.parse().ok(),
-        Value::Number(_) => Decimal::from_str_exact(&x.to_string()).ok(),
-        Value::Null => None,
-        _ => None,
-    })
-}
-
 /// 一帧 subscription：若是 `ticker.*.100ms`，返回 (symbol, tick)；否则 None。
 pub fn parse_ticker_subscription(raw: &str) -> Option<(String, TickerTick)> {
-    let (channel, data) = parse_subscription(raw).ok()??;
+    let (channel, data) = crate::deribit::mapping::parse_subscription(raw).ok()??;
     let symbol = channel
         .strip_prefix("ticker.")
         .and_then(|rest| rest.strip_suffix(".100ms"))?
@@ -167,214 +143,304 @@ pub fn parse_ticker_subscription(raw: &str) -> Option<(String, TickerTick)> {
     Some((symbol, tick))
 }
 
-// =====================================================================
-// 行情 worker：主网恒连 + 周期 reconcile 订阅 + ticker 帧写表
-// =====================================================================
-
-/// 公共行情 WS：恒定主网（即使账户是 testnet）。
-/// 路径与官方/Go 服务一致，不带结尾斜杠；迁移期代理偶发 404 由重连退避兜住。
-fn market_ws_url() -> &'static str {
-    "wss://www.deribit.com/ws/api/v2"
+/// chart.trades 一根蜡烛（deribit v2 字段：t=桶起点 ms，o/h/l/c 字符串价，v 量）。
+#[derive(Debug, Clone, Copy)]
+struct RawCandle {
+    start_ms: i64,
+    open: Decimal,
+    high: Decimal,
+    low: Decimal,
+    close: Decimal,
+    volume: Decimal,
 }
 
-/// 启动行情 worker（detached，随进程生命周期）。由 provider 在激活名单含 deribit 时 spawn。
-pub fn spawn_worker(
+fn parse_candle(v: &Value) -> Option<RawCandle> {
+    let get_dec = |k: &str| dec_field(v.get(k));
+    Some(RawCandle {
+        start_ms: v.get("t")?.as_i64()?,
+        open: get_dec("o")?,
+        high: get_dec("h")?,
+        low: get_dec("l")?,
+        close: get_dec("c")?,
+        volume: get_dec("v").unwrap_or(Decimal::ZERO),
+    })
+}
+
+/// 解析一帧 chart.trades：data 为 `{ "<instrument>": [ candles... ] }`（聚合/推送同形），
+/// 取出每个 instrument 的蜡烛数组（解析失败的元素跳过）。
+fn parse_chart_frame(raw: &str) -> Vec<(String, Vec<RawCandle>)> {
+    let Ok(v) = serde_json::from_str::<Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(channel) = v.pointer("/params/channel").and_then(|x| x.as_str()) else {
+        return Vec::new();
+    };
+    let Some(symbol) = channel
+        .strip_prefix("chart.trades.")
+        .and_then(|rest| rest.strip_suffix(".1"))
+    else {
+        return Vec::new();
+    };
+    // data 嵌在 params 下（subscription 信封）。chart.trades.<inst> 频道已按合约
+    // 区分，常见为**裸蜡烛数组**；也兼容 { "<instrument>": [...] } 与 {"ticks":[...]}。
+    let data = v.pointer("/params/data");
+    let arr = data
+        .and_then(|d| d.as_array())
+        .or_else(|| data.and_then(|d| d.get(symbol).and_then(|x| x.as_array())))
+        .or_else(|| data.and_then(|d| d.get("ticks").and_then(|x| x.as_array())));
+    let Some(arr) = arr else { return Vec::new() };
+    let candles: Vec<RawCandle> = arr.iter().filter_map(parse_candle).collect();
+    if candles.is_empty() {
+        Vec::new()
+    } else {
+        vec![(symbol.to_string(), candles)]
+    }
+}
+
+/// 把桶起点 ms（UTC）转为 YYYYMMDD 交易日（deribit 7×24，按 UTC 自然日）。
+fn trading_day_of(start_ms: i64) -> u32 {
+    use chrono::TimeZone;
+    let dt = chrono::Utc
+        .timestamp_millis_opt(start_ms)
+        .single()
+        .unwrap_or_default();
+    dt.format("%Y%m%d").to_string().parse().unwrap_or(0)
+}
+
+// =====================================================================
+// feed：WsDriver 协议端口实现
+// =====================================================================
+
+/// deribit 行情协议（恒定主网、无认证）。进程一个实例，被 `WsDriver` 驱动。
+pub struct DeribitMarketFeed {
     http: reqwest::Client,
-    rules: Arc<trading_core::order_rule::OrderRuleTable>,
-    quotes: Arc<QuoteTable>,
-    interests: Arc<dyn MarketInterest>,
-    observer: Option<Arc<dyn QuoteObserver>>,
-    reconcile_interval: Duration,
-) {
-    tokio::spawn(async move {
-        let mut backoff = ReconnectBackoff::new();
-        loop {
-            if let Some(wait) = backoff.next_wait() {
-                tokio::time::sleep(wait).await;
-            }
-            let result = run_worker(
-                &http,
-                &rules,
-                &quotes,
-                interests.as_ref(),
-                observer.as_deref(),
-                reconcile_interval,
-            )
-            .await;
-            if let Err(e) = result {
-                tracing::warn!(error = %e, "deribit market ws ended; reconnecting");
-            }
-            // 连接结束（断开/错误）→ 退避重连；重连后 subscribed 清空整体重放。
-            backoff.note_retry();
-        }
-    });
+    rules: Arc<OrderRuleTable>,
+    /// chart.trades 收盘判定：每合约最近一根「成形中」蜡烛；观察到下一桶起点时，
+    /// 上一根即定稿。
+    last_candle: Mutex<HashMap<String, RawCandle>>,
 }
 
-/// 单次连接：握手 → 周期 reconcile 订阅 / 读帧，直到关闭/错误。
-async fn run_worker(
-    http: &reqwest::Client,
-    rules: &trading_core::order_rule::OrderRuleTable,
-    quotes: &QuoteTable,
-    interests: &dyn MarketInterest,
-    observer: Option<&dyn QuoteObserver>,
-    reconcile_interval: Duration,
-) -> anyhow::Result<()> {
-    let mut ws = crate::ws::connect(market_ws_url()).await?;
-    // 本连接已订阅频道（连接重建即清空 → 整体重放）。
-    let mut subscribed: HashSet<String> = HashSet::new();
-    let mut reconcile_tick = tokio::time::interval(reconcile_interval);
-    // 主动 Ping 定时器 + 空闲看门狗（与币安行情流同口径 10s/20s）。
-    let mut ping_tick = tokio::time::interval(PING_INTERVAL);
-    let mut watchdog_tick = tokio::time::interval(WATCHDOG_INTERVAL);
-    let mut last_frame = Instant::now();
-
-    loop {
-        tokio::select! {
-            // 周期：读兴趣集 → 预热规格 → diff → subscribe/unsubscribe。
-            _ = reconcile_tick.tick() => {
-                let keys = interests.interests();
-                // 缺规格的标的先拉 public/get_instrument 写表（与订阅同一兴趣集）。
-                let http_c = http.clone();
-                let n = warm_missing_specs(&keys, rules, move |symbol| {
-                    let http_c = http_c.clone();
-                    async move {
-                        rpc::call(
-                            http_c,
-                            rpc::rest_base(false),
-                            "public/get_instrument",
-                            serde_json::json!({ "instrument_name": symbol }),
-                            None,
-                        )
-                        .await
-                    }
-                })
-                .await;
-                if n > 0 {
-                    tracing::info!(count = n, "reconcile 预热合约规格");
-                }
-                let desired = desired_channels(&keys);
-                let plan = reconcile_subs(&desired, &subscribed);
-                if !plan.to_sub.is_empty() {
-                    send_sub(&mut ws, "public/subscribe", &plan.to_sub).await?;
-                    subscribed.extend(plan.to_sub.iter().cloned());
-                }
-                if !plan.to_unsub.is_empty() {
-                    send_sub(&mut ws, "public/unsubscribe", &plan.to_unsub).await?;
-                    for ch in &plan.to_unsub {
-                        subscribed.remove(ch);
-                    }
-                }
-            }
-            // 主动保活：周期发一帧 Ping（即使无订阅也保持有帧）。
-            _ = ping_tick.tick() => {
-                ws.send(WsMessage::Ping(Default::default())).await?;
-            }
-            // 半开/空订阅看门狗：超 IDLE_TIMEOUT 无任何帧 → 判死重连。
-            _ = watchdog_tick.tick() => {
-                if last_frame.elapsed() >= IDLE_TIMEOUT {
-                    anyhow::bail!("market stream idle timeout, reconnecting");
-                }
-            }
-            // 读帧：ticker → 写 QuoteTable + observer。
-            msg = ws.next() => {
-                let Some(msg) = msg else { break };
-                // 任意入站帧（含服务端 Ping/Pong）证明存活，刷新看门狗。
-                last_frame = Instant::now();
-                let text = match msg? {
-                    WsMessage::Text(t) => t.as_str().to_string(),
-                    WsMessage::Ping(p) => { ws.send(WsMessage::Pong(p)).await?; continue; }
-                    WsMessage::Close(_) => break,
-                    _ => continue,
-                };
-                if let Some((symbol, tick)) = parse_ticker_subscription(&text) {
-                    apply_tick(quotes, observer, &symbol, tick);
-                }
-            }
+impl DeribitMarketFeed {
+    pub fn new(http: reqwest::Client, rules: Arc<OrderRuleTable>) -> Self {
+        Self {
+            http,
+            rules,
+            last_candle: Mutex::new(HashMap::new()),
         }
     }
-    Ok(())
+
+    /// 公共行情 WS：恒定主网（即使账户是 testnet），无尾斜杠。
+    fn market_ws_url() -> &'static str {
+        "wss://www.deribit.com/ws/api/v2"
+    }
+
+    /// 组装 subscribe/unsubscribe JSON-RPC 帧。
+    fn rpc_frame(method: &str, channels: &[String]) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": method,
+            "params": { "channels": channels },
+        })
+        .to_string()
+    }
+
+    /// 把一根已确认收盘的蜡烛转为统一 [`Kline`]。
+    fn finalize_bar(symbol: &str, c: &RawCandle) -> Kline {
+        Kline {
+            venue: VENUE.to_string(),
+            symbol: symbol.to_string(),
+            interval: KlineInterval::M1,
+            trading_day: trading_day_of(c.start_ms),
+            start_ms: c.start_ms,
+            end_ms: c.start_ms + 60_000,
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close,
+            // 三家原生 K线量为浮点，统一 Kline.volume 取整（手/张口径由各所定义）。
+            volume: c.volume.to_string().parse::<i64>().unwrap_or(0),
+            turnover: Decimal::ZERO,
+            open_interest: Decimal::ZERO,
+        }
+    }
 }
 
-/// 发送 subscribe/unsubscribe 请求。
-async fn send_sub(
-    ws: &mut crate::ws::WsStream,
-    method: &str,
-    channels: &[String],
-) -> anyhow::Result<()> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0", "id": 1,
-        "method": method,
-        "params": { "channels": channels },
-    });
-    ws.send(WsMessage::Text(body.to_string().into())).await?;
-    Ok(())
-}
+#[async_trait]
+impl WsMarketFeed for DeribitMarketFeed {
+    fn url(&self) -> &str {
+        Self::market_ws_url()
+    }
 
-/// ticker → QuoteTable 字段级写入（mark + book），并回调 observer 驱动仓位重估。
-fn apply_tick(
-    quotes: &QuoteTable,
-    observer: Option<&dyn QuoteObserver>,
-    symbol: &str,
-    tick: TickerTick,
-) {
-    let now = chrono::Utc::now().timestamp_millis();
-    let book = TopOfBook::new(tick.bid, tick.ask);
-    let update = QuoteUpdate {
-        last: None,
-        mark: Some(tick.mark),
-        mid: None,
-        book: Some(book),
-        ts_exchange_ms: now,
-        ts_recv_ms: now,
-    };
-    let inst = Instrument::new(Venue::Deribit, MarketKind::Option, symbol);
-    quotes.apply(&inst, update);
-    if let Some(ob) = observer {
-        ob.on_quote(Venue::Deribit, MarketKind::Option, symbol, tick.mark);
+    fn reconcile(
+        &self,
+        price_symbols: &BTreeSet<String>,
+        bar_symbols: &BTreeSet<String>,
+        subscribed: &HashSet<String>,
+    ) -> ChannelPlan {
+        // 同一合约可能同时要价格与 K线：ticker 与 chart.trades 是两个不同频道，各自 diff。
+        let mut desired = price_channels(price_symbols);
+        desired.extend(bar_channels(bar_symbols));
+        let plan = SubsPlan::diff(&desired, subscribed);
+        ChannelPlan {
+            subscribe: plan.to_sub,
+            unsubscribe: plan.to_unsub,
+        }
+    }
+
+    async fn send_subscribe(&self, ws: &mut WsStream, channels: &[String]) -> anyhow::Result<()> {
+        ws.send(WsMessage::Text(
+            Self::rpc_frame("public/subscribe", channels).into(),
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn send_unsubscribe(&self, ws: &mut WsStream, channels: &[String]) -> anyhow::Result<()> {
+        ws.send(WsMessage::Text(
+            Self::rpc_frame("public/unsubscribe", channels).into(),
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn on_desired_async(
+        &self,
+        price_symbols: &BTreeSet<String>,
+        _bar_symbols: &BTreeSet<String>,
+    ) {
+        // 旧 worker 行为：先为缺规格的期权标的预热 get_instrument，再订阅。
+        let n = warm_missing_specs(price_symbols, &self.rules, &self.http).await;
+        if n > 0 {
+            tracing::info!(count = n, "reconcile 预热合约规格");
+        }
+    }
+
+    fn decode(&self, text: &str) -> FeedMessage {
+        let mut out = FeedMessage::default();
+
+        // 价格：ticker.*.100ms。
+        if let Some((symbol, tick)) = parse_ticker_subscription(text) {
+            let now = chrono::Utc::now().timestamp_millis();
+            out.ticks.push(PriceTick {
+                symbol,
+                basis: PriceBasis::Mark,
+                price: tick.mark,
+                best_bid: tick.bid,
+                best_ask: tick.ask,
+                volume: None,
+                event_ms: now,
+            });
+        }
+
+        // K线：chart.trades 仅在桶翻转时把上一根定稿。
+        for (symbol, mut candles) in parse_chart_frame(text) {
+            // 同帧多根按起点升序处理（补推/批量）。
+            candles.sort_by_key(|c| c.start_ms);
+            let mut last = self.last_candle.lock().expect("deribit candle lock");
+            for c in candles {
+                let prev = last.get(&symbol).copied();
+                match prev {
+                    Some(prev) if prev.start_ms < c.start_ms => {
+                        // 见到新桶：上一根定稿。
+                        out.bars.push(Self::finalize_bar(&symbol, &prev));
+                        last.insert(symbol.clone(), c);
+                    }
+                    Some(_) => {
+                        // 同桶更新或乱序回退：覆盖/记录，不定稿（回退不回拨已发布 bar）。
+                        last.insert(symbol.clone(), c);
+                    }
+                    None => {
+                        // 首见：只记录，不定稿。
+                        last.insert(symbol.clone(), c);
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    fn write_quote(
+        &self,
+        tick: &PriceTick,
+        quotes: &QuoteTable,
+        observer: Option<&dyn QuoteObserver>,
+    ) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let book = TopOfBook::new(tick.best_bid, tick.best_ask);
+        let update = QuoteUpdate {
+            last: None,
+            mark: Some(tick.price),
+            mid: None,
+            book: Some(book),
+            ts_exchange_ms: now,
+            ts_recv_ms: now,
+        };
+        let inst = Instrument::new(Venue::Deribit, MarketKind::Option, &tick.symbol);
+        quotes.apply(&inst, update);
+        if let Some(ob) = observer {
+            ob.on_quote(Venue::Deribit, MarketKind::Option, &tick.symbol, tick.price);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
-
-    fn set(items: &[&str]) -> HashSet<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
 
     fn dec(s: &str) -> Decimal {
-        Decimal::from_str(s).unwrap()
+        s.parse().unwrap()
     }
 
-    #[test]
-    fn reconcile_diffs_desired_and_subscribed() {
-        let desired = set(&["a", "b"]);
-        let subscribed = set(&["b", "c"]);
-        let plan = reconcile_subs(&desired, &subscribed);
-        assert_eq!(plan.to_sub, vec!["a".to_string()]);
-        assert_eq!(plan.to_unsub, vec!["c".to_string()]);
-    }
-
-    #[test]
-    fn reconcile_no_change_is_empty() {
-        let s = set(&["a"]);
-        assert_eq!(reconcile_subs(&s, &s), SubsPlan::default());
+    fn syms(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
     fn ticker_channel_name() {
         assert_eq!(ticker_channel("BTC-1"), "ticker.BTC-1.100ms");
+        assert_eq!(chart_channel("BTC-1"), "chart.trades.BTC-1.1");
     }
 
-    /// 构造一个已写入规格表的期权标的。
-    fn seed_spec(rules: &trading_core::order_rule::OrderRuleTable, symbol: &str) {
-        use trading_models::{InstrumentType, OrderRule, QtyUnit};
-        rules.put(OrderRule::new(
-            "deribit",
-            symbol,
-            InstrumentType::Option,
-            QtyUnit::Contract,
+    #[test]
+    fn reconcile_maps_symbols_to_channels_and_diffs() {
+        let feed = Arc::new(DeribitMarketFeed::new(
+            reqwest::Client::new(),
+            Arc::new(OrderRuleTable::default()),
+        ));
+        // 已订阅 b 的 ticker；期望价格 {a,b}、K线 {b}。
+        let mut subscribed = HashSet::new();
+        subscribed.insert("ticker.b.100ms".to_string());
+        let plan = feed.reconcile(&syms(&["a", "b"]), &syms(&["b"]), &subscribed);
+        // 新增：a 的 ticker + b 的 chart.trades；无退订。
+        assert_eq!(
+            plan.subscribe,
+            vec!["chart.trades.b.1".to_string(), "ticker.a.100ms".to_string()]
+        );
+        assert!(plan.unsubscribe.is_empty());
+    }
+
+    #[test]
+    fn reconcile_unsubscribes_dropped_channels() {
+        let feed = Arc::new(DeribitMarketFeed::new(
+            reqwest::Client::new(),
+            Arc::new(OrderRuleTable::default()),
+        ));
+        let subscribed = HashSet::from(["ticker.gone.100ms".to_string()]);
+        let plan = feed.reconcile(&syms(&[]), &syms(&[]), &subscribed);
+        assert!(plan.subscribe.is_empty());
+        assert_eq!(plan.unsubscribe, vec!["ticker.gone.100ms".to_string()]);
+    }
+
+    #[test]
+    fn missing_spec_symbols_lists_unfetched_options() {
+        let rules = OrderRuleTable::default();
+        // 预置一个已有规格的标的。
+        rules.put(trading_models::OrderRule::new(
+            VENUE,
+            "BTC-HAVE",
+            trading_models::InstrumentType::Option,
+            trading_models::QtyUnit::Contract,
             Decimal::ONE,
             "BTC",
             "BTC",
@@ -382,99 +448,19 @@ mod tests {
             "deribit:get_instrument",
             0,
         ));
-    }
-
-    #[test]
-    fn missing_spec_symbols_lists_unfetched_option_interest() {
-        use crate::port::InterestKey;
-        let rules = trading_core::order_rule::OrderRuleTable::default();
-        seed_spec(&rules, "BTC-HAVE");
-        let keys = vec![
-            InterestKey::new(Venue::Deribit, MarketKind::Option, "BTC-NEED"),
-            InterestKey::new(Venue::Deribit, MarketKind::Option, "BTC-NEED"), // 去重
-            InterestKey::new(Venue::Deribit, MarketKind::Option, "BTC-HAVE"), // 已有规格→排除
-            InterestKey::new(Venue::BinanceFutures, MarketKind::Futures, "BTCUSDT"), // 非 deribit→排除
-        ];
-        assert_eq!(
-            missing_spec_symbols(&keys, &rules),
-            vec!["BTC-NEED".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn warm_fetches_missing_and_skips_present() {
-        use crate::port::InterestKey;
-        use std::sync::{Arc, Mutex};
-        // 假 fetcher：返回合成规格 result；记录被请求的标的。
-        let asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        // fetcher 返回 RPC 的 result 对象（口径同 rpc::call）。
-        let asked_c = Arc::clone(&asked);
-        let fetcher = move |symbol: String| {
-            let asked_c = Arc::clone(&asked_c);
-            async move {
-                asked_c.lock().unwrap().push(symbol.clone());
-                Ok(serde_json::json!({
-                    "instrument_name": symbol,
-                    "base_currency":"BTC",
-                    "contract_size":1,
-                    "tick_size":"0.0001",
-                    "min_trade_amount":"0.1"
-                }))
-            }
-        };
-        let rules = trading_core::order_rule::OrderRuleTable::default();
-        seed_spec(&rules, "BTC-HAVE");
-        let keys = vec![
-            InterestKey::new(Venue::Deribit, MarketKind::Option, "BTC-NEED"),
-            InterestKey::new(Venue::Deribit, MarketKind::Option, "BTC-HAVE"),
-        ];
-        let n = warm_missing_specs(&keys, &rules, fetcher).await;
-        assert_eq!(n, 1);
-        assert_eq!(*asked.lock().unwrap(), vec!["BTC-NEED".to_string()]);
-        // 拉取后规格已写表。
-        let spec_key = trading_models::OrderRuleKey::new(
-            "deribit",
-            trading_models::InstrumentType::Option,
-            "BTC-NEED",
-        );
-        assert!(rules.get(&spec_key).is_some());
-    }
-
-    #[test]
-    fn missing_spec_symbols_empty_when_all_present() {
-        use crate::port::InterestKey;
-        let rules = trading_core::order_rule::OrderRuleTable::default();
-        seed_spec(&rules, "BTC-1");
-        let keys = vec![InterestKey::new(
-            Venue::Deribit,
-            MarketKind::Option,
-            "BTC-1",
-        )];
-        assert!(missing_spec_symbols(&keys, &rules).is_empty());
-    }
-
-    #[test]
-    fn desired_channels_filters_and_maps_interest() {
-        use crate::port::InterestKey;
-        let keys = vec![
-            InterestKey::new(Venue::Deribit, MarketKind::Option, "BTC-1"),
-            InterestKey::new(Venue::Deribit, MarketKind::Option, "BTC-1"), // 去重
-            InterestKey::new(Venue::BinanceFutures, MarketKind::Futures, "BTCUSDT"), // 过滤
-        ];
-        let ch = desired_channels(&keys);
-        assert_eq!(ch, set(&["ticker.BTC-1.100ms"]));
+        let missing = missing_spec_symbols(&syms(&["BTC-HAVE", "BTC-NEED"]), &rules);
+        assert_eq!(missing, vec!["BTC-NEED".to_string()]);
     }
 
     #[test]
     fn parses_ticker_fields_and_missing_sides() {
-        // 字段名按 Deribit 真实 ticker 报文：best_bid_price / best_ask_price。
         let data = serde_json::json!({
             "mark_price": 0.5, "best_bid_price": 0.49, "best_ask_price": 0.51
         });
         let t = parse_ticker(&data).expect("tick");
-        assert_eq!(t.mark, Decimal::from_str("0.5").unwrap());
-        assert_eq!(t.bid, Decimal::from_str("0.49").ok());
-        assert_eq!(t.ask, Decimal::from_str("0.51").ok());
+        assert_eq!(t.mark, dec("0.5"));
+        assert_eq!(t.bid, Some(dec("0.49")));
+        assert_eq!(t.ask, Some(dec("0.51")));
 
         let one = serde_json::json!({"mark_price":0.5,"best_bid_price":0.49});
         assert!(parse_ticker(&one).expect("tick").ask.is_none());
@@ -491,7 +477,7 @@ mod tests {
         }"#;
         let (symbol, t) = parse_ticker_subscription(raw).expect("parsed");
         assert_eq!(symbol, "BTC-1");
-        assert_eq!(t.mark, Decimal::from_str("0.5").unwrap());
+        assert_eq!(t.mark, dec("0.5"));
     }
 
     #[test]
@@ -499,5 +485,69 @@ mod tests {
         let raw = r#"{"jsonrpc":"2.0","method":"subscription",
             "params":{"channel":"user.orders.option.BTC.raw","data":{}}}"#;
         assert!(parse_ticker_subscription(raw).is_none());
+    }
+
+    #[test]
+    fn decode_ticker_frame_to_price_tick() {
+        let feed =
+            DeribitMarketFeed::new(reqwest::Client::new(), Arc::new(OrderRuleTable::default()));
+        let raw = r#"{"jsonrpc":"2.0","method":"subscription",
+          "params":{"channel":"ticker.BTC-1.100ms","data":{
+            "mark_price":"0.5","best_bid_price":"0.49","best_ask_price":"0.51"}}}"#;
+        let msg = feed.decode(raw);
+        assert_eq!(msg.ticks.len(), 1);
+        assert_eq!(msg.ticks[0].symbol, "BTC-1");
+        assert_eq!(msg.ticks[0].basis, PriceBasis::Mark);
+        assert!(msg.bars.is_empty());
+    }
+
+    #[test]
+    fn decode_chart_finalizes_previous_candle_on_bucket_flip() {
+        let feed =
+            DeribitMarketFeed::new(reqwest::Client::new(), Arc::new(OrderRuleTable::default()));
+        // 第一帧：桶 60000 成形中 → 不定稿（chart.trades 推送 data 为裸蜡烛数组）。
+        let f1 = r#"{"params":{"channel":"chart.trades.BTC-1.1","data":[
+          {"t":60000,"o":"100","h":"110","l":"99","c":"105","v":"2"}]}}"#;
+        assert!(feed.decode(f1).bars.is_empty());
+        // 第二帧：同桶更新 → 仍不定稿。
+        let f2 = r#"{"params":{"channel":"chart.trades.BTC-1.1","data":[
+          {"t":60000,"o":"100","h":"111","l":"99","c":"108","v":"3"}]}}"#;
+        assert!(feed.decode(f2).bars.is_empty());
+        // 第三帧：新桶 120000 → 上一根（以最终更新值）定稿。
+        let f3 = r#"{"params":{"channel":"chart.trades.BTC-1.1","data":[
+          {"t":120000,"o":"108","h":"109","l":"107","c":"108","v":"1"}]}}"#;
+        let bars = feed.decode(f3).bars;
+        assert_eq!(bars.len(), 1);
+        let bar = &bars[0];
+        assert_eq!(bar.symbol, "BTC-1");
+        assert_eq!(bar.venue, VENUE);
+        assert_eq!(bar.start_ms, 60000);
+        assert_eq!(bar.end_ms, 120_000);
+        assert_eq!(bar.open, dec("100"));
+        assert_eq!(bar.high, dec("111"));
+        assert_eq!(bar.low, dec("99"));
+        assert_eq!(bar.close, dec("108"));
+        assert_eq!(bar.volume, 3);
+    }
+
+    #[test]
+    fn write_quote_marks_table() {
+        let feed =
+            DeribitMarketFeed::new(reqwest::Client::new(), Arc::new(OrderRuleTable::default()));
+        let quotes = Arc::new(QuoteTable::new());
+        let tick = PriceTick {
+            symbol: "BTC-1".into(),
+            basis: PriceBasis::Mark,
+            price: dec("0.5"),
+            best_bid: Some(dec("0.49")),
+            best_ask: Some(dec("0.51")),
+            volume: None,
+            event_ms: 1,
+        };
+        feed.write_quote(&tick, &quotes, None);
+        let inst = Instrument::new(Venue::Deribit, MarketKind::Option, "BTC-1");
+        let q = quotes.get(&inst).expect("quote written");
+        assert_eq!(q.mark, Some(dec("0.5")));
+        assert_eq!(q.book.unwrap().bid, Some(dec("0.49")));
     }
 }

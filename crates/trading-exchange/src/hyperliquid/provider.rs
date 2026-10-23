@@ -4,13 +4,17 @@
 //!
 //! 与 binance/deribit provider 平级、同构。见 `docs/扩展交易所.md` 第二节。
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio::task::JoinHandle;
+use trading_models::MarketKind;
 
 use crate::api::ExchangeApi;
 use crate::hyperliquid::account_consumer::{HlUserProvider, HlVenueConnector};
+use crate::hyperliquid::market::HlMarketFeed;
 use crate::hyperliquid::venue::HyperliquidUser;
+use crate::market::{InterestSource, MarketDataStream};
+use crate::market_ws::{self, WsHubStream};
 use crate::port::OrderEventSink;
 use crate::provider::{ProviderDeps, VenueProvider};
 
@@ -36,11 +40,30 @@ impl HyperliquidConfig {
 /// Hyperliquid 套件 provider（持有装配依赖）。
 pub struct HyperliquidProvider {
     deps: ProviderDeps,
+    /// 交易所级行情流单例（首次取用即 spawn hub 驱动，进程内复用同一条连接）。
+    market_stream: OnceLock<Arc<WsHubStream>>,
 }
 
 impl HyperliquidProvider {
     pub fn new(deps: ProviderDeps) -> Self {
-        Self { deps }
+        Self {
+            deps,
+            market_stream: OnceLock::new(),
+        }
+    }
+
+    /// 懒创建并返回 hyperliquid 行情 hub 单例（建一条 WsDriver 连接）。
+    fn ensure_market_stream(&self) -> anyhow::Result<Arc<WsHubStream>> {
+        let stream = self.market_stream.get_or_init(|| {
+            let feed = Arc::new(HlMarketFeed::new());
+            market_ws::spawn_hub(
+                "hyperliquid",
+                feed,
+                Arc::clone(&self.deps.quotes),
+                self.deps.quote_observer.clone(),
+            )
+        });
+        Ok(Arc::clone(stream))
     }
 
     /// 构造某账户的具体用户主体（REST 与账户事件流共用）。
@@ -119,6 +142,20 @@ impl VenueProvider for HyperliquidProvider {
         }
     }
 
+    fn build_market_stream(
+        &self,
+        _exchange: &str,
+        instrument_type: Option<&str>,
+    ) -> anyhow::Result<Arc<dyn MarketDataStream>> {
+        let product = trading_core::protocol::normalize_instrument_type(instrument_type);
+        if product != "futures" {
+            anyhow::bail!(
+                "hyperliquid 行情仅支持永续（instrument_type=futures），收到 `{product}`"
+            );
+        }
+        Ok(self.ensure_market_stream()? as Arc<dyn MarketDataStream>)
+    }
+
     fn spawn_account_stream(
         &self,
         exchange: &str,
@@ -143,21 +180,25 @@ impl VenueProvider for HyperliquidProvider {
             tracing::info!(provider = NAME, "无该交易所账户，跳过交易所级公共服务");
             return;
         }
+        // 与旧装配同口径：无兴趣端口则规则/行情整体跳过。
         let Some(interests) = self.deps.market_interest.clone() else {
             tracing::warn!(provider = NAME, "未提供行情兴趣端口，跳过公共行情/规则");
             return;
         };
-        // 规则 + 行情。activeAssetCtx 的 user 路由地址：provider 在此只拿得到交易所名
-        // （active_exchanges），拿不到账户名清单，故暂传 None（allMids 的 mid 正常，
-        // mark 增强待账户枚举接缝后补）。
-        crate::hyperliquid::services::spawn_shared(
+        // 规则同步（保留）：启动全量 + 定时整表刷新。
+        crate::hyperliquid::services::spawn_rule_sync(
             self.deps.http.clone(),
             Arc::clone(&self.deps.rules),
-            Arc::clone(&self.deps.quotes),
             self.deps.rule_refresh_interval,
-            interests,
-            self.deps.quote_observer.clone(),
-            None,
         );
+        // 行情：建 hub 单例并注册系统行情托管来源（活跃仓位∪规则，过滤 HL/futures）。
+        match self.ensure_market_stream() {
+            Ok(stream) => stream.register_managed_prices(Arc::new(InterestSource::new(
+                interests,
+                trading_models::Venue::Hyperliquid,
+                MarketKind::Futures,
+            ))),
+            Err(e) => tracing::error!(provider = NAME, error = %e, "hyperliquid 行情 hub 启动失败"),
+        }
     }
 }

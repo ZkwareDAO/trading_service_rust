@@ -1,13 +1,32 @@
 //! 交易所接入层 crate（trading-exchange）
 //!
-//! 收口各交易所（Binance、xili 等）的行情流、交易 API、账户事件流、
-//! 规则拉取与对账运行时。本 crate 只向下依赖 trading-core / trading-models，
+//! 收口各交易所（Binance、Deribit、Hyperliquid、CTP、xili 等）的行情流、交易 API、
+//! 账户事件流、规则拉取与对账运行时。本 crate 只向下依赖 trading-core / trading-models，
 //! 不反向依赖 trading-service；对宿主的出站需求经 [`port`] 端口倒置。
+//!
+//! # 统一行情流（Plan「行情 Hub + 统一 MarketDataStream」）
+//! - [`market`]：对外契约 [`market::MarketDataStream`]（`subscribe_prices` /
+//!   `subscribe_klines`，凭证式 `Arc<dyn DesiredSource>` + guard 退订），K线/价格 tick
+//!   等值类型；四家（binance/deribit/hyperliquid/ctp）实现两方法，xili 返回 Unsupported。
+//! - [`market_hub`]：消费者注册表 / 全局并集 / 订阅 diff / 按 symbol 路由 /
+//!   `catch_unwind`+单次耗时摘除异常 sink（纯内核、零 channel、`Arc<Mutex>` 短临界区）。
+//! - [`market_ws`]：WS 三家共用的唯一连接生命周期（退避/10s Ping/5s 看门狗 20s 判死/
+//!   500ms 对账/重连整体重放）+ [`market_ws::WsMarketFeed`] 协议端口（各所只留协议纯函数）。
+//! - CTP 是单连接阻塞特例：业务兴趣 ∪ K线期望共用一条 `ctp-md` 线程，tick 按作用域
+//!   分流（业务集→QuoteTable/observer 原样；K线集→`ctp::market_stream` 聚合/选举/三表）。
+//!
+//! 取行情流经 [`registry::ExchangeRegistry::market_stream`]（对称 `connect/build_api`）。
 
 pub mod account_stream;
 pub mod api;
 pub mod backoff;
 pub mod heartbeat;
+/// 行情统一入口对外类型（MarketDataStream/DesiredSource/BarSink/Kline 等）。
+pub mod market;
+/// hub 纯内核：消费者注册表 / 全局并集 / 订阅 diff / 按 symbol 路由 / 异常 sink 摘除。
+pub mod market_hub;
+/// WS 三家共用的唯一连接生命周期 + WsMarketFeed 协议端口。
+pub mod market_ws;
 pub mod port;
 pub mod position_profile;
 pub mod provider;

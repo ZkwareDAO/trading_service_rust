@@ -117,6 +117,19 @@ impl ExchangeRegistry {
         }
     }
 
+    /// 构造某 (交易所, 标的类别) 的交易所级行情流单例；与 [`Self::connect`] 对称。
+    /// 未注册或不支持统一行情流的所（如 xili）返回错误（Unsupported）。
+    pub fn market_stream(
+        &self,
+        exchange: &str,
+        instrument_type: Option<&str>,
+    ) -> anyhow::Result<Arc<dyn crate::market::MarketDataStream>> {
+        match self.provider(exchange) {
+            Some(p) => p.build_market_stream(exchange, instrument_type),
+            None => anyhow::bail!("未知交易所 `{exchange}`：未注册对应 provider/端点"),
+        }
+    }
+
     /// 启动各所的交易所级共享任务（规则同步/公共行情），逐所 fan-out。
     ///
     /// `active_exchanges` 是宿主从账户内存表去重出的交易所名；各 provider 自行判定
@@ -342,6 +355,16 @@ mod tests {
         let alpha = Arc::new(FakeProvider::new(&["alpha"]));
         let reg = registry_of(vec![alpha]);
         assert!(reg.connect("gamma", None, "acc").is_err());
+    }
+
+    #[test]
+    fn market_stream_unsupported_provider_is_error() {
+        // FakeProvider（如 xili）不覆盖 build_market_stream：默认返回 Unsupported 错误。
+        let xili_like = Arc::new(FakeProvider::new(&["xili"]));
+        let reg = registry_of(vec![xili_like]);
+        assert!(reg.market_stream("xili", Some("futures")).is_err());
+        // 未知所同样报错。
+        assert!(reg.market_stream("nope", None).is_err());
     }
 
     #[test]

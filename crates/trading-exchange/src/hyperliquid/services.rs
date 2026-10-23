@@ -1,10 +1,11 @@
 //! Hyperliquid「交易所级单例」共享服务的启动装配（全用户共享、进程一份）。
 //!
-//! [`spawn_shared`] 拉起：
-//! - 交易规则：主网与测试网 meta 启动各全量同步一次（POST /info meta →
-//!   parse_meta 打网络标 → 整表 put），随后按周期整表刷新（单网失败仅告警、
-//!   等下一周期，不影响另一网）；
-//! - 公共行情：allMids(mid) + 兴趣集币的 activeAssetCtx(mark) 的一条 WS worker。
+//! 本模块只负责**交易规则**同步：主网与测试网 meta 启动各全量同步一次
+//! （POST /info meta → parse_meta 打网络标 → 整表 put），随后按周期整表刷新
+//! （单网失败仅告警、等下一周期，不影响另一网）。
+//!
+//! 公共行情（allMids/activeAssetCtx/candle）已收口到 [`crate::market_ws`]，
+//! 由 provider 构造 `HlMarketFeed` hub 单例承载，不在本模块。
 //!
 //! 账户私有 REST/WS 随账户选网；公共行情恒定正式网，但交易规则须两网并存
 //! （asset index 随 universe 顺序不同）。
@@ -15,11 +16,8 @@ use std::time::Duration;
 
 use reqwest::Client;
 use trading_core::order_rule::OrderRuleTable;
-use trading_core::quote::QuoteTable;
 
 use crate::hyperliquid::endpoint;
-use crate::hyperliquid::market;
-use crate::port::{MarketInterest, QuoteObserver};
 
 /// 主网 + 测试网 meta 各拉一份、各自打标整表写入，两网同名币互不覆盖。
 ///
@@ -67,24 +65,8 @@ async fn sync_one_network(
     Ok(())
 }
 
-/// 启动交易所级共享服务：规则同步/刷新 + 公共行情。
-///
-/// `ctx_user`：activeAssetCtx 订阅所需 user 路由地址（一个已配置 HL 账户）。
-pub(crate) fn spawn_shared(
-    http: Client,
-    rules: Arc<OrderRuleTable>,
-    quotes: Arc<QuoteTable>,
-    rule_refresh_interval: Duration,
-    interests: Arc<dyn MarketInterest>,
-    observer: Option<Arc<dyn QuoteObserver>>,
-    ctx_user: Option<String>,
-) {
-    spawn_rule_sync(http, rules, rule_refresh_interval);
-    market::spawn_worker(quotes, interests, observer, ctx_user);
-}
-
-/// 规则：启动全量一次 + 到点整表刷新。
-fn spawn_rule_sync(http: Client, rules: Arc<OrderRuleTable>, interval: Duration) {
+/// 启动交易所级规则同步：启动全量一次 + 到点整表刷新。
+pub(crate) fn spawn_rule_sync(http: Client, rules: Arc<OrderRuleTable>, interval: Duration) {
     // 启动全量（失败仅告警，不阻断）。
     {
         let rules = Arc::clone(&rules);
