@@ -25,6 +25,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use store_core::{Model, PersistHandle, PersistOptions, Store, StoreError, Table};
+use trading_core::kline::{DominantTable, LastVolumeTable, TickTable};
 use trading_core::order_rule::OrderRuleTable;
 use trading_core::quote::QuoteTable;
 use trading_models::{Account, Order, Position, WatchRule};
@@ -193,6 +194,27 @@ impl TradingStore {
     /// 进程一份的公共行情表（纯内存不落盘；各 venue 公共流写入）。
     pub fn quotes(&self) -> Arc<QuoteTable> {
         self.memory.get_or_init(MemoryTables::new).quotes.clone()
+    }
+
+    /// CTP K线：最新原始 tick 表（纯内存不落盘；CTP 单连接 drain 写入）。
+    pub fn ctp_ticks(&self) -> Arc<TickTable> {
+        self.memory.get_or_init(MemoryTables::new).ctp_ticks.clone()
+    }
+
+    /// CTP K线：合约 → 当日最后累计成交量（主力选举原料）。
+    pub fn ctp_last_volumes(&self) -> Arc<LastVolumeTable> {
+        self.memory
+            .get_or_init(MemoryTables::new)
+            .ctp_last_volumes
+            .clone()
+    }
+
+    /// CTP K线：品种 → 当前主力（收盘选举写入，次日冻结）。
+    pub fn ctp_dominants(&self) -> Arc<DominantTable> {
+        self.memory
+            .get_or_init(MemoryTables::new)
+            .ctp_dominants
+            .clone()
     }
 
     /// 进程一份的杠杆内存仓储（纯内存不落盘）：对账快照写入，下单前据此按需设置。

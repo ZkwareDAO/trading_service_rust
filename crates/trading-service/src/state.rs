@@ -144,6 +144,13 @@ impl AppState {
             // CTP 运行参数：venue.toml [ctp] 段（venue_config 已回退 vendored 缺省）。
             #[cfg(feature = "ctp")]
             ctp: venue.ctp.clone(),
+            // CTP K线三表（进程单例，纯内存不落盘，仿 quotes 由 store MemoryTables 持有）。
+            #[cfg(feature = "ctp")]
+            ctp_ticks: store.ctp_ticks(),
+            #[cfg(feature = "ctp")]
+            ctp_last_volumes: store.ctp_last_volumes(),
+            #[cfg(feature = "ctp")]
+            ctp_dominants: store.ctp_dominants(),
         };
         let exchanges = Arc::new(ExchangeRegistry::builtin(provider_deps));
         // 启动自检（fail-fast）：汇总各 provider 自描述的仓位档案装入引擎并校验，

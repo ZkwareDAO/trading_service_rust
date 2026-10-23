@@ -11,14 +11,22 @@
 
 pub mod account_consumer;
 pub mod api;
+/// K线集 tick 聚合 sink（多合约 CandleAggregator + 主力过滤）。
+pub mod bar_agg;
+/// tick→1m bar 聚合纯状态机（交易日归桶 / 累计量差分）。
+pub mod candle;
 pub mod config;
 pub mod core;
+/// 主力合约选举（纯函数 pick_dominant + 品种前缀）。
+pub mod dominant;
 pub mod gateway;
 pub mod instrument_dir;
 pub mod leg_table;
 pub mod mailbox;
 pub mod mapping;
 pub mod market;
+/// CTP 单连接统一行情流（业务兴趣 ∪ K线集订阅、聚合路由、主力选举任务）。
+pub mod market_stream;
 pub mod order_ref;
 pub mod pending_terminal;
 pub mod place_error;

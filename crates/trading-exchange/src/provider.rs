@@ -85,6 +85,15 @@ pub struct ProviderDeps {
     /// CTP 运行参数（.so 路径/流目录基准；venue.toml [ctp] 段，缺失回退 vendored）。
     #[cfg(feature = "ctp")]
     pub ctp: crate::ctp::CtpConfig,
+    /// CTP K线：最新原始 tick 内存表（纯内存不落盘）。
+    #[cfg(feature = "ctp")]
+    pub ctp_ticks: Arc<trading_core::kline::TickTable>,
+    /// CTP K线：合约 → 当日最后累计成交量（主力原料）。
+    #[cfg(feature = "ctp")]
+    pub ctp_last_volumes: Arc<trading_core::kline::LastVolumeTable>,
+    /// CTP K线：品种 → 当前主力（收盘选举写入）。
+    #[cfg(feature = "ctp")]
+    pub ctp_dominants: Arc<trading_core::kline::DominantTable>,
     /// Hyperliquid 可调参数（市价滑点）。
     pub hyperliquid: HyperliquidConfig,
     /// 行情订阅兴趣供给（宿主读仓位∪规则）；None=不做动态订阅。
@@ -144,9 +153,11 @@ pub trait VenueProvider: Send + Sync {
         account: &str,
     ) -> anyhow::Result<Arc<dyn ExchangeApi>>;
 
-    /// 构造某 (交易所, 标的类别) 的交易所级行情流单例（无认证、所有用户共享）。
+    /// 构造某 (交易所, 标的类别) 的**交易所级行情流单例**（无认证、所有用户共享）。
     ///
-    /// 与 build_api 对称；默认返回 Unsupported——xili 等不支持按需行情的所无需覆盖。
+    /// 与 [`Self::build_api`] 对称；默认返回 Unsupported——xili 等不支持按需行情的所
+    /// 无需覆盖。支持的所（binance/deribit/hyperliquid/ctp）覆盖为返回其
+    /// `Arc<dyn MarketDataStream>`；同一 (交易所, 类别) 每次应取到同一个进程单例。
     fn build_market_stream(
         &self,
         _exchange: &str,

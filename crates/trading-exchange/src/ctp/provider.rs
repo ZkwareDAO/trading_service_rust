@@ -32,6 +32,8 @@ pub struct CtpProvider {
     /// 进程级共享合约静态目录（交易所/乘数/最小变动价位；合约查询预热，全局一致）。
     /// 供 prepare_placement 判 SHFE/取 tick，并注入每个账户会话线程。
     instrument_dir: Arc<crate::ctp::instrument_dir::InstrumentDir>,
+    /// 交易所级统一行情流单例（业务兴趣 ∪ K线集共用一条 ctp-md 连接）。
+    market_stream: std::sync::OnceLock<Arc<crate::ctp::market_stream::CtpMarketStream>>,
 }
 
 impl CtpProvider {
@@ -42,7 +44,23 @@ impl CtpProvider {
             md_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Arc::new(SessionRegistry::default()),
             instrument_dir: Arc::new(crate::ctp::instrument_dir::InstrumentDir::new()),
+            market_stream: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 懒创建并返回 CTP 统一行情流单例（三表 + 合约目录注入）。
+    fn ensure_market_stream(
+        &self,
+    ) -> anyhow::Result<Arc<crate::ctp::market_stream::CtpMarketStream>> {
+        let stream = self.market_stream.get_or_init(|| {
+            crate::ctp::market_stream::CtpMarketStream::new(
+                Arc::clone(&self.deps.ctp_ticks),
+                Arc::clone(&self.deps.ctp_last_volumes),
+                Arc::clone(&self.deps.ctp_dominants),
+                Arc::clone(&self.instrument_dir),
+            )
+        });
+        Ok(Arc::clone(stream))
     }
 
     /// 账户当前会话的停机标志（接线测试/诊断用）。
@@ -158,26 +176,48 @@ impl VenueProvider for CtpProvider {
             return;
         }
         // 公共行情：可降级（行情前置未开仅告警不重试）；兴趣集由宿主注入。
+        let account = match self.market_data_account() {
+            Some(a) => a,
+            None => {
+                tracing::warn!("CTP 行情缺账户名来源（venue.toml [ctp].md_account），跳过行情");
+                return;
+            }
+        };
+        // 统一行情流单例（无 bar client 时其 bar_symbols 为空，drain 走纯业务路径，
+        // 与历史逐字节等价）；起收盘主力选举线程。
+        let stream = match self.ensure_market_stream() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "CTP 行情流单例构造失败，跳过行情");
+                return;
+            }
+        };
+        stream.spawn_election(Arc::clone(&self.md_stop));
         crate::ctp::market::spawn_market_worker(
             crate::ctp::market::MdParams {
                 // 行情前置需要合法账户结构（BrokerID/UserID 编码进登录请求），
                 // 无活动账户时上面已 return，这里取行情账户的领域凭证。
-                account: match self.market_data_account() {
-                    Some(a) => a,
-                    None => {
-                        tracing::warn!(
-                            "CTP 行情缺账户名来源（venue.toml [ctp].md_account），跳过行情"
-                        );
-                        return;
-                    }
-                },
+                account,
                 config: self.config.clone(),
             },
             self.deps.market_interest.clone(),
             Arc::clone(&self.deps.quotes),
             self.deps.quote_observer.clone(),
             Arc::clone(&self.md_stop),
+            Some(crate::ctp::market::MdKlineDeps { stream }),
         );
+    }
+
+    fn build_market_stream(
+        &self,
+        _exchange: &str,
+        instrument_type: Option<&str>,
+    ) -> anyhow::Result<Arc<dyn crate::market::MarketDataStream>> {
+        let product = trading_core::protocol::normalize_instrument_type(instrument_type);
+        if product != "futures" {
+            anyhow::bail!("ctp 行情仅支持期货（instrument_type=futures），收到 `{product}`");
+        }
+        Ok(self.ensure_market_stream()? as Arc<dyn crate::market::MarketDataStream>)
     }
 
     fn spawn_account_stream(
@@ -255,6 +295,9 @@ mod tests {
             hyperliquid: crate::hyperliquid::provider::HyperliquidConfig::default_config(),
             market_interest: None,
             ctp: test_config(),
+            ctp_ticks: Arc::new(trading_core::kline::TickTable::new()),
+            ctp_last_volumes: Arc::new(trading_core::kline::LastVolumeTable::new()),
+            ctp_dominants: Arc::new(trading_core::kline::DominantTable::new()),
         }
     }
 

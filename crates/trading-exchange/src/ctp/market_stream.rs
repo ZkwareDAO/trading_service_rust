@@ -1,0 +1,507 @@
+//! CTP 单连接统一行情流（[`market::MarketDataStream`] 实现）。
+//!
+//! 一个进程单例，被业务 `ctp-md` OS 线程与按需 K线消费者共用：
+//! - 注册两类期望来源：`subscribe_prices`（系统行情，tick 由 drain 统一写 QuoteTable，
+//!   本类型只贡献订阅符号）与 `subscribe_klines`（额外持定稿回调）；
+//! - [`Self::price_symbols`] / [`Self::bar_symbols`] 供 drain 计算「业务兴趣 ∪ K线
+//!   期望（品种经 [`InstrumentDir`] 展开为全部 is_trading 合约）」并集向柜台订阅；
+//! - [`Self::on_kline_tick`]：K线集 tick 喂入 [`BarAggSink`]，分钟翻转定稿后按注册表
+//!   路由（catch_unwind+计时摘除）；原始 tick/累计量写三表在同路径完成；
+//! - [`Self::elect_cycle`]：收盘选举纯内核（量最大/tiebreak/沿用前日/每日只更新一次），
+//!   由 [`Self::spawn_election`] 独立线程在日盘收盘后触发。
+//!
+//! 全程 `std::sync::Mutex`（OS 线程，非 async）；锁内不调用外部 sink（先收集命中
+//! 列表，再在 [`market_hub::safe_notify`] 隔离下回调）。
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use trading_core::kline::{DominantEntry, DominantTable, LastVolumeTable, TickRow, TickTable};
+
+use crate::ctp::bar_agg::BarAggSink;
+use crate::ctp::candle::CandleTick;
+use crate::ctp::dominant::{pick_dominant, product_prefix, ContractVolume};
+use crate::ctp::instrument_dir::InstrumentDir;
+use crate::market::{BarSink, DesiredSource, Kline, MarketDataStream, SubscriptionGuard};
+use crate::market_hub::{safe_notify, NotifyOutcome};
+
+/// bar sink 单次回调摘除阈值（目标 <1µs，1ms 兜底）。
+const BAR_BUDGET: Duration = Duration::from_millis(1);
+
+struct PriceClient {
+    id: u64,
+    source: Arc<dyn DesiredSource>,
+}
+
+struct BarClient {
+    id: u64,
+    source: Arc<dyn DesiredSource>,
+    sink: Arc<dyn BarSink>,
+}
+
+/// bar 定稿路由器：bar 到达时分发给期望集命中的 K线消费者，坏/慢者摘除。
+/// 同时作为 [`BarAggSink`] 的下游 [`BarSink`]。
+struct BarRouter {
+    next_id: Mutex<u64>,
+    clients: Mutex<Vec<BarClient>>,
+}
+
+impl BarRouter {
+    fn new() -> Self {
+        Self {
+            next_id: Mutex::new(0),
+            clients: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn add(&self, source: Arc<dyn DesiredSource>, sink: Arc<dyn BarSink>) -> u64 {
+        let mut idg = self.next_id.lock().unwrap();
+        *idg += 1;
+        let id = *idg;
+        drop(idg);
+        self.clients
+            .lock()
+            .unwrap()
+            .push(BarClient { id, source, sink });
+        id
+    }
+
+    fn remove(&self, id: u64) {
+        self.clients.lock().unwrap().retain(|c| c.id != id);
+    }
+
+    /// 期望集包含某合约：显式合约命中，或品种前缀命中（cu 期望集收 cu2512 的 bar）。
+    fn source_wants(source_symbols: &HashSet<String>, symbol: &str) -> bool {
+        if source_symbols.contains(symbol) {
+            return true;
+        }
+        product_prefix(symbol)
+            .map(|p| source_symbols.contains(&p))
+            .unwrap_or(false)
+    }
+
+    fn dispatch(&self, bar: &Kline) -> usize {
+        // 锁内克隆命中 sink 列表，释锁后再回调（不持锁调外部代码）。
+        let targets: Vec<(u64, Arc<dyn BarSink>)> = {
+            let clients = self.clients.lock().unwrap();
+            clients
+                .iter()
+                .filter(|c| {
+                    let syms: HashSet<String> = c.source.symbols().into_iter().collect();
+                    Self::source_wants(&syms, &bar.symbol)
+                })
+                .map(|c| (c.id, Arc::clone(&c.sink)))
+                .collect()
+        };
+        let mut evicted = Vec::new();
+        for (id, sink) in targets {
+            match safe_notify(sink.as_ref(), bar, BAR_BUDGET) {
+                NotifyOutcome::Ok => {}
+                _ => evicted.push(id),
+            }
+        }
+        if !evicted.is_empty() {
+            self.clients
+                .lock()
+                .unwrap()
+                .retain(|c| !evicted.contains(&c.id));
+        }
+        evicted.len()
+    }
+}
+
+impl BarSink for BarRouter {
+    fn on_bar(&self, bar: &Kline) {
+        self.dispatch(bar);
+    }
+}
+
+/// CTP 统一行情流单例。
+pub struct CtpMarketStream {
+    next_price_id: Mutex<u64>,
+    price_clients: Arc<Mutex<Vec<PriceClient>>>,
+    router: Arc<BarRouter>,
+    /// 多合约聚合器（router 为定稿下游）。
+    bar_agg: Mutex<BarAggSink>,
+    /// 三表（drain 写入；聚合只读 dominant，选举读 last_volume、写 dominant）。
+    ticks: Arc<TickTable>,
+    last_volumes: Arc<LastVolumeTable>,
+    dominants: Arc<DominantTable>,
+    /// 合约目录（品种展开 / product 分组）。
+    instrument_dir: Arc<InstrumentDir>,
+}
+
+impl CtpMarketStream {
+    pub fn new(
+        ticks: Arc<TickTable>,
+        last_volumes: Arc<LastVolumeTable>,
+        dominants: Arc<DominantTable>,
+        instrument_dir: Arc<InstrumentDir>,
+    ) -> Arc<Self> {
+        let router = Arc::new(BarRouter::new());
+        let bar_agg = BarAggSink::new(
+            "ctp",
+            Arc::clone(&dominants),
+            router.clone() as Arc<dyn BarSink>,
+        );
+        Arc::new(Self {
+            next_price_id: Mutex::new(0),
+            price_clients: Arc::new(Mutex::new(Vec::new())),
+            router,
+            bar_agg: Mutex::new(bar_agg),
+            ticks,
+            last_volumes,
+            dominants,
+            instrument_dir,
+        })
+    }
+
+    /// 系统行情期望符号（去重有序）。
+    pub fn price_symbols(&self) -> BTreeSet<String> {
+        self.price_clients
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|c| c.source.symbols())
+            .collect()
+    }
+
+    /// K线期望展开后的具体合约：显式合约 + 品种经目录展开的全部 is_trading 合约。
+    pub fn bar_symbols(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let mut products: HashSet<String> = HashSet::new();
+        let clients = self.router.clients.lock().unwrap();
+        for c in clients.iter() {
+            for raw in c.source.symbols() {
+                // 目录已知具体合约→直接订；否则按品种前缀收集后展开。
+                if self.instrument_dir.get(&raw).is_some() {
+                    out.insert(raw);
+                } else {
+                    products.insert(raw);
+                }
+            }
+        }
+        drop(clients);
+        for sym in self.instrument_dir.trading_instruments_for(&products) {
+            out.insert(sym);
+        }
+        out
+    }
+
+    /// drain 在 K线集 tick 上调用：写最新 tick/累计量两表 + 喂聚合器。
+    /// （QuoteTable/observer 的业务路径在 drain 内单独完成，不经本方法。）
+    pub fn on_kline_tick(&self, symbol: &str, t: &CandleTick) {
+        self.ticks.put(TickRow {
+            symbol: symbol.to_string(),
+            trading_day: t.trading_day,
+            update_ms: t.update_ms,
+            last_price: t.price,
+            cum_volume: t.cum_volume,
+            cum_turnover: t.cum_turnover,
+            open_interest: t.open_interest,
+        });
+        self.last_volumes.put(symbol, t.cum_volume);
+        self.bar_agg.lock().unwrap().on_tick(symbol, t);
+    }
+
+    /// 收盘选举一轮：按合约所属 product（目录 product_id，缺失则剥尾数字）分组，
+    /// 量最大/tiebreak 选主力；该 product 当日已选（dominant.trading_day==day）则跳过
+    /// （每日只更新一次，盘中冻结）；当日无 tick 的 product 不产出（沿用旧值）。
+    pub fn elect_cycle(&self, trading_day: u32) -> usize {
+        let mut by_product: HashMap<String, Vec<ContractVolume>> = HashMap::new();
+        for (symbol, vol) in self.last_volumes.snapshot() {
+            let product = self
+                .instrument_dir
+                .get(&symbol)
+                .map(|i| i.product_id)
+                .filter(|p| !p.is_empty())
+                .or_else(|| product_prefix(&symbol));
+            if let Some(product) = product {
+                by_product.entry(product).or_default().push(ContractVolume {
+                    symbol,
+                    cum_volume: vol,
+                });
+            }
+        }
+        let mut updated = 0;
+        for (product, vols) in by_product {
+            if let Some(cur) = self.dominants.get(&product) {
+                if cur.trading_day == trading_day {
+                    continue; // 当日冻结
+                }
+            }
+            if let Some(symbol) = pick_dominant(&vols) {
+                let cum_volume = vols
+                    .iter()
+                    .find(|c| c.symbol == symbol)
+                    .map(|c| c.cum_volume)
+                    .unwrap_or(0);
+                self.dominants.put(
+                    &product,
+                    DominantEntry {
+                        symbol,
+                        trading_day,
+                        cum_volume,
+                    },
+                );
+                updated += 1;
+            }
+        }
+        updated
+    }
+
+    /// 起独立线程做收盘选举：每分钟检查北京 wall-clock 是否进入日盘收盘后窗口
+    /// （≥15:00），当天首次进入用当日累计量选一次（elect_cycle 内部按交易日防重）。
+    pub fn spawn_election(self: &Arc<Self>, stop: Arc<AtomicBool>) {
+        let me = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("ctp-dominant".into())
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    interruptible_sleep(Duration::from_secs(60), &stop);
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if let Some(day) = beijing_election_day() {
+                        me.elect_cycle(day);
+                    }
+                }
+            })
+            .ok();
+    }
+}
+
+/// 60s 睡眠按 1s 分片，可被停机标志提前打断（与 ctp-md 同口径）。
+fn interruptible_sleep(total: Duration, stop: &AtomicBool) {
+    let mut left = total.as_millis() as u64;
+    while left > 0 && !stop.load(Ordering::SeqCst) {
+        let step = left.min(1000);
+        std::thread::sleep(Duration::from_millis(step));
+        left = left.saturating_sub(step);
+    }
+}
+
+/// 北京 wall-clock：仅在 15:00（含）之后返回当日 YYYYMMDD（日盘收盘后选举窗口）。
+fn beijing_election_day() -> Option<u32> {
+    use chrono::{FixedOffset, Timelike};
+    let bj = FixedOffset::east_opt(8 * 3600)?;
+    let now = chrono::Utc::now().with_timezone(&bj);
+    if now.hour() >= 15 {
+        Some(now.format("%Y%m%d").to_string().parse().unwrap_or(0))
+    } else {
+        None
+    }
+}
+
+impl MarketDataStream for CtpMarketStream {
+    fn subscribe_prices(&self, src: Arc<dyn DesiredSource>) -> anyhow::Result<SubscriptionGuard> {
+        let mut idg = self.next_price_id.lock().unwrap();
+        *idg += 1;
+        let id = *idg;
+        drop(idg);
+        self.price_clients
+            .lock()
+            .unwrap()
+            .push(PriceClient { id, source: src });
+        let clients = Arc::clone(&self.price_clients);
+        Ok(SubscriptionGuard::new(Box::new(move || {
+            if let Ok(mut v) = clients.lock() {
+                v.retain(|c| c.id != id);
+            }
+        })))
+    }
+
+    fn subscribe_klines(
+        &self,
+        src: Arc<dyn DesiredSource>,
+        sink: Arc<dyn BarSink>,
+    ) -> anyhow::Result<SubscriptionGuard> {
+        let id = self.router.add(src, sink);
+        let router = Arc::clone(&self.router);
+        Ok(SubscriptionGuard::new(Box::new(move || router.remove(id))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ctp::core::event::InstrumentInfo;
+    use crate::market::FixedSymbols;
+    use rust_decimal::Decimal;
+
+    fn dir_with(infos: Vec<InstrumentInfo>) -> Arc<InstrumentDir> {
+        let d = Arc::new(InstrumentDir::new());
+        for i in infos {
+            d.remember(i);
+        }
+        d
+    }
+
+    fn info(symbol: &str, product: &str, trading: bool) -> InstrumentInfo {
+        InstrumentInfo {
+            instrument: symbol.into(),
+            exchange_id: "SHFE".into(),
+            product_id: product.into(),
+            is_trading: trading,
+            volume_multiple: 5,
+            price_tick: 10.0,
+            long_margin_ratio: 0.0,
+            short_margin_ratio: 0.0,
+        }
+    }
+
+    fn tables() -> (Arc<TickTable>, Arc<LastVolumeTable>, Arc<DominantTable>) {
+        (
+            Arc::new(TickTable::new()),
+            Arc::new(LastVolumeTable::new()),
+            Arc::new(DominantTable::new()),
+        )
+    }
+
+    fn mk(vol: i64, ms: i64) -> CandleTick {
+        CandleTick {
+            trading_day: 20261023,
+            update_ms: ms,
+            price: Decimal::from(100),
+            cum_volume: vol,
+            cum_turnover: Decimal::ZERO,
+            open_interest: Decimal::ZERO,
+        }
+    }
+
+    #[derive(Default)]
+    struct CountSink {
+        n: Mutex<usize>,
+    }
+    impl BarSink for CountSink {
+        fn on_bar(&self, _bar: &Kline) {
+            *self.n.lock().unwrap() += 1;
+        }
+    }
+    impl CountSink {
+        fn count(&self) -> usize {
+            *self.n.lock().unwrap()
+        }
+    }
+
+    struct PanicSink;
+    impl BarSink for PanicSink {
+        fn on_bar(&self, _bar: &Kline) {
+            panic!("boom");
+        }
+    }
+
+    #[test]
+    fn price_subscription_contributes_symbols_and_guard_removes() {
+        let (t, v, d) = tables();
+        let s = CtpMarketStream::new(t, v, d, dir_with(vec![]));
+        assert!(s.price_symbols().is_empty());
+        let g = s
+            .subscribe_prices(Arc::new(FixedSymbols::new(vec!["rb2510".into()])))
+            .unwrap();
+        assert_eq!(
+            s.price_symbols().into_iter().collect::<Vec<_>>(),
+            vec!["rb2510"]
+        );
+        drop(g);
+        assert!(s.price_symbols().is_empty());
+    }
+
+    #[test]
+    fn product_prefix_expands_to_all_trading_contracts() {
+        let (t, v, d) = tables();
+        let dir = dir_with(vec![
+            info("cu2511", "cu", true),
+            info("cu2512", "cu", true),
+            info("cu2601", "cu", false), // 摘牌不订
+            info("rb2610", "rb", true),
+        ]);
+        let s = CtpMarketStream::new(t, v, d, dir);
+        let _g = s
+            .subscribe_klines(
+                Arc::new(FixedSymbols::new(vec!["cu".into()])),
+                Arc::new(CountSink::default()),
+            )
+            .unwrap();
+        assert_eq!(
+            s.bar_symbols().into_iter().collect::<Vec<_>>(),
+            vec!["cu2511".to_string(), "cu2512".to_string()]
+        );
+    }
+
+    #[test]
+    fn kline_tick_writes_tables_and_routes_only_dominant() {
+        let (ticks, vols, doms) = tables();
+        doms.put(
+            "cu",
+            DominantEntry {
+                symbol: "cu2512".into(),
+                trading_day: 20261023,
+                cum_volume: 0,
+            },
+        );
+        let dir = dir_with(vec![info("cu2511", "cu", true), info("cu2512", "cu", true)]);
+        let sink = Arc::new(CountSink::default());
+        let s = CtpMarketStream::new(ticks, vols, doms, dir);
+        let _g = s
+            .subscribe_klines(Arc::new(FixedSymbols::new(vec!["cu".into()])), sink.clone())
+            .unwrap();
+
+        // 非主力 cu2511 跨分钟：聚合但不路由。
+        s.on_kline_tick("cu2511", &mk(10, 600_000));
+        s.on_kline_tick("cu2511", &mk(11, 660_000));
+        // 主力 cu2512 跨分钟：定稿路由 1 根。
+        s.on_kline_tick("cu2512", &mk(20, 600_000));
+        s.on_kline_tick("cu2512", &mk(25, 660_000));
+        assert_eq!(sink.count(), 1);
+
+        assert!(s.ticks.get("cu2512").is_some());
+        assert_eq!(s.last_volumes.get("cu2512"), Some(25));
+    }
+
+    #[test]
+    fn elect_cycle_picks_and_freezes_per_day() {
+        let (ticks, vols, doms) = tables();
+        let dir = dir_with(vec![info("cu2511", "cu", true), info("cu2512", "cu", true)]);
+        vols.put("cu2511", 100);
+        vols.put("cu2512", 500);
+        let s = CtpMarketStream::new(ticks, vols, doms, dir);
+
+        assert_eq!(s.elect_cycle(20261023), 1);
+        assert_eq!(s.dominants.dominant_symbol("cu").as_deref(), Some("cu2512"));
+        // 同日冻结。
+        s.last_volumes.put("cu2511", 9999);
+        assert_eq!(s.elect_cycle(20261023), 0);
+        assert_eq!(s.dominants.dominant_symbol("cu").as_deref(), Some("cu2512"));
+        // 次日允许重选。
+        assert_eq!(s.elect_cycle(20261024), 1);
+        assert_eq!(s.dominants.dominant_symbol("cu").as_deref(), Some("cu2511"));
+    }
+
+    #[test]
+    fn bad_sink_is_evicted_on_route() {
+        let (t, v, d) = tables();
+        d.put(
+            "cu",
+            DominantEntry {
+                symbol: "cu2512".into(),
+                trading_day: 20261023,
+                cum_volume: 0,
+            },
+        );
+        let dir = dir_with(vec![info("cu2512", "cu", true)]);
+        let s = CtpMarketStream::new(t, v, d, dir);
+        let _g = s
+            .subscribe_klines(
+                Arc::new(FixedSymbols::new(vec!["cu".into()])),
+                Arc::new(PanicSink),
+            )
+            .unwrap();
+        // 跨分钟定稿触发 panic sink：被吞住并摘除（不 panic 出 drain）。
+        s.on_kline_tick("cu2512", &mk(1, 600_000));
+        s.on_kline_tick("cu2512", &mk(2, 660_000));
+        assert_eq!(s.router.clients.lock().unwrap().len(), 0);
+    }
+}

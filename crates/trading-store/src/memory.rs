@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use trading_core::kline::{DominantTable, LastVolumeTable, TickTable};
 use trading_core::order_rule::OrderRuleTable;
 use trading_core::quote::QuoteTable;
 
@@ -27,6 +28,12 @@ pub struct MemoryTables {
     pub quotes: Arc<QuoteTable>,
     /// 杠杆缓存（账户对账快照写入，下单前据此决定是否需要 set_leverage）。
     pub leverages: LeverageRepo,
+    /// CTP K线：最新原始 tick（WAL 原料）。
+    pub ctp_ticks: Arc<TickTable>,
+    /// CTP K线：合约 → 当日最后累计成交量（主力选举原料）。
+    pub ctp_last_volumes: Arc<LastVolumeTable>,
+    /// CTP K线：品种 → 当前主力（收盘选举写入，次日冻结）。
+    pub ctp_dominants: Arc<DominantTable>,
 }
 
 impl MemoryTables {
@@ -36,6 +43,9 @@ impl MemoryTables {
             order_rules: Arc::new(OrderRuleTable::new()),
             quotes: Arc::new(QuoteTable::new()),
             leverages: LeverageRepo::new(),
+            ctp_ticks: Arc::new(TickTable::new()),
+            ctp_last_volumes: Arc::new(LastVolumeTable::new()),
+            ctp_dominants: Arc::new(DominantTable::new()),
         }
     }
 }

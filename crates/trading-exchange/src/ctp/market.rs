@@ -63,6 +63,12 @@ pub struct MdParams {
     pub config: CtpConfig,
 }
 
+/// K线侧依赖（None = 无任何 K线消费者，drain 只走业务行情路径，行为与历史逐字节等价）。
+pub struct MdKlineDeps {
+    /// CTP 统一行情流（bar clients / 三表聚合 / 主力选举）。
+    pub stream: Arc<crate::ctp::market_stream::CtpMarketStream>,
+}
+
 /// 启动行情线程（阻塞线程内跑常驻循环）。
 ///
 /// `interests`：订阅兴趣供给（与其它所同型）。`None`（未提供兴趣端口）属部署态
@@ -78,6 +84,7 @@ pub fn spawn_market_worker(
     quotes: Arc<QuoteTable>,
     observer: Option<Arc<dyn QuoteObserver>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    kline: Option<MdKlineDeps>,
 ) {
     // 防御性守卫：空行情前置不应到达 FFI 的 register_front。
     if params.config.md_front.trim().is_empty() {
@@ -86,7 +93,7 @@ pub fn spawn_market_worker(
     }
     std::thread::Builder::new()
         .name("ctp-md".into())
-        .spawn(move || run_md_loop(&params, interests, &quotes, observer, &stop))
+        .spawn(move || run_md_loop(&params, interests, &quotes, observer, &stop, kline))
         .map(|_| ())
         .unwrap_or_else(|e| tracing::warn!(error = %e, "CTP 行情线程启动失败"));
 }
@@ -227,6 +234,7 @@ fn run_md_loop(
     quotes: &Arc<QuoteTable>,
     observer: Option<Arc<dyn QuoteObserver>>,
     stop: &std::sync::atomic::AtomicBool,
+    kline: Option<MdKlineDeps>,
 ) {
     // interests == None（未提供兴趣端口）属部署态关闭：直接退出，不进常驻循环；
     // 与「有端口但兴趣集暂空」严格区分，后者只保活等待。
@@ -239,9 +247,13 @@ fn run_md_loop(
     // 上周期是否处于空集保活态：仅在 空↔非空 翻转时打 info，避免每 5s 刷屏。
     let mut was_idle = false;
     loop {
-        // 决策只需「是否非空」：谓词短路判定，空转期不额外克隆订阅标的
-        // （interests() 本身按值返回 Vec 是 trait 既有代价）。
-        let has_symbols = interests.interests().iter().any(is_ctp_futures);
+        // 决策只需「是否非空」：业务兴趣或 K线期望任一非空即建连。
+        let has_business = interests.interests().iter().any(is_ctp_futures);
+        let has_kline = kline
+            .as_ref()
+            .map(|k| !k.stream.bar_symbols().is_empty())
+            .unwrap_or(false);
+        let has_symbols = has_business || has_kline;
         match planner.poll(stop.load(Ordering::SeqCst), has_symbols) {
             MdStep::Exit => break,
             MdStep::IdleWait => {
@@ -262,7 +274,15 @@ fn run_md_loop(
             MdStep::Connect => {
                 // 建连前才取真实订阅标的（planner 只知非空、不知具体标的）；
                 // 退避醒来后集合恰好转空的极端竞态在此兜底，交回下一周期 IdleWait。
-                let symbols = ctp_subscription_symbols(interests.as_ref());
+                // 线订阅集 = 业务兴趣 ∪ K线期望（品种已在 bar_symbols 内展开为合约）。
+                let mut symbols = ctp_subscription_symbols(interests.as_ref());
+                if let Some(k) = kline.as_ref() {
+                    for sym in k.stream.bar_symbols() {
+                        if !symbols.contains(&sym) {
+                            symbols.push(sym);
+                        }
+                    }
+                }
                 if symbols.is_empty() {
                     continue;
                 }
@@ -272,7 +292,15 @@ fn run_md_loop(
                     was_idle = false;
                 }
 
-                let outcome = run_md_session(params, &symbols, quotes, &observer, stop);
+                let outcome = run_md_session(
+                    params,
+                    &symbols,
+                    quotes,
+                    &observer,
+                    stop,
+                    kline.as_ref(),
+                    interests.as_ref(),
+                );
                 if outcome == MdSessionOutcome::Stop {
                     break;
                 }
@@ -285,12 +313,15 @@ fn run_md_loop(
 
 /// 单个连接会话：连接 → 登录 → 订阅 → 消费 tick，直到断线/失败/停机。
 /// 返回前 `MdHandle` drop（release 刷盘），下一周期重新建连。
+#[allow(clippy::too_many_arguments)]
 fn run_md_session(
     params: &MdParams,
     symbols: &[String],
     quotes: &Arc<QuoteTable>,
     observer: &Option<Arc<dyn QuoteObserver>>,
     stop: &std::sync::atomic::AtomicBool,
+    kline: Option<&MdKlineDeps>,
+    interests: &dyn crate::port::MarketInterest,
 ) -> MdSessionOutcome {
     if stop.load(Ordering::SeqCst) {
         return MdSessionOutcome::Stop;
@@ -334,6 +365,15 @@ fn run_md_session(
     }
     tracing::info!(count = symbols.len(), "CTP 行情订阅生效");
 
+    // 本会话业务兴趣集合（会话内不重订阅，与历史一致；预算成集合供每笔 O(1) 判定）。
+    let business_set: std::collections::HashSet<String> =
+        ctp_subscription_symbols(interests).into_iter().collect();
+    // K线集合同样每会话订阅一次（CTP 无会话内增量订阅；新登记合约随下次重连生效），
+    // 会话开始预算一次，避免在高频 tick 路径反复展开合约目录。
+    let kline_set: std::collections::HashSet<String> = kline
+        .map(|k| k.stream.bar_symbols().into_iter().collect())
+        .unwrap_or_default();
+
     // tick 消费：断开即结束本会话交外循环重连；停机即整体退出。
     while !stop.load(Ordering::SeqCst) {
         match md.next_event(MD_POLL_TIMEOUT) {
@@ -359,14 +399,42 @@ fn run_md_session(
                     ask = t.ask_price,
                     "CTP 行情 tick 到达"
                 );
-                let now = now_ms();
-                quotes.apply(&instrument_key(&t.instrument), tick_to_update(&t, now));
-                if let Some(obs) = observer {
-                    if let Some(price) = Decimal::try_from(t.last_price)
-                        .ok()
-                        .filter(|p| *p > Decimal::ZERO)
-                    {
-                        obs.on_quote(Venue::Ctp, MarketKind::Futures, &t.instrument, price);
+                // 作用域判定：业务兴趣集 / K线期望集（均会话开始预算，O(1) 查询）。
+                let in_business = business_set.contains(&t.instrument);
+                let in_kline = kline_set.contains(&t.instrument);
+
+                // 业务集 → QuoteTable + observer（原样）。
+                if in_business {
+                    let now = now_ms();
+                    quotes.apply(&instrument_key(&t.instrument), tick_to_update(&t, now));
+                    if let Some(obs) = observer {
+                        if let Some(price) = Decimal::try_from(t.last_price)
+                            .ok()
+                            .filter(|p| *p > Decimal::ZERO)
+                        {
+                            obs.on_quote(Venue::Ctp, MarketKind::Futures, &t.instrument, price);
+                        }
+                    }
+                }
+                // K线集 → 写 TickTable/LastVolumeTable + 聚合（与业务路径正交，可同走）。
+                if in_kline {
+                    if let Some(k) = kline {
+                        let day = t.trading_day_u32();
+                        if day != 0 {
+                            if let (Some(update_ms), Some(price)) =
+                                (t.update_utc_ms(), Decimal::try_from(t.last_price).ok())
+                            {
+                                let candle = crate::ctp::bar_agg::to_candle_tick(
+                                    day,
+                                    update_ms,
+                                    price,
+                                    t.volume as i64,
+                                    Decimal::try_from(t.turnover).unwrap_or(Decimal::ZERO),
+                                    Decimal::try_from(t.open_interest).unwrap_or(Decimal::ZERO),
+                                );
+                                k.stream.on_kline_tick(&t.instrument, &candle);
+                            }
+                        }
                     }
                 }
             }
@@ -424,6 +492,10 @@ mod tests {
             volume: 1000,
             update_time: "09:30:00".into(),
             update_millisec: 0,
+            trading_day: "20261023".into(),
+            action_day: "20261023".into(),
+            turnover: 0.0,
+            open_interest: 0.0,
         }
     }
 

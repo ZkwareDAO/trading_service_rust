@@ -68,6 +68,29 @@ impl InstrumentDir {
             })
     }
 
+    /// 列出属于给定产品代码集合且当前 `is_trading` 的合约（有序、去重）。
+    /// 供品种（如 cu）展开为该品种全部在交易合约（K线订阅）。
+    pub fn trading_instruments_for(
+        &self,
+        products: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .by_instrument
+            .iter()
+            .filter(|e| e.value().is_trading && products.contains(e.value().product_id.as_str()))
+            .map(|e| e.key().clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// 合约是否已知且在交易（K线订阅的成员判定/作用域分流用）。
+    pub fn is_trading(&self, instrument: &str) -> bool {
+        self.by_instrument
+            .get(instrument.trim())
+            .is_some_and(|e| e.value().is_trading)
+    }
+
     /// 已缓存的合约数（诊断/测试用）。
     pub fn len(&self) -> usize {
         self.by_instrument.len()

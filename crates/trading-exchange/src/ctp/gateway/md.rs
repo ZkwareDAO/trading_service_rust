@@ -113,6 +113,10 @@ impl MdSpi for EventMdSpi {
                 volume: d.Volume,
                 update_time: decode_fixed(&d.UpdateTime),
                 update_millisec: d.UpdateMillisec,
+                trading_day: decode_fixed(&d.TradingDay),
+                action_day: decode_fixed(&d.ActionDay),
+                turnover: d.Turnover,
+                open_interest: d.OpenInterest,
             }));
         }
     }
