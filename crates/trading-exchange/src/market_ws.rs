@@ -121,6 +121,19 @@ pub fn idle_dead(last_frame: Instant, now: Instant, timeout: Duration) -> bool {
     now.duration_since(last_frame) >= timeout
 }
 
+/// 桶起点 ms（UTC）→ YYYYMMDD 交易日。三家 7×24 交易所的原生 K线共用此口径。
+pub fn trading_day_of_utc_ms(start_ms: i64) -> u32 {
+    use chrono::TimeZone;
+    chrono::Utc
+        .timestamp_millis_opt(start_ms)
+        .single()
+        .unwrap_or_default()
+        .format("%Y%m%d")
+        .to_string()
+        .parse()
+        .unwrap_or(0)
+}
+
 /// hub 行情流句柄（每「连接」一个进程单例）：持注册表 + 驱动任务，实现
 /// [`MarketDataStream`]。动态消费者经两个 subscribe 方法登记；托管（系统行情）
 /// 来源由 provider 注册并把 guard 永久保存在本句柄内。

@@ -116,19 +116,6 @@ fn parse_candles(raw: &str) -> Option<(String, Vec<RawCandle>)> {
     Some((coin, candles))
 }
 
-/// 桶起点 ms（UTC）→ YYYYMMDD（HL 7×24，按 UTC 自然日）。
-fn trading_day_of(start_ms: i64) -> u32 {
-    use chrono::TimeZone;
-    chrono::Utc
-        .timestamp_millis_opt(start_ms)
-        .single()
-        .unwrap_or_default()
-        .format("%Y%m%d")
-        .to_string()
-        .parse()
-        .unwrap_or(0)
-}
-
 // =====================================================================
 // feed
 // =====================================================================
@@ -168,7 +155,7 @@ impl HlMarketFeed {
             venue: VENUE.to_string(),
             symbol: coin.to_string(),
             interval: KlineInterval::M1,
-            trading_day: trading_day_of(c.start_ms),
+            trading_day: crate::market_ws::trading_day_of_utc_ms(c.start_ms),
             start_ms: c.start_ms,
             end_ms: c.start_ms + 60_000,
             open: c.open,

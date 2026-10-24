@@ -197,16 +197,6 @@ fn parse_chart_frame(raw: &str) -> Vec<(String, Vec<RawCandle>)> {
     }
 }
 
-/// 把桶起点 ms（UTC）转为 YYYYMMDD 交易日（deribit 7×24，按 UTC 自然日）。
-fn trading_day_of(start_ms: i64) -> u32 {
-    use chrono::TimeZone;
-    let dt = chrono::Utc
-        .timestamp_millis_opt(start_ms)
-        .single()
-        .unwrap_or_default();
-    dt.format("%Y%m%d").to_string().parse().unwrap_or(0)
-}
-
 // =====================================================================
 // feed：WsDriver 协议端口实现
 // =====================================================================
@@ -250,7 +240,7 @@ impl DeribitMarketFeed {
             venue: VENUE.to_string(),
             symbol: symbol.to_string(),
             interval: KlineInterval::M1,
-            trading_day: trading_day_of(c.start_ms),
+            trading_day: crate::market_ws::trading_day_of_utc_ms(c.start_ms),
             start_ms: c.start_ms,
             end_ms: c.start_ms + 60_000,
             open: c.open,

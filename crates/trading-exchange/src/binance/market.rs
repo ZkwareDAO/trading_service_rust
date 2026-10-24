@@ -211,7 +211,7 @@ fn parse_kline_frame(text: &str) -> Option<Kline> {
         venue: VENUE.to_string(),
         symbol,
         interval: KlineInterval::M1,
-        trading_day: trading_day_of(start_ms),
+        trading_day: crate::market_ws::trading_day_of_utc_ms(start_ms),
         start_ms,
         end_ms,
         open: dec("o"),
@@ -222,19 +222,6 @@ fn parse_kline_frame(text: &str) -> Option<Kline> {
         turnover: dec("q"),
         open_interest: Decimal::ZERO,
     })
-}
-
-/// 桶起点 ms（UTC）→ YYYYMMDD。
-fn trading_day_of(start_ms: i64) -> u32 {
-    use chrono::TimeZone;
-    chrono::Utc
-        .timestamp_millis_opt(start_ms)
-        .single()
-        .unwrap_or_default()
-        .format("%Y%m%d")
-        .to_string()
-        .parse()
-        .unwrap_or(0)
 }
 
 // =====================================================================
