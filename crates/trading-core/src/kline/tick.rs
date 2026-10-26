@@ -1,55 +1,36 @@
-//! K线采集专用的三张「纯内存、不落盘」高频表（与 [`crate::quote::QuoteTable`] 同层）。
+//! CTP 原始 tick 的 WAL 待刷盘窗口。
 //!
-//! 仅 CTP 单连接行情在 B4 写入；都**不实现 Model、不注册 store-core、不做快照/恢复/
-//! 日切**——进程重启后为空，由 CTP 订阅重新填充。句柄以 `Arc` 自由跨线程共享，
-//! 所有方法同步、无 `.await`（DashMap 分片锁，纳秒~微秒级）。
+//! 与「每合约只留最新价」的 QuoteTable 不同：K线原始数据要求**每笔**留档，
+//! 故本表是有界追加窗口——CTP drain 线程对每笔 K线集 tick [`Self::append`]，
+//! trading-store 的 KlineRepo 定时 [`Self::drain_all`] 批量写 CSV，写成功即清空。
+//! 内存占用＝ flush 间隔 × tick 速率，与全天笔数无关。
 //!
-//! * [`TickTable`]：合约 → 最新一笔原始 tick（K线原始数据 CSV 的内存原料）；
-//! * [`LastVolumeTable`]：合约 → 当日最后累计成交量（主力选举原料）；
-//! * [`DominantTable`]：品种 → 当前主力（symbol + 交易日，收盘选举写入，次日冻结）。
+//! 纯内存、不实现 Model、不快照恢复；行模型 [`RawTick`] 在 trading-models。
 
-use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
-use dashmap::DashMap;
-use rust_decimal::Decimal;
+use trading_models::RawTick;
 
-/// 一笔原始 tick 的内存行（WAL 原料；B4 先落核心字段，五档等随 FFI 透传扩展）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TickRow {
-    /// 合约代码（如 cu2512）。
-    pub symbol: String,
-    /// 归属交易日 YYYYMMDD（CTP TradingDay，夜盘已归次日）。
-    pub trading_day: u32,
-    /// 交易所时间（ActionDay+UpdateTime+UpdateMillisec 合成 UTC ms）。
-    pub update_ms: i64,
-    /// 最新价。
-    pub last_price: Decimal,
-    /// 当日累计成交量（手）。
-    pub cum_volume: i64,
-    /// 当日累计成交额。
-    pub cum_turnover: Decimal,
-    /// 当前总持仓量。
-    pub open_interest: Decimal,
-}
+/// 待刷盘窗口的默认最大积压行数（背压硬上限）。flush 持续失败 + 行情持续到达时，
+/// 超过此值丢弃最新帧并计入 dropped，宁可丢 K线原始 tick 也不让进程 OOM
+/// （K线为旁路数据，不得拖垮订单/仓位等核心内存）。正常 5s flush 远达不到。
+pub const DEFAULT_MAX_PENDING_TICKS: usize = 1_000_000;
 
-impl TickRow {
-    pub fn new(symbol: impl Into<String>, trading_day: u32, update_ms: i64) -> Self {
-        Self {
-            symbol: symbol.into(),
-            trading_day,
-            update_ms,
-            last_price: Decimal::ZERO,
-            cum_volume: 0,
-            cum_turnover: Decimal::ZERO,
-            open_interest: Decimal::ZERO,
-        }
-    }
-}
-
-/// 合约 → 最新原始 tick（覆盖写，单写者=CTP drain 线程）。
-#[derive(Debug, Default)]
+/// 原始 tick WAL 待刷盘窗口（单写者＝CTP drain；flush 线程批量取出）。
+#[derive(Debug)]
 pub struct TickTable {
-    inner: DashMap<String, TickRow>,
+    rows: Mutex<Vec<RawTick>>,
+    /// 窗口积压上限：满后新帧丢弃。
+    capacity: usize,
+    /// 因积压达上限而丢弃的 tick 数（诊断/告警用）。
+    dropped: AtomicU64,
+}
+
+impl Default for TickTable {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_MAX_PENDING_TICKS)
+    }
 }
 
 impl TickTable {
@@ -57,200 +38,158 @@ impl TickTable {
         Self::default()
     }
 
-    /// 覆盖写入某合约的最新 tick。
-    pub fn put(&self, row: TickRow) {
-        self.inner.insert(row.symbol.clone(), row);
+    /// 指定积压上限构造（测试/按部署调参用）。
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            rows: Mutex::new(Vec::with_capacity(capacity.min(1024))),
+            capacity,
+            dropped: AtomicU64::new(0),
+        }
     }
 
-    pub fn get(&self, symbol: &str) -> Option<TickRow> {
-        self.inner.get(symbol).map(|r| r.value().clone())
+    /// 追加一笔原始 tick（按到达顺序保留，含非主力合约）；窗口积压达上限时
+    /// 丢弃该最新帧并累加 dropped（背压，不阻塞 drain 线程、不 OOM）。
+    pub fn append(&self, row: RawTick) {
+        let mut rows = self.rows.lock().unwrap();
+        if rows.len() >= self.capacity {
+            drop(rows);
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        rows.push(row);
     }
 
-    pub fn remove(&self, symbol: &str) {
-        self.inner.remove(symbol);
+    /// 因积压达上限而丢弃的累计 tick 数。
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
-    pub fn len(&self) -> usize {
-        self.inner.len()
+    /// 读取并清零丢弃计数（周期告警取增量用）。
+    pub fn take_dropped(&self) -> u64 {
+        self.dropped.swap(0, Ordering::Relaxed)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-}
-
-/// 合约 → 当日最后累计成交量（每笔 tick 覆盖）。主力选举按此比较各合约量。
-#[derive(Debug, Default)]
-pub struct LastVolumeTable {
-    inner: DashMap<String, i64>,
-}
-
-impl LastVolumeTable {
-    pub fn new() -> Self {
-        Self::default()
+    /// 当前窗口快照（不清空；诊断/测试用）。
+    pub fn snapshot(&self) -> Vec<RawTick> {
+        self.rows.lock().unwrap().clone()
     }
 
-    pub fn put(&self, symbol: &str, cum_volume: i64) {
-        self.inner.insert(symbol.to_string(), cum_volume);
+    /// 取出全部待写行并清空窗口（KlineRepo 批量写盘成功后调用）。
+    pub fn drain_all(&self) -> Vec<RawTick> {
+        std::mem::take(&mut *self.rows.lock().unwrap())
     }
 
-    pub fn get(&self, symbol: &str) -> Option<i64> {
-        self.inner.get(symbol).map(|v| *v.value())
-    }
-
-    pub fn remove(&self, symbol: &str) {
-        self.inner.remove(symbol);
-    }
-
-    /// 全表快照：(合约, 当日累计量)，按合约排序保证确定性（主力选举遍历用）。
-    pub fn snapshot(&self) -> Vec<(String, i64)> {
-        let mut out: Vec<(String, i64)> = self
-            .inner
-            .iter()
-            .map(|e| (e.key().clone(), *e.value()))
-            .collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
+    /// 写盘失败时把本批 tick 放回窗口**队首**（旧批在前、drain 后新到在后），
+    /// 下轮 flush 重试，不丢数据。
+    pub fn requeue_front(&self, mut batch: Vec<RawTick>) {
+        let mut guard = self.rows.lock().unwrap();
+        batch.append(&mut guard);
+        *guard = batch;
     }
 
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.rows.lock().unwrap().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-}
-
-/// 主力记录：品种下当前主力合约 + 选举归属交易日。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DominantEntry {
-    /// 主力合约（如 cu2512）。
-    pub symbol: String,
-    /// 写入时的交易日 YYYYMMDD（次日含夜盘整段冻结，不漂移）。
-    pub trading_day: u32,
-    /// 选举时该主力的当日累计量（诊断用）。
-    pub cum_volume: i64,
-}
-
-/// 品种（如 cu）→ 当前主力。收盘选举任务写入，行情/推送读。
-#[derive(Debug, Default)]
-pub struct DominantTable {
-    inner: DashMap<String, DominantEntry>,
-}
-
-impl DominantTable {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn put(&self, product: &str, entry: DominantEntry) {
-        self.inner.insert(product.to_string(), entry);
-    }
-
-    pub fn get(&self, product: &str) -> Option<DominantEntry> {
-        self.inner.get(product).map(|e| e.value().clone())
-    }
-
-    /// 主力符号快捷查询。
-    pub fn dominant_symbol(&self, product: &str) -> Option<String> {
-        self.inner.get(product).map(|e| e.symbol.clone())
-    }
-
-    pub fn remove(&self, product: &str) {
-        self.inner.remove(product);
-    }
-
-    /// 全表快照（品种 → 记录）。
-    pub fn snapshot(&self) -> HashMap<String, DominantEntry> {
-        self.inner
-            .iter()
-            .map(|e| (e.key().clone(), e.value().clone()))
-            .collect()
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.rows.lock().unwrap().is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
+    use trading_models::RawTick;
+
+    fn tick(symbol: &str, ts: i64, vol: i64) -> RawTick {
+        RawTick {
+            exchange: "ctp".into(),
+            symbol: symbol.into(),
+            timestamp: ts,
+            trading_day: 20261024,
+            price: Decimal::from(75_000 + vol),
+            open: Decimal::ZERO,
+            high: Decimal::ZERO,
+            low: Decimal::ZERO,
+            close: Decimal::ZERO,
+            volume: vol,
+            turnover: Decimal::ZERO,
+            open_interest: Decimal::ZERO,
+            bid: [Decimal::ZERO; 5],
+            ask: [Decimal::ZERO; 5],
+            bid_vol: [0; 5],
+            ask_vol: [0; 5],
+        }
+    }
 
     #[test]
-    fn tick_table_put_get_replace_remove() {
+    fn append_keeps_every_tick_in_arrival_order() {
+        // WAL 与「每合约只留最新」的覆盖表不同：每笔 K线集 tick（含非主力合约）
+        // 都必须按到达顺序留档，供批量追加 CSV。
         let t = TickTable::new();
         assert!(t.is_empty());
-        let mut row = TickRow::new("cu2512", 20261023, 1000);
-        row.cum_volume = 5;
-        t.put(row);
-        assert_eq!(t.len(), 1);
-        assert_eq!(t.get("cu2512").unwrap().cum_volume, 5);
+        t.append(tick("cu2511", 100, 10));
+        t.append(tick("cu2512", 200, 20));
+        t.append(tick("cu2511", 300, 11));
+        assert_eq!(t.len(), 3);
 
-        // 覆盖写。
-        let mut row2 = TickRow::new("cu2512", 20261023, 2000);
-        row2.cum_volume = 9;
-        t.put(row2);
-        assert_eq!(t.get("cu2512").unwrap().cum_volume, 9);
-        assert_eq!(t.get("cu2512").unwrap().update_ms, 2000);
-
-        t.remove("cu2512");
-        assert!(t.get("cu2512").is_none());
-        assert!(t.is_empty());
-    }
-
-    #[test]
-    fn last_volume_snapshot_sorted() {
-        let t = LastVolumeTable::new();
-        t.put("cu2601", 100);
-        t.put("cu2512", 500);
-        t.put("rb2611", 7);
-        let snap = t.snapshot();
-        // 按合约字典序，与插入顺序无关。
+        let all = t.snapshot();
+        assert_eq!(all.len(), 3);
         assert_eq!(
-            snap,
-            vec![
-                ("cu2512".to_string(), 500),
-                ("cu2601".to_string(), 100),
-                ("rb2611".to_string(), 7),
-            ]
+            all.iter()
+                .map(|r| (r.symbol.as_str(), r.timestamp))
+                .collect::<Vec<_>>(),
+            vec![("cu2511", 100), ("cu2512", 200), ("cu2511", 300)]
         );
-        assert_eq!(t.get("cu2512"), Some(500));
-        assert_eq!(t.get("nope"), None);
     }
 
     #[test]
-    fn dominant_table_put_get_and_symbol() {
-        let d = DominantTable::new();
-        assert!(d.dominant_symbol("cu").is_none());
-        d.put(
-            "cu",
-            DominantEntry {
-                symbol: "cu2512".into(),
-                trading_day: 20261023,
-                cum_volume: 500,
-            },
+    fn drain_all_returns_everything_and_clears_window() {
+        // flush 取出全部待写行：成功写盘后窗口必须清空，下批不重复。
+        let t = TickTable::new();
+        t.append(tick("cu2512", 1, 1));
+        t.append(tick("cu2512", 2, 2));
+
+        let batch = t.drain_all();
+        assert_eq!(batch.len(), 2);
+        assert!(t.is_empty());
+        // 再 drain 一次为空（不重复出旧数据）。
+        assert!(t.drain_all().is_empty());
+
+        // 清空后仍可继续追加（写盘任务与 drain 线程并发的正常节奏）。
+        t.append(tick("rb2611", 3, 3));
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn append_drops_newest_and_counts_when_capacity_saturated() {
+        // 背压硬上限：窗口满后丢最新帧（不入队）并累加 dropped，不 OOM、不阻塞。
+        let t = TickTable::with_capacity(2);
+        t.append(tick("a", 1, 1));
+        t.append(tick("b", 2, 2));
+        t.append(tick("c", 3, 3)); // 达上限，丢弃
+        t.append(tick("d", 4, 4)); // 继续丢弃
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.dropped_count(), 2);
+        // 已入队的前两帧保留（FIFO，旧数据不被新数据顶掉）。
+        let snap = t.snapshot();
+        assert_eq!(
+            snap.iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
         );
-        assert_eq!(d.dominant_symbol("cu").as_deref(), Some("cu2512"));
-        let e = d.get("cu").unwrap();
-        assert_eq!(e.trading_day, 20261023);
-        assert_eq!(d.len(), 1);
-        // 换月选举覆盖。
-        d.put(
-            "cu",
-            DominantEntry {
-                symbol: "cu2601".into(),
-                trading_day: 20261024,
-                cum_volume: 900,
-            },
-        );
-        assert_eq!(d.dominant_symbol("cu").as_deref(), Some("cu2601"));
-        d.remove("cu");
-        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn requeue_front_is_not_subject_to_capacity_drop() {
+        // 写盘失败重放的整批必须完整放回（不受容量上限丢弃），下轮重试不丢数据。
+        let t = TickTable::with_capacity(1);
+        let mut batch = vec![tick("a", 1, 1), tick("b", 2, 2), tick("c", 3, 3)];
+        // 模拟 drain 取出后又有新帧入队，失败 requeue 时整批在前。
+        t.append(tick("new", 9, 9));
+        batch.append(&mut t.drain_all());
+        t.requeue_front(batch);
+        assert_eq!(t.len(), 4, "重放批 + 新帧全部保留，不被容量裁剪");
+        assert_eq!(t.dropped_count(), 0);
     }
 }

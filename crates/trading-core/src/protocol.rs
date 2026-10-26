@@ -132,6 +132,23 @@ pub struct SouthCommand {
     /// 创建为 pending（链式后继，等待激活）；缺省 active。
     #[serde(default)]
     pub pending: bool,
+
+    // —— subscribe_kline / unsubscribe_kline 专用（其余命令忽略）——
+    /// 要订阅的标的列表：具体合约（BTCUSDT/cu2512）或 CTP 品种前缀（cu）。
+    /// 兼容单标的 `symbol`：未给 symbols 时服务层回退取 instrument()。
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    /// K线周期；缺省/仅支持 "1m"。
+    #[serde(default)]
+    pub interval: Option<String>,
+}
+
+/// K线周期统一归一：空/1m/1min/1minute → "1m"；其余 None（本期仅支持 1m）。
+pub fn normalize_kline_interval(raw: Option<&str>) -> Option<&'static str> {
+    match raw.unwrap_or("1m").trim().to_ascii_lowercase().as_str() {
+        "" | "1m" | "1min" | "1minute" => Some("1m"),
+        _ => None,
+    }
 }
 
 /// 标的类型归一化：futures/perpetual/swap/futures_usdm -> futures，option -> option，
@@ -350,6 +367,44 @@ pub struct ClientEvent {
     pub message: Option<String>,
     #[serde(default)]
     pub positions: Option<Vec<PositionSnapshot>>,
+    /// type=kline_1m 时的定稿 bar 载荷（其余事件为 None）。
+    #[serde(default)]
+    pub kline: Option<KlineEvent>,
+}
+
+/// `kline_1m` 推送载荷：一根已定稿的 1 分钟 K线（只推定稿，不补历史）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KlineEvent {
+    /// 交易所标识（binance/deribit/hyperliquid/ctp）。
+    pub venue: String,
+    /// 标的：CTP 如实为具体合约（cu2512，不拼主力连续）。
+    pub symbol: String,
+    /// 周期标识（本期仅 "1m"）。
+    pub interval: String,
+    /// 归属交易日 YYYYMMDD（CTP 夜盘归次日）。
+    pub trading_day: u32,
+    /// 桶开始时间（UTC 毫秒，含）。
+    pub start_time: i64,
+    /// 桶结束时间（UTC 毫秒，不含）。
+    pub end_time: i64,
+    #[serde(with = "decimal_wire")]
+    pub open: Decimal,
+    #[serde(with = "decimal_wire")]
+    pub high: Decimal,
+    #[serde(with = "decimal_wire")]
+    pub low: Decimal,
+    #[serde(with = "decimal_wire")]
+    pub close: Decimal,
+    /// 周期内成交量（增量；WS 所按各自口径，CTP 为累计差分）。
+    pub volume: i64,
+    /// 周期内成交额（增量）；不产出该字段的所为 None。
+    #[serde(default)]
+    #[serde(with = "decimal_wire::opt")]
+    pub turnover: Option<Decimal>,
+    /// 周期末总持仓量（CTP）；其余所为 None。
+    #[serde(default)]
+    #[serde(with = "decimal_wire::opt")]
+    pub open_interest: Option<Decimal>,
 }
 
 /// 持仓快照（get_position 应答元素，来自交易所实时查询）。
@@ -391,6 +446,7 @@ impl ClientEvent {
             filled_quantity: Some(order.filled_quantity),
             message: None,
             positions: None,
+            kline: None,
         }
     }
 
@@ -413,6 +469,7 @@ impl ClientEvent {
             filled_quantity: None,
             message: Some(message.into()),
             positions: None,
+            kline: None,
         }
     }
 
@@ -436,6 +493,7 @@ impl ClientEvent {
             filled_quantity: None,
             message: Some(message.into()),
             positions: None,
+            kline: None,
         }
     }
 
@@ -460,6 +518,31 @@ impl ClientEvent {
                 "持仓来自交易所实时查询，position_id 由服务端按内存活跃仓 join 回填".to_string(),
             ),
             positions: Some(positions),
+            kline: None,
+        }
+    }
+
+    /// 定稿 1 分钟 K线推送（type=kline_1m）；广播给订阅者，不带订单身份。
+    pub fn kline_1m(k: KlineEvent) -> Self {
+        ClientEvent {
+            kind: "kline_1m".to_string(),
+            status: None,
+            client_order_id: None,
+            signal_id: None,
+            exchange_order_id: None,
+            exchange: Some(k.venue.clone()),
+            strategy_name: None,
+            instrument: Some(k.symbol.clone()),
+            side: None,
+            order_type: None,
+            order_price: None,
+            order_quantity: None,
+            reduce_only: None,
+            filled_price: None,
+            filled_quantity: None,
+            message: None,
+            positions: None,
+            kline: Some(k),
         }
     }
 }
@@ -594,6 +677,57 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let back: PositionSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.position_id, Some(7));
+    }
+
+    #[test]
+    fn subscribe_kline_command_parses_symbols_and_interval() {
+        let raw = r#"{"option":"subscribe_kline","exchange":"ctp","instrument_type":"futures","symbols":["cu","cu2512"],"interval":"1m"}"#;
+        let cmd: SouthCommand = serde_json::from_str(raw).unwrap();
+        assert_eq!(cmd.option_kind(), "subscribe_kline");
+        assert_eq!(cmd.symbols, vec!["cu", "cu2512"]);
+        assert_eq!(cmd.interval.as_deref(), Some("1m"));
+        // 旧报文（无 symbols/interval）默认空列表/缺省，向后兼容。
+        let old: SouthCommand = serde_json::from_str(r#"{"option":"place_order"}"#).unwrap();
+        assert!(old.symbols.is_empty());
+        assert_eq!(old.interval, None);
+    }
+
+    #[test]
+    fn kline_interval_normalizes_leniently_or_rejects() {
+        assert_eq!(normalize_kline_interval(None), Some("1m"));
+        assert_eq!(normalize_kline_interval(Some("")), Some("1m"));
+        assert_eq!(normalize_kline_interval(Some("1M")), Some("1m"));
+        assert_eq!(normalize_kline_interval(Some("5m")), None);
+    }
+
+    #[test]
+    fn kline_1m_event_round_trips_with_bar_payload() {
+        let ev = ClientEvent::kline_1m(KlineEvent {
+            venue: "ctp".into(),
+            symbol: "cu2512".into(),
+            interval: "1m".into(),
+            trading_day: 20261024,
+            start_time: 60_000,
+            end_time: 120_000,
+            open: rust_decimal::Decimal::from(75000),
+            high: rust_decimal::Decimal::from(75200),
+            low: rust_decimal::Decimal::from(74950),
+            close: rust_decimal::Decimal::from(75100),
+            volume: 12,
+            turnover: Some(rust_decimal::Decimal::from(900000)),
+            open_interest: None,
+        });
+        assert_eq!(ev.kind, "kline_1m");
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: ClientEvent = serde_json::from_str(&json).unwrap();
+        let k = back.kline.unwrap();
+        assert_eq!(k.symbol, "cu2512");
+        assert_eq!(k.trading_day, 20261024);
+        assert_eq!(k.volume, 12);
+        assert_eq!(k.turnover, Some(rust_decimal::Decimal::from(900000)));
+        assert!(json.contains("\"type\":\"kline_1m\""));
+        // 避免未用告警：占位引用宏路径（实际用全路径）。
+        let _ = std::any::type_name::<Decimal>();
     }
 
     #[test]
