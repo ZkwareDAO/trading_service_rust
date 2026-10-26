@@ -3,10 +3,11 @@
 //! 三个 model 均实现 [`store_core::Model`]：
 //! - `deleted` 在 CSV 中存 0/1；
 //! - `created_at` / `updated_at` 为 UTC 毫秒时间戳，由框架自动维护；
-//! - 价格/数量/金额统一使用 [`rust_decimal::Decimal`] 定点数（文档中 Position
-//!   标注的 float64 经评审改为 Decimal，禁止浮点累加与相等判定）。
+//! - 价格/数量/金额统一使用 [`rust_decimal::Decimal`] 定点数（Position 早期
+//!   设计的 float64 经评审改为 Decimal，禁止浮点累加与相等判定）。
 
 pub mod account;
+pub mod bar;
 pub mod order;
 pub mod order_rule;
 pub mod position;
@@ -16,6 +17,9 @@ pub mod types;
 pub mod watch_rule;
 
 pub use account::{Account, SecretCipher, ACCOUNT_CSV_HEADER, SECRET_PREFIX};
+pub use bar::{
+    Bar, RawTick, RawTickParseError, BAR_CSV_HEADER, RAW_TICK_COLUMNS, RAW_TICK_CSV_HEADER,
+};
 pub use order::{Order, OrderStatus, OrderType, TimeInForce};
 pub use order_rule::{OrderRule, OrderRuleKey, PriceTier};
 pub use position::{revalue_positions, Position, PositionPrice, QtyUnit, ROI_SCALE};

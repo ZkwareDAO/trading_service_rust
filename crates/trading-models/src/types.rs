@@ -3,7 +3,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// 标的/合约类型（Order / Position 共用）。CSV 中存小写字符串。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum InstrumentType {
     /// 现货（缺省值）。
