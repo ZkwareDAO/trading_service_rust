@@ -91,6 +91,59 @@ impl InstrumentDir {
             .is_some_and(|e| e.value().is_trading)
     }
 
+    /// 从 `data/ctp-specs/instruments.csv` 内容冷启动加载（只解析、不碰文件路径，
+    /// 文件定位/读取由宿主装配层负责，保持本层不做文件 IO）。
+    ///
+    /// 列序固定（见 ctp-fetch-specs 产出）：
+    /// `0 instrument_id, 1 exchange_id, 2 product_id, 4 product_class,
+    ///  5 volume_multiple, 6 price_tick, 11 long_margin_ratio,
+    ///  12 short_margin_ratio, 13 is_trading`。
+    ///
+    /// 过滤口径：**仅收 product_class=1（期货）且 is_trading=1**；期权(2)/
+    /// 组合(3,5,6,7) 与摘牌合约一律不入内存表（K线品种展开只需在交易期货）。
+    /// 表头（含可能的 UTF-8 BOM）与缺列/坏行跳过，不致命；返回实际入表条数。
+    pub fn load_from_csv(&self, reader: impl std::io::Read) -> std::io::Result<usize> {
+        use std::io::{BufRead, BufReader};
+        let mut loaded = 0usize;
+        for (idx, line) in BufReader::new(reader).lines().enumerate() {
+            let line = line?;
+            // 首行表头：按列数与首列名识别（BOM 在首列名内也能命中 contains）。
+            if idx == 0 && line.contains("instrument_id") {
+                continue;
+            }
+            if let Some(info) = parse_instrument_csv_row(&line) {
+                self.remember(info);
+                loaded += 1;
+            }
+        }
+        Ok(loaded)
+    }
+
+    /// 以最新快照**整体重灌**：先剔除新集合中已不存在（摘牌/不再是在交易期货）
+    /// 的旧合约，再逐条 upsert（[`Self::remember`] 负责 trim/规范化/后到覆盖），
+    /// 返回新集合写入条数。
+    ///
+    /// 在**同一实例**（同一 `Arc`）上原地更新（DashMap `retain` + insert），
+    /// 行情流/各账户会话/build_api 等既有持有方无需换句柄即可看到最新集合。
+    /// 供每日规格刷新实现「以新替旧」语义；与 `load_from_csv` 的纯追加不同，
+    /// 本方法会移除快照里已消失的合约。
+    pub fn replace_all(&self, rows: impl IntoIterator<Item = InstrumentInfo>) -> usize {
+        let incoming: Vec<InstrumentInfo> = rows.into_iter().collect();
+        // 新集合的合约键（trim、去空白）；与 remember 的规范化口径一致。
+        let keys: std::collections::HashSet<String> = incoming
+            .iter()
+            .map(|i| i.instrument.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect();
+        // 先剔除新集合中已不存在的旧合约……
+        self.by_instrument.retain(|k, _| keys.contains(k));
+        // ……再逐条 upsert（后到覆盖，可纠正乘数/跳价/保证金率漂移）。
+        for info in incoming {
+            self.remember(info);
+        }
+        keys.len()
+    }
+
     /// 已缓存的合约数（诊断/测试用）。
     pub fn len(&self) -> usize {
         self.by_instrument.len()
@@ -100,6 +153,47 @@ impl InstrumentDir {
     pub fn is_empty(&self) -> bool {
         self.by_instrument.is_empty()
     }
+}
+
+/// 解析 instruments.csv 的一行（固定列序，见 [`InstrumentDir::load_from_csv`]）。
+/// 仅当 product_class=1（期货）且 is_trading=1 时返回 [`InstrumentInfo`]；
+/// 期权/组合/摘牌/缺列/数值非法返回 None（跳过）。
+fn parse_instrument_csv_row(line: &str) -> Option<InstrumentInfo> {
+    let f: Vec<&str> = line.split(',').collect();
+    // 至少需要到 is_trading（第 14 列，索引 13）。
+    if f.len() < 14 {
+        return None;
+    }
+    let instrument = f[0].trim().trim_start_matches('\u{feff}');
+    if instrument.is_empty() {
+        return None;
+    }
+    // product_class=1 期货；其余（2 期权、3 组合、5/6/7 等）不收。
+    if f[4].trim() != "1" {
+        return None;
+    }
+    // is_trading=1 才在交易。
+    if f[13].trim() != "1" {
+        return None;
+    }
+    let parse_i32 = |s: &str| s.trim().parse::<i32>().unwrap_or(0);
+    let parse_f64 = |s: &str| {
+        s.trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0)
+    };
+    Some(InstrumentInfo {
+        instrument: instrument.to_string(),
+        exchange_id: f[1].trim().to_string(),
+        product_id: f[2].trim().to_string(),
+        is_trading: true,
+        volume_multiple: parse_i32(f[5]),
+        price_tick: parse_f64(f[6]),
+        long_margin_ratio: parse_f64(f[11]),
+        short_margin_ratio: parse_f64(f[12]),
+    })
 }
 
 #[cfg(test)]
@@ -173,5 +267,86 @@ mod tests {
         assert!((short - 0.20).abs() < 1e-12, "空头保证金率");
         // 未预热合约：返回 (0,0)，调用方据此判比率未就绪（不猜测）。
         assert_eq!(dir.margin_ratios("nope"), (0.0, 0.0));
+    }
+
+    #[test]
+    fn load_from_csv_ingests_only_futures_and_maps_fields() {
+        // 列序与 data/ctp-specs/instruments.csv 一致（BOM 仅在表头首列，按列索引取）。
+        let csv = "\u{feff}instrument_id,exchange_id,product_id,instrument_name,product_class,volume_multiple,price_tick,min_limit_volume,max_limit_volume,min_market_volume,max_market_volume,long_margin_ratio,short_margin_ratio,is_trading,open_date,expire_date\n\
+cu2611,SHFE,cu,cu2611,1,5,10,1,500,1,60,0.1,0.1,1,20251118,20261116\n\
+cu2612,SHFE,cu,cu2612,1,5,10,1,500,1,60,0.07,0.07,1,20251216,20261215\n\
+cu2612C146000,SHFE,cu_o,cu2612C146000,2,5,2,1,100,1,30,0.2,0.2,1,20260402,20261124\n\
+zz9999,XXXX,zz,zz9999,3,1,1,1,10,1,10,0,0,1,20260101,20261231\n";
+        let dir = InstrumentDir::new();
+        let n = dir.load_from_csv(csv.as_bytes()).expect("parse ok");
+        // 仅 product_class=1 期货（2 条）；期权(2)/组合(3) 剔除。
+        assert_eq!(n, 2);
+        assert_eq!(dir.len(), 2);
+        let cu2611 = dir.get("cu2611").expect("cu2611 loaded");
+        assert_eq!(cu2611.exchange_id, "SHFE");
+        assert_eq!(cu2611.product_id, "cu");
+        assert!(cu2611.is_trading);
+        assert_eq!(cu2611.volume_multiple, 5);
+        assert_eq!(cu2611.price_tick as i64, 10);
+        assert!((cu2611.long_margin_ratio - 0.1).abs() < 1e-12);
+        assert!(dir.get("cu2612C146000").is_none(), "期权不入内存表");
+        assert!(dir.get("zz9999").is_none(), "非期货不入内存表");
+    }
+
+    #[test]
+    fn load_from_csv_skips_non_trading_and_bad_rows() {
+        // is_trading=0 的摘牌期货不收；缺列/坏行跳过不致命。
+        let csv = "instrument_id,exchange_id,product_id,instrument_name,product_class,volume_multiple,price_tick,min_limit_volume,max_limit_volume,min_market_volume,max_market_volume,long_margin_ratio,short_margin_ratio,is_trading,open_date,expire_date\n\
+rb2610,SHFE,rb,rb2610,1,10,1,1,500,1,60,0.1,0.1,0,20251018,20261016\n\
+ag2612,SHFE,ag,ag2612,1,15,1,1,500,1,60,0.1,0.1,1,20251216,20261215\n\
+broken,row\n";
+        let dir = InstrumentDir::new();
+        let n = dir.load_from_csv(csv.as_bytes()).expect("parse ok");
+        assert_eq!(n, 1, "只收在交易期货 ag2612");
+        assert!(dir.get("rb2610").is_none());
+        assert!(dir.get("ag2612").is_some());
+    }
+
+    #[test]
+    fn replace_all_upserts_and_removes_missing_contracts() {
+        // 初始：rb2510 + i2601 两条。
+        let dir = InstrumentDir::new();
+        dir.remember(info("rb2510", "SHFE", 10, 1.0));
+        dir.remember(info("i2601", "DCE", 100, 0.5));
+        assert_eq!(dir.len(), 2);
+
+        // 新快照：rb2510（乘数/tick 变更）+ cu2611；i2601 已消失。
+        let n = dir.replace_all([
+            info("rb2510", "SHFE", 12, 1.0),
+            info("cu2611", "SHFE", 5, 10.0),
+        ]);
+
+        // 返回新集合条数；同一实例上 i2601 被移除、rb2510 被覆盖、cu2611 新增。
+        assert_eq!(n, 2);
+        assert_eq!(dir.len(), 2);
+        assert!(dir.get("i2601").is_none(), "消失合约应被剔除");
+        assert_eq!(dir.multiple("rb2510"), 12, "已存在合约应被覆盖");
+        assert_eq!(dir.get("cu2611").map(|i| i.price_tick), Some(10.0));
+    }
+
+    #[test]
+    fn replace_all_clears_dir_when_snapshot_empty() {
+        let dir = InstrumentDir::new();
+        dir.remember(info("rb2510", "SHFE", 10, 1.0));
+        assert_eq!(dir.replace_all([]), 0);
+        assert!(dir.is_empty());
+    }
+
+    #[test]
+    fn load_from_csv_trading_instruments_filters_product() {
+        // 品种展开只得到该 product_id 的在交易期货合约（排除期权 product_id）。
+        let csv = "\u{feff}instrument_id,exchange_id,product_id,instrument_name,product_class,volume_multiple,price_tick,min_limit_volume,max_limit_volume,min_market_volume,max_market_volume,long_margin_ratio,short_margin_ratio,is_trading,open_date,expire_date\n\
+cu2611,SHFE,cu,cu2611,1,5,10,1,500,1,60,0.1,0.1,1,20251118,20261116\n\
+cu2612,SHFE,cu,cu2612,1,5,10,1,500,1,60,0.1,0.1,1,20251216,20261215\n\
+cu2612C146000,SHFE,cu_o,cu2612C146000,2,5,2,1,100,1,30,0.2,0.2,1,20260402,20261124\n";
+        let dir = InstrumentDir::new();
+        dir.load_from_csv(csv.as_bytes()).unwrap();
+        let got = dir.trading_instruments_for(&std::collections::HashSet::from(["cu".to_string()]));
+        assert_eq!(got, vec!["cu2611".to_string(), "cu2612".to_string()]);
     }
 }

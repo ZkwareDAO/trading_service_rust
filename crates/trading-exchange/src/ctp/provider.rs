@@ -6,11 +6,14 @@
 use std::sync::Arc;
 
 use std::sync::atomic::AtomicBool;
+use std::sync::Mutex;
 
 use tokio::task::JoinHandle;
 
 use crate::ctp::account_consumer::{CtpVenueConnector, SessionRegistry};
 use crate::ctp::core::account::CtpAccount;
+use crate::ctp::instrument_dir::InstrumentDir;
+use crate::ctp::spec_fetch::{self, SpecSnapshot};
 use crate::ctp::{api::CtpApi, CtpConfig};
 use crate::port::{ExchangeCredential, OrderEventSink};
 use crate::position_profile::PositionProfile;
@@ -18,6 +21,22 @@ use crate::provider::{ProviderDeps, VenueProvider};
 
 /// ctp 唯一规范名（大小写敏感精确匹配，无别名）。
 pub const NAME: &str = "ctp";
+
+/// 一次规格刷新落库的三类条数（管理 API 应答/日志用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecRefreshCounts {
+    /// 全量合约条数（含期权/组合）。
+    pub instruments: usize,
+    /// 其中在交易期货条数。
+    pub futures: usize,
+    /// 投资者手续费率条数。
+    pub commissions: usize,
+}
+
+/// 已有一次规格刷新在执行（互斥冲突）；管理 API 据此回 409 而非 500。
+#[derive(Debug, thiserror::Error)]
+#[error("已有一次 CTP 规格刷新在执行，请稍后再试")]
+pub struct SpecRefreshBusy;
 
 /// CTP 套件 provider（持有装配依赖与运行参数）。
 pub struct CtpProvider {
@@ -30,20 +49,55 @@ pub struct CtpProvider {
     /// 连接器逐次新建，这些状态必须跨热加载存活）。
     sessions: Arc<SessionRegistry>,
     /// 进程级共享合约静态目录（交易所/乘数/最小变动价位；合约查询预热，全局一致）。
-    /// 供 prepare_placement 判 SHFE/取 tick，并注入每个账户会话线程。
-    instrument_dir: Arc<crate::ctp::instrument_dir::InstrumentDir>,
+    /// 供 prepare_placement 判 SHFE/取 tick，并注入每个账户会话线程。规格刷新时
+    /// 在**同一 Arc 上原地重灌**（[`InstrumentDir::replace_all`]：retain 新集合 +
+    /// upsert），行情流/各会话/build_api 等既有持有方自动看到最新合约。
+    instrument_dir: Arc<InstrumentDir>,
+    /// 规格刷新互斥（拒绝并发刷新）：短会话固定使用 `spec-refresh/` 流目录，
+    /// 同一流目录不能并存两个 TraderApi（con 文件互踩）。持有 unit guard 即占用，
+    /// try_lock 失败说明已有刷新在跑（handler 回 409）。
+    spec_refreshing: Mutex<()>,
     /// 交易所级统一行情流单例（业务兴趣 ∪ K线集共用一条 ctp-md 连接）。
     market_stream: std::sync::OnceLock<Arc<crate::ctp::market_stream::CtpMarketStream>>,
 }
 
 impl CtpProvider {
     pub fn new(deps: ProviderDeps, config: CtpConfig) -> Self {
+        let instrument_dir = Arc::new(crate::ctp::instrument_dir::InstrumentDir::new());
+        // 冷启动种子：最新一份 instruments.csv（仅在交易期货）灌入内存表，
+        // 使品种订阅在交易侧在线合约查询返回前即可展开；文件缺失不阻断启动。
+        if let Some(path) = config.instrument_specs_path.as_ref() {
+            if path.exists() {
+                match std::fs::File::open(path) {
+                    Ok(f) => match instrument_dir.load_from_csv(f) {
+                        Ok(n) => tracing::info!(
+                            path = %path.display(),
+                            instruments = n,
+                            "CTP 合约规格种子已加载（冷启动）"
+                        ),
+                        Err(e) => tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "CTP 合约规格种子读取失败，回退在线预热"
+                        ),
+                    },
+                    Err(e) => tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "CTP 合约规格种子打开失败，回退在线预热"
+                    ),
+                }
+            } else {
+                tracing::debug!(path = %path.display(), "CTP 合约规格种子不存在，纯在线预热");
+            }
+        }
         Self {
             deps,
             config,
             md_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Arc::new(SessionRegistry::default()),
-            instrument_dir: Arc::new(crate::ctp::instrument_dir::InstrumentDir::new()),
+            instrument_dir,
+            spec_refreshing: Mutex::new(()),
             market_stream: std::sync::OnceLock::new(),
         }
     }
@@ -58,6 +112,7 @@ impl CtpProvider {
                 Arc::clone(&self.deps.ctp_last_volumes),
                 Arc::clone(&self.deps.ctp_dominants),
                 Arc::clone(&self.instrument_dir),
+                self.config.kline_products.clone(),
             )
         });
         Ok(Arc::clone(stream))
@@ -98,6 +153,73 @@ impl CtpProvider {
             front_address: c.front_address.to_string(),
             is_production_mode: c.is_production_mode,
         })
+    }
+
+    /// 每日规格刷新（管理 API 在 `spawn_blocking` 内调用）：
+    /// 1. 用一个独立临时 trader 短连接**阻塞**拉全量合约 + 投资者手续费率；
+    /// 2. 经 `persist` 闭包交宿主持久化（service 层转 store 行写日期文件 + latest；
+    ///    exchange 不依赖 trading-store、不做文件 IO）；
+    /// 3. 用最新「在交易期货」快照**原地重灌**共享 [`InstrumentDir`]（同一 Arc）。
+    ///
+    /// 互斥：同一时刻只允许一个刷新（短会话独占 `spec-refresh/` 流目录）。
+    /// 已有刷新在跑时**立即**返回错误（不排队，调用方回 409）。
+    ///
+    /// 顺序保证：先落盘成功才重灌内存，使内存目录不领先于磁盘冷启动种子。
+    /// 落盘日期口径由 `persist` 闭包自行掌握（exchange 层不关心日期/文件）。
+    pub fn refresh_specs(
+        &self,
+        persist: impl FnOnce(&SpecSnapshot) -> anyhow::Result<()>,
+    ) -> anyhow::Result<SpecRefreshCounts> {
+        // 立即 try_lock：刷新耗时数十秒，绝不让第二个 HTTP 请求在此阻塞排队。
+        // 持有 unit guard 本身即占用；其生命周期覆盖整个刷新，函数返回（正常/错误/
+        // panic unwind）时自动释放——无需额外布尔位。
+        let _gate = match self.spec_refreshing.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // 类型化错误：handler 据此回 409（不排队、不当作 500）。
+                return Err(anyhow::Error::new(SpecRefreshBusy));
+            }
+            // 上次刷新线程 panic 中毒：恢复并继续（后续为全新短会话，状态自洽）。
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        };
+        self.refresh_specs_locked(persist)
+    }
+
+    fn refresh_specs_locked(
+        &self,
+        persist: impl FnOnce(&SpecSnapshot) -> anyhow::Result<()>,
+    ) -> anyhow::Result<SpecRefreshCounts> {
+        // 规格是交易所级全局数据，账户只用于登录鉴权；统一用 venue.toml
+        // `[ctp].md_account`（行情/规格共用的登录账户），与行情线程同源。
+        let name = self.config.md_account.clone().ok_or_else(|| {
+            anyhow::anyhow!("规格刷新缺少账户：请在 venue.toml 配置 [ctp].md_account")
+        })?;
+        let acct = self.ctp_account(&name)?;
+
+        // 1) 阻塞短会话拉全量（数十秒；调用方已置于 spawn_blocking）。
+        let snapshot =
+            spec_fetch::fetch_all_specs(&acct, &self.config.trader_so, &self.config.flow_path)?;
+        let counts = SpecRefreshCounts {
+            instruments: snapshot.instruments.len(),
+            futures: snapshot.futures_count(),
+            commissions: snapshot.commissions.len(),
+        };
+
+        // 2) 先落盘（失败则不重灌内存，保留旧目录）。
+        persist(&snapshot)?;
+
+        // 3) 原地重灌共享合约目录（仅在交易期货）；retain 新集合，摘牌合约被移除。
+        let dir_rows = spec_fetch::to_trading_futures_dir_rows(&snapshot);
+        let loaded = self.instrument_dir.replace_all(dir_rows);
+        tracing::info!(
+            account = %name,
+            instruments = counts.instruments,
+            futures = counts.futures,
+            commissions = counts.commissions,
+            dir_loaded = loaded,
+            "CTP 合约规格刷新完成：已落盘并重灌共享合约目录"
+        );
+        Ok(counts)
     }
 }
 
@@ -192,6 +314,11 @@ impl VenueProvider for CtpProvider {
                 return;
             }
         };
+        // 冷启动预设主力（venue.toml [ctp].preset_dominants）：盘中重启/未到
+        // 15:00 选举窗口时也能让品种订阅立即只推指定合约；空配置为 no-op。
+        if !self.config.preset_dominants.is_empty() {
+            stream.preset_dominants(&self.config.preset_dominants);
+        }
         stream.spawn_election(Arc::clone(&self.md_stop));
         crate::ctp::market::spawn_market_worker(
             crate::ctp::market::MdParams {
@@ -420,6 +547,46 @@ mod tests {
             test_config(),
         );
         assert!(p.ctp_account("nobody").is_err());
+    }
+
+    // ---- refresh_specs：并发闸门 / 账户缺失（均不触 FFI）----
+
+    fn provider_without_creds() -> CtpProvider {
+        CtpProvider::new(
+            deps_with(Arc::new(StubResolver(Mutex::new(
+                std::collections::HashMap::new(),
+            )))),
+            test_config(),
+        )
+    }
+
+    #[test]
+    fn refresh_specs_rejects_when_already_running() {
+        // Arrange：持有 unit guard 模拟一次刷新正在执行（guard 存活到用例结束）。
+        let p = provider_without_creds();
+        let _held = p.spec_refreshing.lock().unwrap();
+
+        // Act：persist 绝不应被调用（在闸门处即拒绝）。
+        let err = p
+            .refresh_specs(|_| panic!("并发刷新不应进入落盘回调"))
+            .unwrap_err();
+
+        // Assert：类型化为 SpecRefreshBusy（handler 据此回 409）。
+        assert!(err.downcast_ref::<SpecRefreshBusy>().is_some());
+    }
+
+    #[test]
+    fn refresh_specs_missing_account_errors_and_releases_gate() {
+        // Arrange：for_tests 的 md_account=Some("test")，但 resolver 为空 → 解析失败，
+        // 且失败发生在 FFI 建连之前。
+        let p = provider_without_creds();
+
+        // Act。
+        let err = p.refresh_specs(|_| Ok(())).unwrap_err();
+
+        // Assert：不是并发冲突（是账户错误）；闸门经 RAII 已释放，可再次获取。
+        assert!(err.downcast_ref::<SpecRefreshBusy>().is_none());
+        assert!(p.spec_refreshing.try_lock().is_ok());
     }
 
     #[test]

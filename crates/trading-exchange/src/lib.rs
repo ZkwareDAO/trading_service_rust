@@ -4,7 +4,7 @@
 //! 账户事件流、规则拉取与对账运行时。本 crate 只向下依赖 trading-core / trading-models，
 //! 不反向依赖 trading-service；对宿主的出站需求经 [`port`] 端口倒置。
 //!
-//! # 统一行情流（Plan「行情 Hub + 统一 MarketDataStream」）
+//! # 统一行情流（行情 Hub + 统一 MarketDataStream）
 //! - [`market`]：对外契约 [`market::MarketDataStream`]（`subscribe_prices` /
 //!   `subscribe_klines`，凭证式 `Arc<dyn DesiredSource>` + guard 退订），K线/价格 tick
 //!   等值类型；四家（binance/deribit/hyperliquid/ctp）实现两方法，xili 返回 Unsupported。

@@ -33,6 +33,8 @@ pub mod place_error;
 pub mod position_dir;
 pub mod prep;
 pub mod provider;
+/// 合约规格/手续费率每日全量拉取短会话（一次性 trader 连接，阻塞式；管理 API 调用）。
+pub mod spec_fetch;
 pub mod venue;
 
 pub use config::{from_values, CtpConfig, DEFAULT_SHFE_MARKET_DRIFT_TICKS};

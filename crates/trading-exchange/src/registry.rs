@@ -19,12 +19,28 @@ use crate::xili::provider::XiliProvider;
 /// 已登记交易所套件的注册表（纯路由）。
 pub struct ExchangeRegistry {
     providers: Vec<Arc<dyn VenueProvider>>,
+    /// CTP provider 的具体类型句柄（规格刷新等 CTP 专属运维入口需要具体类型，
+    /// `dyn VenueProvider` 不暴露之）。仅 `builtin` 在启用 ctp 时登记；自定义
+    /// 装配（[`Self::from_providers`]）为 None。
+    #[cfg(feature = "ctp")]
+    ctp: Option<Arc<crate::ctp::provider::CtpProvider>>,
 }
 
 impl ExchangeRegistry {
     /// 由一组 provider 构造（测试与自定义装配用；生产装配见 [`Self::builtin`]）。
+    /// 不登记具体 CTP 句柄（[`Self::ctp_provider`] 返回 None）。
     pub fn from_providers(providers: Vec<Arc<dyn VenueProvider>>) -> Self {
-        Self { providers }
+        Self {
+            providers,
+            #[cfg(feature = "ctp")]
+            ctp: None,
+        }
+    }
+
+    /// CTP provider 具体句柄（管理 API 规格刷新用）；未启用 ctp / 自定义装配返回 None。
+    #[cfg(feature = "ctp")]
+    pub fn ctp_provider(&self) -> Option<Arc<crate::ctp::provider::CtpProvider>> {
+        self.ctp.clone()
     }
 
     /// 生产装配：登记内置交易所套件。
@@ -42,17 +58,30 @@ impl ExchangeRegistry {
         let binance: Arc<dyn VenueProvider> =
             Arc::new(crate::binance::provider::BinanceProvider::new(deps.clone()));
         let xili: Arc<dyn VenueProvider> = Arc::new(XiliProvider::new(endpoints, http));
-        // CTP（feature="ctp"）：同步阻塞特例，.so/生产模式开关经 CtpConfig 注入。
-        #[cfg(feature = "ctp")]
-        let ctp: Arc<dyn VenueProvider> = Arc::new(crate::ctp::provider::CtpProvider::new(
-            deps.clone(),
-            deps.ctp.clone(),
-        ));
         // xili 排在前：同名端点名时本地模拟所优先（便于教学/联调覆盖）。
+        let providers: Vec<Arc<dyn VenueProvider>> = vec![xili, deribit, hyperliquid, binance];
+        // 仅 ctp feature 下会向列表 push，故 mut 按 cfg 重绑定（无 ctp 构建避免 unused_mut）。
         #[cfg(feature = "ctp")]
-        return Self::from_providers(vec![xili, deribit, hyperliquid, binance, ctp]);
-        #[cfg(not(feature = "ctp"))]
-        Self::from_providers(vec![xili, deribit, hyperliquid, binance])
+        let mut providers = providers;
+
+        // CTP（feature="ctp"）：同步阻塞特例，.so/生产模式开关经 CtpConfig 注入。
+        // 具体类型同时存入注册表的 ctp 字段（管理 API 规格刷新 downcast-free 使用），
+        // 同一个 Arc 再以 trait 对象追加到路由列表末尾。
+        #[cfg(feature = "ctp")]
+        let ctp = {
+            let concrete = Arc::new(crate::ctp::provider::CtpProvider::new(
+                deps.clone(),
+                deps.ctp.clone(),
+            ));
+            providers.push(Arc::clone(&concrete) as Arc<dyn VenueProvider>);
+            Some(concrete)
+        };
+
+        Self {
+            providers,
+            #[cfg(feature = "ctp")]
+            ctp,
+        }
     }
 
     /// 已登记 provider 列表（供复合连接器使用）。

@@ -1,4 +1,4 @@
-//! 行情统一入口的对外类型（Plan 1 / v6）。
+//! 行情统一入口的对外类型（跨所共用的行情流契约）。
 //!
 //! 本模块只定义**跨交易所共用的契约与值类型**，不含任何连接生命周期或具体所协议：
 //! - [`MarketDataStream`]：每家交易所实现的两个订阅原语（系统行情 / K线）；
@@ -7,8 +7,10 @@
 //! - [`SubscriptionGuard`]：drop 即退订的凭证；
 //! - [`PriceTick`] / [`Kline`] / [`KlineInterval`]：行情与 K线值类型。
 //!
-//! 设计约束见 `.claude/plans/market-hub-refactor.plan.md`：hub 内零 channel，
-//! 消费者以 [`std::sync::Arc`] 注册表 + 同步回调交接（同 `QuoteObserver` 模式）。
+//! 设计约束：hub 内**零 channel**，消费者以 [`std::sync::Arc`] 注册表 + 同步回调
+//! 交接（同 `QuoteObserver` 模式）。本模块的值类型是**进程内传输/回调契约**，不落盘；
+//! 持久化行模型在 trading-models（[`trading_models::Bar`] 与原始 tick `RawTick`），
+//! 由 trading-store 的 KlineRepo 写 CSV。
 
 use std::sync::Arc;
 

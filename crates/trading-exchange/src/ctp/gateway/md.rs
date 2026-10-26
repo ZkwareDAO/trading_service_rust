@@ -229,6 +229,11 @@ impl MdHandle {
         self.api.subscribe_market_data(instruments)
     }
 
+    /// 退订行情（会话内可多次调用，用于 K线期望集动态收缩）。
+    pub fn unsubscribe(&self, instruments: &[&str]) -> i32 {
+        self.api.unsubscribe_market_data(instruments)
+    }
+
     /// 显式释放。
     pub fn release(&self) {
         self.api.release();

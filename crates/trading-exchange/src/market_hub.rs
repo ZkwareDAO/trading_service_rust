@@ -1,10 +1,10 @@
 //! 行情 hub 纯内核：消费者注册表 / 全局并集 / 订阅 diff / 按 symbol 路由 / 异常 sink 摘除。
 //!
 //! 本模块**不含任何 IO、连接、async、channel**：只做登记与纯函数式的集合运算与同步
-//! 回调隔离。WS 驱动（`market_ws.rs`，B1 起）与 CTP planner（B4）各持有一个
-//! [`HubRegistry`]（`Arc<Mutex<HubCore>>`），周期锁读并集做订阅增减，收 tick/bar 时
-//! 按 symbol 查注册表同步回调。锁内不回调、不 IO：驱动先在短临界区内取出当次回调
-//! 列表，释锁后再调用 sink。
+//! 回调隔离。WS 驱动（[`crate::market_ws`]）与 CTP 单连接（[`crate::ctp::market`]
+//! 的 drain 循环）各持有一个 [`HubRegistry`]（`Arc<Mutex<HubCore>>`），周期锁读并集做
+//! 订阅增减，收 tick/bar 时按 symbol 查注册表同步回调。锁内不回调、不 IO：驱动先在
+//! 短临界区内取出当次回调列表，释锁后再调用 sink。
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::Hash;

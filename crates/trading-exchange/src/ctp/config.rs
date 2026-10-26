@@ -29,6 +29,20 @@ pub struct CtpConfig {
     /// （买开=ask+n·tick、卖开=bid−n·tick）；**CTP 独立配置，与 deribit 漂移无关**。
     /// 平仓不漂移（取 best bid/ask）。默认 1；0 = 纯对手价。
     pub shfe_market_drift_ticks: i64,
+    /// 冷启动预设主力：`品种:主力合约` 列表，如 `["cu:cu2512"]`。
+    /// 进程启动时直接写入主力表（trading_day 取当日），使**盘中重启/未到 15:00
+    /// 选举窗口**时品种订阅（cu）也能立即只推该合约；当日收盘选举对该品种跳过
+    /// （视为当日已选），下一交易日由真实成交量选举接管。空 = 不预设。
+    pub preset_dominants: Vec<String>,
+    /// 默认采集的 K线品种（配置基线兴趣集），如 `["cu","rb"]`。这些品种在服务
+    /// 启动后即展开为全部在交易合约采集（无需任何客户端订阅），与南向客户端运行时
+    /// 订阅取并集；客户端退订不会移除本基线品种。空 = 仅按客户端动态订阅采集。
+    pub kline_products: Vec<String>,
+    /// 冷启动合约规格种子 CSV 路径（`<data>/ctp-specs/latest/instruments.csv`）。
+    /// 进程启动时若文件存在，读入 InstrumentDir（仅在交易期货），使品种订阅
+    /// （cu）在交易侧在线合约查询返回前即可展开；在线查询结果后到覆盖。
+    /// None/文件缺失 = 不读种子，纯靠在线预热。exchange 只读、不写此文件。
+    pub instrument_specs_path: Option<std::path::PathBuf>,
 }
 
 /// SHFE 市价转限价漂移档数缺省值（穿 1 个最小变动价位提成交确定性）。
@@ -50,6 +64,9 @@ impl CtpConfig {
             md_anon: false,
             md_pass_is_authcode: false,
             shfe_market_drift_ticks: DEFAULT_SHFE_MARKET_DRIFT_TICKS,
+            preset_dominants: Vec::new(),
+            kline_products: Vec::new(),
+            instrument_specs_path: None,
         }
     }
 
@@ -70,6 +87,9 @@ impl CtpConfig {
             md_anon: false,
             md_pass_is_authcode: false,
             shfe_market_drift_ticks: DEFAULT_SHFE_MARKET_DRIFT_TICKS,
+            preset_dominants: Vec::new(),
+            kline_products: Vec::new(),
+            instrument_specs_path: None,
         }
     }
 }
@@ -106,6 +126,12 @@ pub fn from_values(
     md_pass_is_authcode: Option<bool>,
     // SHFE 市价开仓穿价漂移档数（None=用内置默认 1）。
     shfe_market_drift_ticks: Option<i64>,
+    // 冷启动预设主力 `品种:合约` 列表（None=不预设）。
+    preset_dominants: Option<Vec<String>>,
+    // 配置基线 K线品种列表（None=空，仅按客户端动态订阅采集）。
+    kline_products: Option<Vec<String>>,
+    // 冷启动合约规格种子 CSV 路径（None=不读种子）。
+    instrument_specs_path: Option<std::path::PathBuf>,
 ) -> CtpConfig {
     let base = CtpConfig::vendored();
     CtpConfig {
@@ -120,6 +146,9 @@ pub fn from_values(
         shfe_market_drift_ticks: shfe_market_drift_ticks
             .unwrap_or(base.shfe_market_drift_ticks)
             .max(0),
+        preset_dominants: preset_dominants.unwrap_or(base.preset_dominants),
+        kline_products: kline_products.unwrap_or(base.kline_products),
+        instrument_specs_path,
     }
 }
 
@@ -137,6 +166,9 @@ mod tests {
             Some("/tmp/ctp-flow-custom".into()),
             Some("tcp://101.226.250.133:42213".into()),
             Some("ctp-simnow".into()),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -161,6 +193,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
         // Assert：md_front 为空 = 行情线程不启动的信号。
         assert!(cfg.md_front.is_empty());
@@ -172,8 +207,32 @@ mod tests {
     #[test]
     fn md_login_mode_is_configurable() {
         // Arrange / Act：匿名行情 + 密码=授权码两种柜台鉴权形态均可配置。
-        let anon = from_values(None, None, None, None, None, Some(true), None, None);
-        let auth = from_values(None, None, None, None, None, None, Some(true), None);
+        let anon = from_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let auth = from_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+        );
         // Assert。
         assert!(anon.md_anon);
         assert!(!anon.md_pass_is_authcode);
@@ -184,17 +243,55 @@ mod tests {
     #[test]
     fn shfe_drift_is_configurable_and_defaults_to_one() {
         // 透传配置值（含 0=纯对手价）。
-        let cfg = from_values(None, None, None, None, None, None, None, Some(3));
+        let cfg = from_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(3),
+            None,
+            None,
+            None,
+        );
         assert_eq!(cfg.shfe_market_drift_ticks, 3);
-        let zero = from_values(None, None, None, None, None, None, None, Some(0));
+        let zero = from_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(0),
+            None,
+            None,
+            None,
+        );
         assert_eq!(zero.shfe_market_drift_ticks, 0);
         // None 取内置默认；负值钳 0。
-        let dflt = from_values(None, None, None, None, None, None, None, None);
+        let dflt = from_values(
+            None, None, None, None, None, None, None, None, None, None, None,
+        );
         assert_eq!(
             dflt.shfe_market_drift_ticks,
             DEFAULT_SHFE_MARKET_DRIFT_TICKS
         );
-        let neg = from_values(None, None, None, None, None, None, None, Some(-2));
+        let neg = from_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(-2),
+            None,
+            None,
+            None,
+        );
         assert_eq!(neg.shfe_market_drift_ticks, 0);
     }
 

@@ -368,9 +368,10 @@ fn run_md_session(
     // 本会话业务兴趣集合（会话内不重订阅，与历史一致；预算成集合供每笔 O(1) 判定）。
     let business_set: std::collections::HashSet<String> =
         ctp_subscription_symbols(interests).into_iter().collect();
-    // K线集合同样每会话订阅一次（CTP 无会话内增量订阅；新登记合约随下次重连生效），
-    // 会话开始预算一次，避免在高频 tick 路径反复展开合约目录。
-    let kline_set: std::collections::HashSet<String> = kline
+    // K线期望集：会话开始预算当前已订合约，并在循环内按节拍动态对账（见下方
+    // reconcile_kline_subscriptions）——支持配置基线品种展开与客户端运行时订阅/
+    // 退订在会话内增删，无需断线重连。
+    let mut kline_set: std::collections::HashSet<String> = kline
         .map(|k| k.stream.bar_symbols().into_iter().collect())
         .unwrap_or_default();
 
@@ -444,8 +445,68 @@ fn run_md_session(
             }
             _ => {}
         }
+        // 每个 poll 节拍（约 1s）对账一次 K线期望集：配置基线品种展开 ∪ 客户端
+        // 运行时订阅发生增删时，会话内增量 subscribe/unsubscribe，不等断线重连。
+        if let Some(k) = kline {
+            reconcile_kline_subscriptions(&md, k, &business_set, &mut kline_set);
+        }
     }
     MdSessionOutcome::Stop
+}
+
+/// 会话内 K线订阅对账：把柜台实际订阅的 K线集合对齐到当前 `bar_symbols()`。
+///
+/// - 新增（期望有、当前无）且不属于业务集合约 → 增量 `subscribe`；
+/// - 消失（当前有、期望无）且不属于业务集合约 → `unsubscribe`（业务兴趣集的
+///   合约即使 K线退订也不退，老路径仍在收）；
+/// - 合约目录尚未预热导致展开为空时不误退（保留当前集，等下一拍）。
+fn reconcile_kline_subscriptions(
+    md: &MdHandle,
+    kline: &MdKlineDeps,
+    business: &std::collections::HashSet<String>,
+    current: &mut std::collections::HashSet<String>,
+) {
+    let desired: std::collections::HashSet<String> =
+        kline.stream.bar_symbols().into_iter().collect();
+
+    // 目录未就绪：desired 可能暂空，跳过本拍以免误退已订合约。
+    // 判据：存在配置基线/客户端品种但目录展开为空——简单起见，仅当 desired 非空
+    // 或确无任何 K线需求时才动作；空需求且 current 非空属正常全退订，需区分。
+    // 这里用 stream 是否有任何 bar 客户端/基线来判断"空"是真空还是未就绪。
+    let has_demand = kline.stream.has_kline_demand();
+    if desired.is_empty() && has_demand {
+        return;
+    }
+
+    let to_add: Vec<String> = desired.difference(current).cloned().collect();
+    let to_remove: Vec<String> = current
+        .iter()
+        .filter(|s| !desired.contains(*s) && !business.contains(*s))
+        .cloned()
+        .collect();
+
+    if !to_add.is_empty() {
+        let refs: Vec<&str> = to_add.iter().map(|s| s.as_str()).collect();
+        let code = md.subscribe(&refs);
+        if code == 0 {
+            tracing::info!(symbols = to_add.len(), "CTP K线会话内增订合约");
+            current.extend(to_add);
+        } else {
+            tracing::warn!(code, symbols = ?to_add, "CTP K线增订受理失败，下拍重试");
+        }
+    }
+    if !to_remove.is_empty() {
+        let refs: Vec<&str> = to_remove.iter().map(|s| s.as_str()).collect();
+        let code = md.unsubscribe(&refs);
+        if code == 0 {
+            tracing::info!(symbols = refs.len(), "CTP K线会话内退订合约");
+            for s in &to_remove {
+                current.remove(s);
+            }
+        } else {
+            tracing::warn!(code, symbols = ?to_remove, "CTP K线退订受理失败，下拍重试");
+        }
+    }
 }
 
 /// 受理码重试：`attempt` 返回 0 即成功；否则每秒重试直到累计 `max_secs` 秒。
