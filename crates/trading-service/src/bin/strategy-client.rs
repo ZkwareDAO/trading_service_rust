@@ -217,6 +217,9 @@ fn build_command(args: &Args) -> anyhow::Result<SouthCommand> {
         min_roi: None,
         max_roi: None,
         deleted: None,
+        // K线订阅为独立 WS 客户端用法，本 CLI 暂不下发，保持缺省。
+        symbols: Vec::new(),
+        interval: None,
     };
     match opt.as_str() {
         "place_order" | "place" => {

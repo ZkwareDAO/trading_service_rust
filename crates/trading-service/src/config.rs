@@ -59,6 +59,10 @@ pub struct Args {
     #[arg(long, default_value = "200ms")]
     pub rule_scan_interval: String,
 
+    /// K线（定稿 bar / CTP 原始 tick）批量落 CSV 的周期。
+    #[arg(long, default_value = "5s")]
+    pub kline_flush_interval: String,
+
     /// 南向策略连接共享密钥文件（64 hex，0600，首启自动生成）。留空则用 <data-dir>/south.key。
     #[arg(long, default_value = "")]
     pub south_secret_file: String,
@@ -116,6 +120,8 @@ pub struct ServiceConfig {
     pub position_debounce: Duration,
     pub position_reconcile_interval: Duration,
     pub rule_scan_interval: Duration,
+    /// K线 bar/tick 批量落 CSV 周期。
+    pub kline_flush_interval: Duration,
     pub south_secret_file: String,
     pub south_dev_insecure: bool,
     /// 企业微信开仓成交通知 Webhook（空串=关闭）。
@@ -180,6 +186,9 @@ impl Args {
                 &args.position_reconcile_interval,
             )?,
             rule_scan_interval: trading_core::timeutil::parse_duration(&args.rule_scan_interval)?,
+            kline_flush_interval: trading_core::timeutil::parse_duration(
+                &args.kline_flush_interval,
+            )?,
             south_secret_file,
             south_dev_insecure: args.south_dev_insecure,
             notify_open_url: args.notify_open_url.trim().to_string(),

@@ -76,6 +76,8 @@ pub struct AppState {
     pub notify: NotifyHub,
     /// 南向策略连接握手鉴权（单一共享密钥 + nonce 防重放；dev 旁路除外）。
     pub south_auth: SouthAuth,
+    /// K线服务编排（订阅登记/fan-out/CSV 刷盘；进程一份）。
+    pub kline: Arc<crate::kline::KlineService>,
 }
 
 impl AppState {
@@ -191,6 +193,14 @@ impl AppState {
         .with_order_querier(rule_querier)
         .with_notify_hub(notify.clone());
 
+        // K线服务：句柄全部取自 store 单例；fan-out 复用既有南向连接 hub。
+        // assemble 只在 tokio runtime（main / #[tokio::test]）内调用，故可直接取 Handle。
+        let pusher = Arc::new(crate::kline::HubKlinePusher::new(
+            hub.clone(),
+            tokio::runtime::Handle::current(),
+        ));
+        let kline = Arc::new(crate::kline::KlineService::new(Arc::clone(&store), pusher));
+
         Self {
             store,
             hub,
@@ -200,6 +210,7 @@ impl AppState {
             position_engine: engine,
             notify,
             south_auth,
+            kline,
         }
     }
 

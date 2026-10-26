@@ -13,6 +13,7 @@ mod config;
 mod event;
 mod hub;
 mod interest;
+mod kline;
 mod notify;
 mod order_query;
 mod position_query;
@@ -133,6 +134,20 @@ async fn main() -> anyhow::Result<()> {
     );
     // Venue 可调参数（deribit 价差阈值/漂移档数；文件缺失=默认）。
     let venue_cfg = venue_config::load(std::path::Path::new(&cfg.venue_config))?;
+    // 仅 ctp feature 下会改写 venue_cfg（补冷启动种子路径），故 mut 也按 cfg 重绑定，
+    // 避免无 ctp feature 构建时 unused_mut。
+    #[cfg(feature = "ctp")]
+    let mut venue_cfg = venue_cfg;
+    // CTP 冷启动合约规格种子：缺省指向 <data>/ctp-specs/latest/instruments.csv，
+    // 文件不存在时 CtpProvider 自动回退纯在线预热（不阻断启动）。
+    #[cfg(feature = "ctp")]
+    if venue_cfg.ctp.instrument_specs_path.is_none() {
+        let p = std::path::Path::new(&cfg.data_dir)
+            .join("ctp-specs")
+            .join("latest")
+            .join("instruments.csv");
+        venue_cfg.ctp.instrument_specs_path = Some(p);
+    }
 
     // 账户门面：账户域在 store，交易所/规则/仓位端口实现在服务层（newtype 委托）。
     let accounts = AccountHub::new(account_manager);
@@ -195,6 +210,17 @@ async fn main() -> anyhow::Result<()> {
         "交易所级公共服务（规则/行情）按账户归属启动"
     );
     state.exchanges.spawn_market_services(&active_exchanges);
+
+    // —— K线服务（venue-neutral）：对每个活跃且支持的 (交易所, 标的类别) 调一次
+    // subscribe_klines；客户端运行时订阅只改登记表，交易所侧下轮对账增订/退订。
+    // 同时起独立线程把定稿 bar/CTP 原始 tick 批量 append 到 CSV。无 K线订阅时
+    // 交易所线订阅集＝纯业务集，行为与改造前等价。
+    state.kline.start(
+        &state.exchanges,
+        &active_exchanges,
+        cfg.kline_flush_interval,
+        Arc::clone(&account_stop),
+    );
 
     // —— 持仓模式只读校验：各 binance 账户查 /fapi/v1/positionSide/dual，与本地
     // account.csv 配置不一致只记 error 日志，绝不自动修改用户交易所设置。
@@ -276,7 +302,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(south::ws_handler))
         .route("/ws", get(south::ws_handler))
         // 账户重载触发（预留）：POST 后重读 account.csv，连接在对账周期重建。
-        .route("/admin/accounts/reload", post(admin::reload_accounts))
+        .route("/admin/accounts/reload", post(admin::reload_accounts));
+
+    // CTP 合约规格每日刷新（仅启用 ctp 时）：拉全量 → 落盘 + latest → 重灌合约目录。
+    #[cfg(feature = "ctp")]
+    let south_app = south_app.route("/admin/ctp/refresh-specs", post(admin::refresh_ctp_specs));
+
+    let south_app = south_app
         // REST API（/health 与 /api/v1/*，与南向 WS 同端口）。
         .merge(api::router())
         .with_state(state.clone());

@@ -93,6 +93,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, strategy: String) {
     }
 
     state.hub.unregister_if(&strategy, token);
+    // 断连一次摘除该策略的全部 K线订阅（与他人共享的 key 仅减员，归零退订交易所）。
+    state.kline.disconnect(&strategy);
     tracing::info!(strategy = %strategy, "strategy disconnected (south)");
 }
 

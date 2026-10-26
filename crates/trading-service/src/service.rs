@@ -102,7 +102,7 @@ pub(crate) struct CancelOrderInput {
 /// 内核事件回调出口：决定后台受理/失败事件发往何处。
 ///
 /// * WS 路径：`ToStrategy`——沿用原 send_event 推给策略连接；
-/// * REST 路径：`Ignore`——后台事件不推送（文档规定靠轮询/WS 路由）。
+/// * REST 路径：`Ignore`——后台事件不推送（靠轮询/WS 路由）。
 #[derive(Debug, Clone)]
 pub(crate) enum Callback {
     /// 发往该策略身份的南向连接（含原日志）。
@@ -569,11 +569,110 @@ pub async fn dispatch(state: AppState, strategy: String, cmd: SouthCommand) {
         "get_positions" => get_positions(state, strategy, cmd).await,
         "get_order" => get_order(state, strategy, cmd).await,
         "create_rule" | "create_watch_rule" => create_rule(state, strategy, cmd).await,
+        "subscribe_kline" | "subscribe_klines" => subscribe_kline(state, strategy, cmd).await,
+        "unsubscribe_kline" | "unsubscribe_klines" => unsubscribe_kline(state, strategy, cmd).await,
         other => {
             warn!(option = %other, "unknown south command");
             let ev = ClientEvent::error(format!("未知命令 `{other}`"), Some(strategy.clone()));
             send_event(&state, &strategy, &ev).await;
         }
+    }
+}
+
+/// 解析一条 K线订阅命令的标的列表：优先 `symbols[]`，否则回退单标的 instrument()。
+fn kline_symbols(cmd: &SouthCommand) -> Vec<String> {
+    let list: Vec<String> = cmd
+        .symbols
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !list.is_empty() {
+        return list;
+    }
+    cmd.instrument()
+        .map(|s| vec![s.to_string()])
+        .unwrap_or_default()
+}
+
+/// subscribe_kline：校验 exchange/周期/标的后登记（幂等）；交易所侧下轮对账增订。
+async fn subscribe_kline(state: AppState, strategy: String, cmd: SouthCommand) {
+    if let Some(err) = validate_kline(&cmd) {
+        send_event(
+            &state,
+            &strategy,
+            &ClientEvent::error(err, Some(strategy.clone())),
+        )
+        .await;
+        return;
+    }
+    let exchange = cmd.exchange().unwrap_or_default().to_string();
+    let symbols = kline_symbols(&cmd);
+    if symbols.is_empty() {
+        send_event(
+            &state,
+            &strategy,
+            &ClientEvent::error(
+                "subscribe_kline 需要 symbols[] 或 symbol",
+                Some(strategy.clone()),
+            ),
+        )
+        .await;
+        return;
+    }
+    state.kline.subscribe(&strategy, &exchange, &symbols);
+    let msg = format!("已订阅 {} 个 {} 1m K线标的", symbols.len(), exchange);
+    send_event(
+        &state,
+        &strategy,
+        &ClientEvent::ack(msg, Some(strategy.clone())),
+    )
+    .await;
+}
+
+/// unsubscribe_kline：移除该策略对应订阅（归零自动向交易所退订）。
+async fn unsubscribe_kline(state: AppState, strategy: String, cmd: SouthCommand) {
+    if let Some(err) = validate_kline(&cmd) {
+        send_event(
+            &state,
+            &strategy,
+            &ClientEvent::error(err, Some(strategy.clone())),
+        )
+        .await;
+        return;
+    }
+    let exchange = cmd.exchange().unwrap_or_default().to_string();
+    let symbols = kline_symbols(&cmd);
+    if !symbols.is_empty() {
+        state.kline.unsubscribe(&strategy, &exchange, &symbols);
+    }
+    let msg = if symbols.is_empty() {
+        "未指定标的，无退订".to_string()
+    } else {
+        format!("已退订 {} 个 {} 1m K线标的", symbols.len(), exchange)
+    };
+    send_event(
+        &state,
+        &strategy,
+        &ClientEvent::ack(msg, Some(strategy.clone())),
+    )
+    .await;
+}
+
+/// K线命令公共校验：exchange 必填且受支持、周期仅支持 1m。返回错误文案。
+fn validate_kline(cmd: &SouthCommand) -> Option<String> {
+    let Some(exchange) = cmd.exchange() else {
+        return Some("subscribe_kline 缺少 exchange".to_string());
+    };
+    if !["binance", "deribit", "hyperliquid", "ctp"].contains(&exchange) {
+        return Some(format!("K线暂不支持交易所 `{exchange}`"));
+    }
+    match trading_core::protocol::normalize_kline_interval(cmd.interval.as_deref()) {
+        Some(_) => None,
+        None => Some(format!(
+            "不支持的 K线周期 `{}`（本期仅 1m）",
+            cmd.interval.as_deref().unwrap_or("")
+        )),
     }
 }
 
@@ -1739,6 +1838,117 @@ mod tests {
             .rule_repo()
             .unwrap()
             .list_non_retired()
+            .is_empty());
+    }
+
+    /// 发一条 K线命令并读回一帧应答。
+    async fn send_kline(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        body: &str,
+    ) -> serde_json::Value {
+        use futures_util::{SinkExt, StreamExt};
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(body.into()))
+            .await
+            .unwrap();
+        let msg = ws.next().await.unwrap().unwrap();
+        serde_json::from_str(msg.to_text().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn subscribe_kline_acks_and_registers_then_disconnect_clears() {
+        let app = crate::api::test_support::app_with_accounts("").await;
+        let url = crate::api::test_support::serve_south_ws(&app.state).await;
+        let mut ws = connect_south(&url, "s1").await;
+
+        // 订阅 CTP 具体合约 + 品种前缀。
+        let v = send_kline(
+            &mut ws,
+            r#"{"option":"subscribe_kline","exchange":"ctp","instrument_type":"futures","symbols":["cu2512","cu"],"interval":"1m"}"#,
+        )
+        .await;
+        assert_eq!(v["type"], "ack");
+        // 登记表作用域快照立即含两符号（驱动交易所下轮增订）。
+        assert_eq!(
+            app.state
+                .kline
+                .source_for("ctp", InstrumentType::Futures)
+                .symbols(),
+            vec!["cu".to_string(), "cu2512".to_string()]
+        );
+
+        // 退订具体合约：只剩品种。
+        let v = send_kline(
+            &mut ws,
+            r#"{"option":"unsubscribe_kline","exchange":"ctp","symbols":["cu2512"]}"#,
+        )
+        .await;
+        assert_eq!(v["type"], "ack");
+        assert_eq!(
+            app.state
+                .kline
+                .source_for("ctp", InstrumentType::Futures)
+                .symbols(),
+            vec!["cu".to_string()]
+        );
+
+        // 关闭连接 → 断连清理：该策略订阅全部消失。
+        use futures_util::StreamExt;
+        ws.close(None).await.unwrap();
+        // 给服务端读循环处理关闭帧的时间。
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut deadline = 0u32;
+        while !app
+            .state
+            .kline
+            .source_for("ctp", InstrumentType::Futures)
+            .symbols()
+            .is_empty()
+            && deadline < 50
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            deadline += 1;
+        }
+        assert!(app
+            .state
+            .kline
+            .source_for("ctp", InstrumentType::Futures)
+            .symbols()
+            .is_empty());
+        let _ = ws.next().await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_kline_rejects_bad_interval_and_unknown_venue() {
+        let app = crate::api::test_support::app_with_accounts("").await;
+        let url = crate::api::test_support::serve_south_ws(&app.state).await;
+        let mut ws = connect_south(&url, "s1").await;
+
+        let v = send_kline(
+            &mut ws,
+            r#"{"option":"subscribe_kline","exchange":"ctp","symbols":["cu2512"],"interval":"5m"}"#,
+        )
+        .await;
+        assert_eq!(v["type"], "error");
+
+        let v = send_kline(
+            &mut ws,
+            r#"{"option":"subscribe_kline","exchange":"xili","symbols":["x"]}"#,
+        )
+        .await;
+        assert_eq!(v["type"], "error");
+
+        // 缺 exchange（validate 返回 None 分支：exchange 缺失）。
+        let v = send_kline(&mut ws, r#"{"option":"subscribe_kline","symbols":["x"]}"#).await;
+        assert_eq!(v["type"], "error");
+
+        // 被拒后登记表保持为空。
+        assert!(app
+            .state
+            .kline
+            .source_for("ctp", InstrumentType::Futures)
+            .symbols()
             .is_empty());
     }
 }

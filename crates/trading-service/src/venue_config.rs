@@ -103,6 +103,13 @@ struct CtpSection {
     md_pass_is_authcode: Option<bool>,
     /// SHFE 市价开仓穿价漂移档数（缺省用 trading-exchange 内置默认 1）。
     shfe_market_drift_ticks: Option<i64>,
+    /// 冷启动预设主力 `品种:合约` 列表（如 ["cu:cu2512"]）；缺省不预设。
+    preset_dominants: Option<Vec<String>>,
+    /// 配置基线 K线品种（如 ["cu","rb"]），默认就采集；缺省仅按客户端动态订阅。
+    kline_products: Option<Vec<String>>,
+    /// 冷启动合约规格种子 CSV 路径；缺省由 main 按 data-dir 补
+    /// `<data>/ctp-specs/latest/instruments.csv`。
+    instrument_specs_path: Option<String>,
 }
 
 /// 加载 venue 配置：文件不存在 → 全默认；存在则按字段补默认。
@@ -132,6 +139,12 @@ pub fn load(path: &Path) -> anyhow::Result<LoadedVenueConfigs> {
             parsed.ctp.md_anon,
             parsed.ctp.md_pass_is_authcode,
             parsed.ctp.shfe_market_drift_ticks,
+            parsed.ctp.preset_dominants,
+            parsed.ctp.kline_products,
+            parsed
+                .ctp
+                .instrument_specs_path
+                .map(std::path::PathBuf::from),
         ),
     })
 }
@@ -147,7 +160,9 @@ pub fn default_configs() -> LoadedVenueConfigs {
             slippage: default_slippage(),
         },
         #[cfg(feature = "ctp")]
-        ctp: trading_exchange::ctp::from_values(None, None, None, None, None, None, None, None),
+        ctp: trading_exchange::ctp::from_values(
+            None, None, None, None, None, None, None, None, None, None, None,
+        ),
     }
 }
 
