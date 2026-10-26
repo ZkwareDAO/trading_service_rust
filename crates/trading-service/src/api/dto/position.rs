@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use trading_models::{InstrumentType, Position, Side};
 
-/// 内存持仓 REST 投影（文档 §3.2）。刻意不含 model 的 `qty_unit`
+/// 内存持仓 REST 投影。刻意不含 model 的 `qty_unit`
 /// （无业务消费方，纯扩展预留，REST 一律不展示）。
 #[derive(Debug, Clone, Serialize)]
 pub struct PositionDTO {
@@ -148,7 +148,7 @@ mod tests {
 
         // 安全/契约红线：qty_unit 绝不出现在报文里。
         assert!(v.get("qty_unit").is_none(), "DTO 不得暴露 qty_unit: {v}");
-        // 文档 §3.2 共 26 个键。
+        // 持仓 DTO 共 26 个键。
         assert_eq!(v.as_object().unwrap().len(), 26, "实际键集: {v}");
     }
 

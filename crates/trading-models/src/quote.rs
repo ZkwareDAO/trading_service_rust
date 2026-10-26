@@ -1,6 +1,6 @@
 //! 行情数据模型：强类型标的 [`Instrument`] 与每个标的一份的最新行情 [`Quote`]。
 //!
-//! 规范来源：`docs/行情订阅模型.md`。与 [`crate::OrderRule`] 同类——行情是交易所
+//! 与 [`crate::OrderRule`] 同类——行情是交易所
 //! 发布的瞬时公开数据：**只存在于内存，不实现 [`store_core::Model`]、不落 CSV、
 //! 不参与日切与恢复**，进程重启后由各 venue 订阅重新填充。运行时的内存表
 //! （`DashMap<Instrument, Quote>`）位于 `trading-core`。

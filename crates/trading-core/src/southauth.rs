@@ -1,6 +1,6 @@
 //! 南向连接握手鉴权原语（服务端与 strategy-client 客户端共享同一份字节布局）。
 //!
-//! 见 `docs/服务端与客户端连接.md`：
+//! 握手签名口径：
 //! ```text
 //! signature = HMAC-SHA256(secret, strategy_name + nonce)   // hex 小写
 //! ```

@@ -451,7 +451,7 @@ pub struct PositionFilter {
 impl PositionFilter {
     pub fn matches(&self, p: &Position) -> bool {
         self.account_id.is_none_or(|v| v == p.account_id)
-            // 仓储的仓位交易所匹配按忽略大小写口径（文档 §4.8）。
+            // 仓储的仓位交易所匹配按忽略大小写口径。
             && self
                 .exchange
                 .as_deref()
@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn position_filter_exchange_is_case_insensitive() {
-        // 仓储的仓位交易所匹配按忽略大小写口径（文档 §4.8）。
+        // 仓储的仓位交易所匹配按忽略大小写口径。
         let p = position(1, Side::Buy, "0");
         let f = PositionFilter {
             exchange: Some("BINANCE".into()),
@@ -811,7 +811,7 @@ mod tests {
 
     #[test]
     fn position_filter_deleted_defaults_to_any_explicit_active_hides_closed() {
-        // §4.8：deleted 不传=不筛选（持仓中+已平仓都返回）；显式 0 才仅持仓中。
+        // deleted 不传=不筛选（持仓中+已平仓都返回）；显式 0 才仅持仓中。
         let mut closed = position(1, Side::Buy, "0");
         closed.deleted = true;
         // 默认 Any：tombstone 也可见。

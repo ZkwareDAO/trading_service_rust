@@ -5,7 +5,7 @@
 //! * [`BinanceUser`]：用户主体（一套 key/secret），实现 [`ExchangeApi`]，下单前先
 //!   [`prepare_order`] 做本地校验/对齐，撤/查单用 [`route_order_ref`] 单号路由。
 //!
-//! 见 `docs/扩展交易所.md` 第二节、`docs/交易规则.md` 第二节。
+//! 币安 VenueProvider：交易所接入与下单规则见本模块实现。
 //!
 //! 旁路实现：尚未接入线上 `Exchange` 装配，非测试构建暂无消费方（ignored 冒烟测试
 //! 除外），允许 dead_code；切换线上路径后移除。

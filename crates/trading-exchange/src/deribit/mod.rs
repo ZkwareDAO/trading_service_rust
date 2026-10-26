@@ -8,7 +8,7 @@
 //! * [`mapping`]：私有 WS subscription 信封解析；
 //! * [`market`]：主网公共行情 WS（持仓∪规则动态订阅、ticker 帧写 QuoteTable）；
 //!
-//! 见 `docs/扩展交易所.md` 第四节、`docs/deribit开平仓处理.md`。
+//! Deribit 适配器模块总览（接入与开平仓处理见各子模块）。
 
 pub mod account_consumer;
 pub mod instant;

@@ -6,7 +6,7 @@
 //!   枚举出线上字符串、Decimal 出精确数字、不暴露 qty_unit/密钥等内部字段）；
 //! * `handlers`：薄 axum handler，只做解析 → 调 store/service → DTO 信封；
 //! * `filters`：列表查询的零 IO 谓词；
-//! * `rules_batch`：连锁规则批量创建的零 IO 纯模块（§9 两遍落库）。
+//! * `rules_batch`：连锁规则批量创建的零 IO 纯模块（两遍落库）。
 
 pub mod dto;
 pub mod envelope;

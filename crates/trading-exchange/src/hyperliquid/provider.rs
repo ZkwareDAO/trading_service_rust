@@ -2,7 +2,7 @@
 //! hyperliquid 唯一精确名；构造 [`HyperliquidUser`]、按需 spawn per-account 账户
 //! 事件消费任务与交易所级公共服务（规则 + allMids/activeAssetCtx 行情）。
 //!
-//! 与 binance/deribit provider 平级、同构。见 `docs/扩展交易所.md` 第二节。
+//! 与 binance/deribit provider 平级、同构。
 
 use std::sync::{Arc, OnceLock};
 

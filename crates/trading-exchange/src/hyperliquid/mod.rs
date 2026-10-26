@@ -14,7 +14,7 @@
 //! * `user_stream` / `account_consumer`：认证 WS 与通用账户消费循环适配；
 //! * `market` / `services` / `provider`：公共行情、交易所级服务、套件注册。
 //!
-//! 见 `docs/扩展交易所.md` 第三节、`docs/扩展交易所.md` 第六节。
+//! Hyperliquid 适配器模块总览（用户数据流与行情见各子模块）。
 
 pub(crate) mod account_consumer;
 pub(crate) mod codec;

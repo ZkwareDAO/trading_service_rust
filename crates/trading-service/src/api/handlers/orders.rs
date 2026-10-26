@@ -15,7 +15,7 @@ use crate::service::{
 };
 use crate::state::AppState;
 
-/// `POST /api/v1/orders` 请求体（文档 §4.4）。
+/// `POST /api/v1/orders` 请求体。
 ///
 /// Decimal 字段直接收数字或字符串（serde 经 rust_decimal 字符串/数字反序列化）；
 /// REST 无 client_order_id/signal_id 字段——cid 服务端生成。

@@ -8,7 +8,7 @@
 //!
 //! 账户事件流（`AccountEventStream`）在 P4 于本类型上实现。
 //!
-//! 见 `docs/扩展交易所.md` 第四节。
+//! Deribit VenueProvider。
 
 use std::sync::Arc;
 

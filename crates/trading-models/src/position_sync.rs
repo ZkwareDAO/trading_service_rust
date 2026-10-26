@@ -1,6 +1,6 @@
 //! 仓位对账纯内核（**交易所无关**）：交易所回查快照 vs 本地活跃仓位的三方对比。
 //!
-//! 见 `docs/状态机设计.md`「封装方法 / 同步规则」。本模块只认领域类型
+//! 本模块只认领域类型
 //! [`Position`]：binance / hyperliquid / deribit 三家在符号、方向、合约乘数、结算
 //! 币种上的差异都在上一层 mapper（交易所侧 `PositionInfo -> Position`）收敛，
 //! 对比内核不做任何交易所分支，新增交易所无需改动此处。
@@ -46,7 +46,7 @@ pub struct ReconcileReport {
     pub closed: usize,
 }
 
-/// 对账键：`(account, instrument, side, instrument_type)`（文档指定）。
+/// 对账键：`(account, instrument, side, instrument_type)`。
 /// `Side`/`InstrumentType` 未派生 `Hash`，统一拍平成整数与字符串参与哈希。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PositionKey {

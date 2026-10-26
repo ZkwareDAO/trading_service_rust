@@ -13,7 +13,7 @@ use crate::rules::{build_rule, RuleCreateInput};
 use crate::state::AppState;
 use trading_models::WatchRule;
 
-/// `POST /api/v1/rules` 请求体（文档 §4.6.1）。
+/// `POST /api/v1/rules` 请求体。
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpsertRuleRequestDto {
     /// 带 id=更新；缺省/0=创建。
@@ -366,7 +366,7 @@ pub async fn rule_status_batch(
 }
 
 // =====================================================================
-// 连锁规则批量创建（§9 两遍落库）
+// 连锁规则批量创建（两遍落库）
 // =====================================================================
 
 /// `POST /api/v1/rules/batch` 请求体。
@@ -388,7 +388,7 @@ pub async fn batch_create_rules(
         return Err(ApiError::bad_request("rules 不能为空"));
     }
 
-    // —— 零 IO 预校验（§9.5）：ref 名唯一、action 引用目标存在（前向合法）——
+    // —— 零 IO 预校验：ref 名唯一、action 引用目标存在（前向合法）——
     // 未携带 ref 的条目给内部唯一名（不会也不应被引用）。
     let entries: Vec<(String, String)> = req
         .rules

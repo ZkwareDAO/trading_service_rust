@@ -1,7 +1,7 @@
 //! Binance `exchangeInfo` → [`OrderRule`] 归一化（RuleFetcher 的纯内核）。
 //!
 //! 不碰网络/SDK：只把交易所原始 JSON 解析成统一规则行，HTTP 拉取由薄封装负责。
-//! 见 `docs/交易规则.md` 第二节与 6.4 字段映射。
+//! 币安下单规则与字段映射见本模块各方法文档。
 //!
 //! 归一化内核已由单测覆盖；消费它的无认证 `RuleFetcher`（HTTP GET exchangeInfo）
 //! 与启动/30 天定时接线在下一步落地，此前非测试构建暂无调用方，允许 dead_code。

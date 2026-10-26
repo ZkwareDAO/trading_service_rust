@@ -8,7 +8,7 @@
 //! - 持仓：clearinghouseState；杠杆：updateLeverage；参考价：allMids→mid；
 //! - 账户私有 WS：orderUpdates + clearinghouseState（见 user_stream）。
 //!
-//! 见 `docs/扩展交易所.md` 第三节、`docs/扩展交易所.md` 第六节。
+//! Hyperliquid VenueProvider（用户数据流/行情）。
 
 use std::collections::HashMap;
 use std::sync::Arc;

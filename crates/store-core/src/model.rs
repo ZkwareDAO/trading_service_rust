@@ -58,7 +58,7 @@ impl<T: AccountModel> AccountIndex for Table<T> {
     }
 }
 
-/// `bool` 在 CSV 中以 `0/1` 存储（文档约定：deleted 默认 0，1 为已删除）。
+/// `bool` 在 CSV 中以 `0/1` 存储（约定：deleted 默认 0，1 为已删除）。
 /// 用法：`#[serde(with = "store_core::model::bool_u8")]`。
 pub mod bool_u8 {
     use serde::{Deserialize, Deserializer, Serializer};

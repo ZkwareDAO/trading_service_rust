@@ -5,7 +5,7 @@
 //! - orderUpdates.data[]：每个订单更新 → AccountEvent::Order（推进状态机）；
 //! - clearinghouseState 帧 → AccountEvent::Account（仓位脏信号，真值再走 REST）。
 //!
-//! 见 `docs/扩展交易所.md` 第三节、`docs/扩展交易所.md` 坑1。
+//! Hyperliquid 用户数据流连接（含已知坑点的处理）。
 
 use std::time::Duration;
 

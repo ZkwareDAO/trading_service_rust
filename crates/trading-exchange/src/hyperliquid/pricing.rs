@@ -2,7 +2,7 @@
 //!
 //! Hyperliquid 无真市价单，市价转 IOC 限价：以中间价 mid 为基准，买入向上、
 //! 卖出向下各放 slippage（默认 5%），再按 5 位有效数字取整；下单数量对齐
-//! 到数量步长。价格精度口径见 `docs/扩展交易所.md` 6.1/6.3。
+//! 到数量步长（价格精度口径见本模块常量/函数）。
 
 use rust_decimal::Decimal;
 use rust_decimal::RoundingStrategy;

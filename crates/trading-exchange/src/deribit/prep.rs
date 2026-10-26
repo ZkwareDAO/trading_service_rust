@@ -4,7 +4,7 @@
 //! 行情（mark/bid/ask）由调用方（venue）从 `QuoteTable` 读出后以
 //! [`MarketSnapshot`] 注入；合约规格取自已懒加载的 [`OrderRule`]。
 //!
-//! 见 `docs/deribit开平仓处理.md`、`docs/交易规则.md`。
+//! Deribit 下单前预处理（开平仓/规则见本模块）。
 
 use rust_decimal::Decimal;
 use trading_core::order_rule::align_amount;

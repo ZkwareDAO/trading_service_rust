@@ -1,7 +1,7 @@
 //! Deribit 期权定价纯内核：分档 tick、市价转限价（开仓漂移 / 平仓对手价）、
 //! 平仓价差闸门。全程 [`Decimal`]、零网络，供 TDD。
 //!
-//! 见 `docs/deribit开平仓处理.md`。
+//! Deribit 定价/价格处理。
 
 use rust_decimal::Decimal;
 use trading_models::{PriceTier, Side};

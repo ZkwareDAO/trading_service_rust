@@ -8,7 +8,7 @@ use crate::api::dto::position::PositionDTO;
 use crate::api::envelope::{now_ms, parse_json, ApiError, ApiResponse, BizError};
 use crate::state::AppState;
 
-/// 请求体（文档 §4.10）。
+/// 请求体。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExchangePositionsRequest {
     pub exchange: String,

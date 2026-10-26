@@ -5,7 +5,7 @@
 //! 本模块把**信封解析**做成零 IO 纯函数（TDD）；网络发送为薄 reqwest 封装，
 //! token 的缓存/刷新在 venue 层。
 //!
-//! 见 `docs/扩展交易所.md` 第四节。
+//! Deribit JSON-RPC 客户端。
 
 use reqwest::Client;
 use serde_json::Value;

@@ -1,4 +1,4 @@
-//! 连锁规则批量创建的零 IO 纯模块（rule设计 §9）。
+//! 连锁规则批量创建的零 IO 纯模块（两遍落库）。
 //!
 //! 处理请求体的 `ref`（客户端引用）与 `action: rule:<ref>`：
 //! * [`RawAction`]：action 三态（self / rule:<ref> / 直接 rule:<id>）；
@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-/// 请求处理期的 action 三态（§9.3）。
+/// 请求处理期的 action 三态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawAction {
     /// 执行自身（无链式跳转）。

@@ -164,7 +164,7 @@ impl Position {
     /// 时间戳均保持不变。**`margin` 是 ROI 的前置输入（非本函数衍生）**：调用方须在
     /// 调用前填好（柜台权威值或上层 cost/leverage 兜底），本函数不自行计算保证金。
     ///
-    /// 口径（见 `docs/状态机设计.md`）：
+    /// 口径：
     /// * `notional = current_price × quantity × multiplier`
     /// * 多：`pnl = (current_price − pos_price) × qty × mult`；
     ///   空：`pnl = (pos_price − current_price) × qty × mult`

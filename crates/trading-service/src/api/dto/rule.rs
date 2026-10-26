@@ -1,4 +1,4 @@
-//! RuleDTO：盯盘/风控规则 REST 投影（文档 §3.3）。
+//! RuleDTO：盯盘/风控规则 REST 投影。
 
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -136,7 +136,7 @@ mod tests {
         assert_eq!(v["deleted"], false);
         assert_eq!(v["created_at"], 1_700_000_000_000u64);
         assert_eq!(v["updated_at"], 1_700_000_000_200u64);
-        // 文档 §3.3 共 24 个键。
+        // 规则 DTO 共 24 个键。
         assert_eq!(v.as_object().unwrap().len(), 24, "实际键集: {v}");
     }
 

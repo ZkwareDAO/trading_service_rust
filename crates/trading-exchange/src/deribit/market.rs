@@ -7,7 +7,7 @@
 //! - K线频道 `chart.trades.<instrument>.1`：仅在分钟桶翻转（收盘）时回调定稿 bar；
 //! - `on_desired_async` 对缺规格标的拉 `public/get_instrument` 预热（旧 warm_specs 搬入）。
 //!
-//! 见 `docs/行情订阅模型.md` §4.3/5.4。
+//! Deribit 行情订阅渠道与符号映射见本模块协议函数。
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};

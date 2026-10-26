@@ -6,7 +6,7 @@
 //! - `candle`（K线期望集）：1m 原生蜡烛，桶翻转时把上一根定稿回调。
 //!
 //! 写价后回调 `QuoteObserver` 驱动仓位重估。频道/帧解析为纯函数。
-//! 见 `docs/行情订阅模型.md`、`docs/扩展交易所.md` 6.3。
+//! Hyperliquid 行情订阅与符号映射见本模块。
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;

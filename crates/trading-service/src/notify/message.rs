@@ -176,7 +176,7 @@ pub struct SpreadAlertInput<'a> {
     pub roi: Decimal,
 }
 
-/// 渲染 Deribit 期权价差告警（需人工平仓）markdown（docs §四）。
+/// 渲染 Deribit 期权价差告警（需人工平仓）markdown。
 #[allow(dead_code)]
 pub fn render_deribit_spread(input: &SpreadAlertInput) -> String {
     let mut lines = vec!["**> 需要手动平仓**".to_string()];
@@ -199,7 +199,7 @@ pub fn render_deribit_spread(input: &SpreadAlertInput) -> String {
     lines.join("\n")
 }
 
-/// Deribit 订单状态播报渲染输入（docs §五，单行消息）。
+/// Deribit 订单状态播报渲染输入（单行消息）。
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DeribitOrderStatusInput<'a> {
@@ -249,7 +249,7 @@ pub fn deribit_state_from_wire(raw: &str) -> Option<DeribitState> {
     }
 }
 
-/// 按订单要素拼「动作」文案（docs §2.2，纯函数）。
+/// 按订单要素拼「动作」文案（纯函数）。
 ///
 /// * 仓位方向：reduce_only 时订单方向**取反**（平买仓下 sell、平卖仓下 buy）；
 /// * 前缀：reduce_only→「减」、否则「开」；
@@ -289,7 +289,7 @@ const DERIBIT_QTY_SCALE: u32 = 4;
 /// 通知 A ROI 百分比的固定小数位（2 位）。
 const DERIBIT_ROI_PCT_SCALE: u32 = 2;
 
-/// Deribit 订单状态播报（docs §五，单行 markdown）。
+/// Deribit 订单状态播报（单行 markdown）。
 #[allow(dead_code)]
 pub fn render_deribit_order_status(input: &DeribitOrderStatusInput) -> String {
     // 头部 + 「代币 / 动作 / 数量」。
@@ -325,12 +325,12 @@ pub fn render_deribit_order_status(input: &DeribitOrderStatusInput) -> String {
 
 /// ROI 告警渲染时的小数位（百分比 2 位）。
 const REPORT_ROI_PCT_SCALE: u32 = 2;
-/// 数量固定小数位（docs §六：代币数量 4 位）。
+/// 数量固定小数位（代币数量 4 位）。
 const REPORT_QTY_SCALE: u32 = 4;
 /// 分段发送默认上限（字节）：企微 markdown content 上限 4096，预留安全余量。
 pub const CHUNK_MAX_BYTES: usize = 4000;
 
-/// 仓位定时播报中的单条持仓渲染输入（docs §六）。
+/// 仓位定时播报中的单条持仓渲染输入。
 #[derive(Debug, Clone)]
 pub struct PositionReportItem<'a> {
     /// 交易对。
@@ -372,7 +372,7 @@ fn roi_pct_text(roi: Decimal) -> String {
     }
 }
 
-/// 渲染单条持仓段落（docs §六）：方向/盈亏着色，杠杆 0 省略行。
+/// 渲染单条持仓段落：方向/盈亏着色，杠杆 0 省略行。
 ///
 /// 段落首行只输出合约名（不再附带账户后缀）：账户/交易所信息已由外层
 /// [`render_position_report`] / [`render_roi_alert`] 的标题统一承载，避免重复。
@@ -409,7 +409,7 @@ fn join_paragraphs(items: impl Iterator<Item = String>) -> String {
     items.collect::<Vec<_>>().join("\n\n")
 }
 
-/// 仓位定时播报（docs §六，含 `<font>` 颜色）；仓间空一行。无持仓返回空串。
+/// 仓位定时播报（含 `<font>` 颜色）；仓间空一行。无持仓返回空串。
 pub fn render_position_report(
     user_name: &str,
     exchange: &str,
@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn render_open_matches_doc_example_verbatim() {
-        // 文档 §二 示例逐字断言（合约买入开多，价格/数量 6 位小数尾随零）。
+        // 逐字断言（合约买入开多，价格/数量 6 位小数尾随零）。
         let order = filled_order(
             Side::Buy,
             false,
@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn render_risk_close_matches_doc_example_verbatim() {
-        // 文档 §三 示例逐字断言（Sell 平多，盈亏值 6 位、百分比×100 后 4 位带 %）。
+        // 逐字断言（Sell 平多，盈亏值 6 位、百分比×100 后 4 位带 %）。
         let order = filled_order(
             Side::Sell,
             true,
@@ -832,7 +832,7 @@ mod tests {
 
     // ---- 预留 TODO 测试（当前 #[ignore]，实现对应骨架后去掉 ignore 启用）----
 
-    /// docs §四 示例：价差告警含默认标题、买一/卖一/价差、ROI 行与说明。
+    /// 价差告警含默认标题、买一/卖一/价差、ROI 行与说明。
     #[test]
     #[ignore = "TODO: 待 render_deribit_spread 实现后启用"]
     fn render_deribit_spread_matches_doc_example() {
@@ -858,7 +858,7 @@ mod tests {
         );
     }
 
-    /// docs §四：ROI 为 0 时省略「当前roi」行。
+    /// ROI 为 0 时省略「当前roi」行。
     #[test]
     #[ignore = "TODO: 待 render_deribit_spread 实现后启用"]
     fn render_deribit_spread_omits_roi_line_when_zero() {
@@ -938,7 +938,7 @@ mod tests {
         );
     }
 
-    /// build_deribit_action 完整矩阵（docs §2.2）。
+    /// build_deribit_action 完整矩阵。
     #[test]
     fn build_deribit_action_matrix() {
         use DeribitState::*;
@@ -1020,7 +1020,7 @@ mod tests {
         assert_eq!(deribit_state_from_wire(""), None);
     }
 
-    /// docs §六 示例：仓位播报标题、颜色标签、杠杆与盈亏格式（多仓）。
+    /// 仓位播报示例：标题、颜色标签、杠杆与盈亏格式（多仓）。
     #[test]
     fn render_position_report_matches_doc_example_long() {
         let item = PositionReportItem {
@@ -1047,7 +1047,7 @@ mod tests {
         );
     }
 
-    /// docs §六：空仓用 warning 色；杠杆为 0（期权）省略杠杆行。
+    /// 空仓用 warning 色；杠杆为 0（期权）省略杠杆行。
     #[test]
     fn render_position_report_short_uses_warning_color_and_hides_leverage() {
         let item = PositionReportItem {

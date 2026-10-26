@@ -9,7 +9,7 @@
 //!
 //! 账户私有 REST/WS 随账户选网；公共行情恒定正式网，但交易规则须两网并存
 //! （asset index 随 universe 顺序不同）。
-//! 见 `docs/扩展交易所.md` 第二节步骤 9。
+//! Hyperliquid 后置服务（L2 初始化/签名动作）。
 
 use std::sync::Arc;
 use std::time::Duration;

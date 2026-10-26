@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use trading_models::{InstrumentType, Order, OrderStatus, OrderType, Side, TimeInForce};
 
-/// 订单 REST 投影（文档 §3.1）。枚举直接内嵌 model 枚举（serde rename 已与
+/// 订单 REST 投影。枚举直接内嵌 model 枚举（serde rename 已与
 /// 线上字典逐字一致）；Decimal 走精确 JSON 数字；bool 出 true/false。
 #[derive(Debug, Clone, Serialize)]
 pub struct OrderDTO {
@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(v["filled_quantity"], serde_json::json!(0.05));
         assert!(v["order_price"].is_number());
 
-        // 无多余/缺失键：与文档 §3.1 字段集严格一致（28 个）。
+        // 无多余/缺失键：订单 DTO 字段集严格一致（28 个）。
         assert_eq!(v.as_object().unwrap().len(), 28, "实际键集: {v}");
     }
 
