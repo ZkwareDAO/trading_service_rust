@@ -147,6 +147,7 @@ id,name,exchange,credentials,deleted,created_at,updated_at
 ```
 
 - 重载经管理 API `POST /admin/accounts/reload` 显式触发；交易所连接随后按重载版本停旧起新（对账周期 `--account-reload-interval`，默认 2s）。
+- CTP 合约规格每日刷新（仅编译启用 ctp feature）：`POST /admin/ctp/refresh-specs`。用独立临时 trader 短连接阻塞拉取全量合约 + 投资者手续费率，落盘 `<data-dir>/ctp-specs/YYYYMM/{instruments,commissions}-YYYY-MM-DD.csv` 与 `latest/` 副本，并原地重灌进程内共享合约目录。耗时数十秒（受柜台 1s 流控），应放外部 cron（如盘后 14:55）调用；同一时刻仅允许一个刷新在跑，并发返回 `409`，成功返回 `{success,instruments,futures,commissions,error}`。
 - 新增账户即由 supervisor 拉起其用户数据流连接；删除/`deleted=1` 即停用连接；坏文件保留旧表。
 - `credentials` 为**整串凭证 JSON**（按 exchange 选 schema：REST 签名所 `{api_key, api_secret, api_passphrase?, position_mode, is_testnet}`，CTP `{broker_id, user_id, password, app_id, auth_code, investor_id?, front_address, is_production_mode?}`），支持明文 JSON（仅联调，启动会告警并在内存归一化）或加密形态 `enc.v1.*`（AES-256-GCM，主密钥在 `<data-dir>/account.key`，0600，首启自动生成）。REST 所的 `is_testnet`/`position_mode` 是账户级属性（随该账户的凭证 JSON）。
 - 模板见 `deploy/account.example.csv`，账户管理（含旧宽表迁移 `migrate`）见 `account-tool`。
@@ -204,6 +205,7 @@ sudo ./deploy/deploy.sh      # 构建并安装到 /opt/trading_service_rust，�
 | `--account-key-file` | 空 | 账户主密钥路径（缺省取 `<data-dir>/account.key`，首启自动生成） |
 | `--south-secret-file` | 空 | 南向 HMAC 密钥路径（缺省取 `<data-dir>/south.key`，首启自动生成 0600） |
 | `--flush-interval` | `5s` | 脏表定时落盘周期 |
+| `--kline-flush-interval` | `5s` | K线（定稿 1m bar / CTP 原始 tick）批量 append 到 CSV 的周期（独立 OS 线程，同步 IO 不进 tokio worker） |
 | `--rest-timeout` | `5s` | 交易所 REST 超时 |
 | `--account-reload-interval` | `2s` | 账户表对账周期（重载版本变化即停旧起新） |
 | `--rule-refresh-interval` | `720h` | 交易所规则表刷新周期 |
