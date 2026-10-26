@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use trading_core::kline::{DominantTable, LastVolumeTable, TickTable};
+use trading_core::kline::{BarTable, DominantTable, KlineRegistry, LastVolumeTable, TickTable};
 use trading_core::order_rule::OrderRuleTable;
 use trading_core::quote::QuoteTable;
 
@@ -28,12 +28,16 @@ pub struct MemoryTables {
     pub quotes: Arc<QuoteTable>,
     /// 杠杆缓存（账户对账快照写入，下单前据此决定是否需要 set_leverage）。
     pub leverages: LeverageRepo,
-    /// CTP K线：最新原始 tick（WAL 原料）。
+    /// CTP K线：原始 tick WAL 待刷盘窗口。
     pub ctp_ticks: Arc<TickTable>,
     /// CTP K线：合约 → 当日最后累计成交量（主力选举原料）。
     pub ctp_last_volumes: Arc<LastVolumeTable>,
     /// CTP K线：品种 → 当前主力（收盘选举写入，次日冻结）。
     pub ctp_dominants: Arc<DominantTable>,
+    /// K线：定稿 bar 待刷盘窗口（四家共用）。
+    pub bar_table: Arc<BarTable>,
+    /// K线：客户端订阅登记表（引用计数、断连清理）。
+    pub kline_registry: Arc<KlineRegistry>,
 }
 
 impl MemoryTables {
@@ -46,6 +50,8 @@ impl MemoryTables {
             ctp_ticks: Arc::new(TickTable::new()),
             ctp_last_volumes: Arc::new(LastVolumeTable::new()),
             ctp_dominants: Arc::new(DominantTable::new()),
+            bar_table: Arc::new(BarTable::new()),
+            kline_registry: Arc::new(KlineRegistry::new()),
         }
     }
 }
@@ -105,11 +111,31 @@ mod tests {
 
     #[test]
     fn store_memory_bundle_matches_individual_accessors() {
-        // 集合句柄与两个独立访问器必须指向同一实例（单一事实来源）。
+        // 集合句柄与各独立访问器必须指向同一实例（单一事实来源）。
         let store = open_store();
         let mem = store.memory();
         assert!(Arc::ptr_eq(&mem.order_rules, &store.order_rules()));
         assert!(Arc::ptr_eq(&mem.quotes, &store.quotes()));
+        assert!(Arc::ptr_eq(&mem.ctp_ticks, &store.ctp_ticks()));
+        assert!(Arc::ptr_eq(
+            &mem.ctp_last_volumes,
+            &store.ctp_last_volumes()
+        ));
+        assert!(Arc::ptr_eq(&mem.ctp_dominants, &store.ctp_dominants()));
+        assert!(Arc::ptr_eq(&mem.bar_table, &store.bar_table()));
+        assert!(Arc::ptr_eq(&mem.kline_registry, &store.kline_registry()));
+    }
+
+    #[test]
+    fn store_returns_same_kline_tables_every_call() {
+        // K线五张高频表都必须是进程内单例（跨句柄共享同一份内存）。
+        let store = open_store();
+        assert!(Arc::ptr_eq(&store.bar_table(), &store.bar_table()));
+        assert!(Arc::ptr_eq(
+            &store.kline_registry(),
+            &store.kline_registry()
+        ));
+        assert!(Arc::ptr_eq(&store.ctp_ticks(), &store.ctp_ticks()));
     }
 
     #[test]

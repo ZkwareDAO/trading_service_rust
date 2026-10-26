@@ -25,15 +25,17 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use store_core::{Model, PersistHandle, PersistOptions, Store, StoreError, Table};
-use trading_core::kline::{DominantTable, LastVolumeTable, TickTable};
+use trading_core::kline::{BarTable, DominantTable, KlineRegistry, LastVolumeTable, TickTable};
 use trading_core::order_rule::OrderRuleTable;
 use trading_core::quote::QuoteTable;
 use trading_models::{Account, Order, Position, WatchRule};
 
 pub mod accounts;
 pub mod async_rt;
+pub mod ctp_specs;
 pub mod history;
 pub mod init;
+pub mod kline;
 pub mod leverage;
 pub mod memory;
 pub mod orders;
@@ -43,6 +45,7 @@ pub mod rules;
 pub use accounts::{AccountBrief, AccountManager, ResolvedAccount};
 pub use async_rt::{PersistRuntime, PersistTaskHandle};
 pub use history::HistoryReader;
+pub use kline::{FlushReport as KlineFlushReport, KlineRepo};
 pub use leverage::{should_set_leverage, LeverageKey, LeverageRepo};
 pub use memory::MemoryTables;
 pub use orders::{OrderEventInput, OrderRepo, OrderRepoError};
@@ -61,6 +64,8 @@ pub struct TradingStore {
     order_repo: OnceLock<OrderRepo>,
     position_repo: OnceLock<PositionRepo>,
     rule_repo: OnceLock<RuleRepo>,
+    /// K线 CSV 仓储（append-only 新形态，惰性单例；root 同数据根）。
+    kline_repo: OnceLock<KlineRepo>,
 }
 
 impl TradingStore {
@@ -92,6 +97,7 @@ impl TradingStore {
                 order_repo: OnceLock::new(),
                 position_repo: OnceLock::new(),
                 rule_repo: OnceLock::new(),
+                kline_repo: OnceLock::new(),
             },
             handle,
         ))
@@ -128,6 +134,7 @@ impl TradingStore {
                 order_repo: OnceLock::new(),
                 position_repo: OnceLock::new(),
                 rule_repo: OnceLock::new(),
+                kline_repo: OnceLock::new(),
             },
             handle,
         ))
@@ -217,6 +224,27 @@ impl TradingStore {
             .clone()
     }
 
+    /// K线：定稿 bar 待刷盘窗口（四家共用，纯内存不落快照）。
+    pub fn bar_table(&self) -> Arc<BarTable> {
+        self.memory.get_or_init(MemoryTables::new).bar_table.clone()
+    }
+
+    /// K线：客户端订阅登记表（引用计数、断连清理，纯内存）。
+    pub fn kline_registry(&self) -> Arc<KlineRegistry> {
+        self.memory
+            .get_or_init(MemoryTables::new)
+            .kline_registry
+            .clone()
+    }
+
+    /// K线 CSV 仓储：bar/tick 批量 append 到 root/kline/...（进程内单例）。
+    /// 定时 flush 任务由服务层在取得该实例后 spawn。
+    pub fn kline_repo(&self) -> KlineRepo {
+        self.kline_repo
+            .get_or_init(|| KlineRepo::new(self.root.clone()))
+            .clone()
+    }
+
     /// 进程一份的杠杆内存仓储（纯内存不落盘）：对账快照写入，下单前据此按需设置。
     pub fn leverage_repo(&self) -> LeverageRepo {
         self.memory.get_or_init(MemoryTables::new).leverages.clone()
@@ -234,6 +262,13 @@ impl TradingStore {
     /// 历史归档回查器（廉价构造、无缓存；按需倒序扫历史 CSV）。
     pub fn history(&self) -> HistoryReader {
         HistoryReader::new(self.root.clone())
+    }
+
+    /// CTP 合约规格快照存储（无状态、仅持有数据根；每次廉价构造，无共享索引）。
+    /// 管理 API 每日刷新时写 `ctp-specs/YYYYMM/{instruments,commissions}-YYYY-MM-DD.csv`
+    /// 与 `latest/` 副本，冷启动种子从 latest 读回。
+    pub fn ctp_specs(&self) -> ctp_specs::CtpSpecsStore {
+        ctp_specs::CtpSpecsStore::new(self.root.clone())
     }
 
     /// 立即做一次快照落盘（同步；只写 dirty 表）。
