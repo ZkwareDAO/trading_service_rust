@@ -12,10 +12,10 @@ use tokio::task::JoinHandle;
 use crate::api::ExchangeApi;
 use crate::binance::client::{BinanceFuturesClientCache, BinanceFuturesOptions};
 use crate::binance::services::{self, spawn_market_hubs};
+use crate::binance::stream::BinanceMarketStream;
 use crate::binance::user_stream::{BinanceUserProvider, BinanceVenueConnector};
 use crate::binance::venue::BinanceUser;
 use crate::market::MarketDataStream;
-use crate::market_ws::WsHubStream;
 use crate::port::{CredentialResolver, OrderEventSink};
 use crate::provider::{ProviderDeps, VenueProvider};
 
@@ -85,8 +85,8 @@ impl BinanceUserProvider for BinanceUsers {
 pub struct BinanceProvider {
     users: Arc<BinanceUsers>,
     deps: ProviderDeps,
-    /// 现货/合约两条全市场行情 hub（首次取用即一起构造，进程单例）。
-    market_hubs: OnceLock<(Arc<WsHubStream>, Arc<WsHubStream>)>,
+    /// 现货/合约两条本所拥有的行情流（首次取用即一起构造，进程单例）。
+    market_hubs: OnceLock<(Arc<BinanceMarketStream>, Arc<BinanceMarketStream>)>,
 }
 
 impl BinanceProvider {
@@ -103,8 +103,8 @@ impl BinanceProvider {
         }
     }
 
-    /// 懒构造并返回 (现货, 合约) 两条全市场行情 hub 单例。
-    fn ensure_market_hubs(&self) -> &(Arc<WsHubStream>, Arc<WsHubStream>) {
+    /// 懒构造并返回 (现货, 合约) 两条本所行情流单例。
+    fn ensure_market_hubs(&self) -> &(Arc<BinanceMarketStream>, Arc<BinanceMarketStream>) {
         self.market_hubs.get_or_init(|| {
             spawn_market_hubs(
                 Arc::clone(&self.deps.quotes),

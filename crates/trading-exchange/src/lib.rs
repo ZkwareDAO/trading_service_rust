@@ -5,13 +5,17 @@
 //! 不反向依赖 trading-service；对宿主的出站需求经 [`port`] 端口倒置。
 //!
 //! # 统一行情流（行情 Hub + 统一 MarketDataStream）
-//! - [`market`]：对外契约 [`market::MarketDataStream`]（`subscribe_prices` /
-//!   `subscribe_klines`，凭证式 `Arc<dyn DesiredSource>` + guard 退订），K线/价格 tick
-//!   等值类型；四家（binance/deribit/hyperliquid/ctp）实现两方法，xili 返回 Unsupported。
+//! - [`market`]：对外契约 [`market::MarketDataStream`]（与 `ExchangeApi` 同等级，
+//!   `subscribe_prices` / `subscribe_klines`，凭证式 `Arc<dyn DesiredSource>` + guard
+//!   退订），K线/价格 tick 等值类型。**每家交易所各自拥有具名 impl**：
+//!   binance/deribit/hyperliquid 的 `XxxMarketStream` 与 ctp 的 `CtpMarketStream`；
+//!   xili 不覆盖，取默认 Unsupported。
 //! - [`market_hub`]：消费者注册表 / 全局并集 / 订阅 diff / 按 symbol 路由 /
 //!   `catch_unwind`+单次耗时摘除异常 sink（纯内核、零 channel、`Arc<Mutex>` 短临界区）。
-//! - [`market_ws`]：WS 三家共用的唯一连接生命周期（退避/10s Ping/5s 看门狗 20s 判死/
-//!   500ms 对账/重连整体重放）+ [`market_ws::WsMarketFeed`] 协议端口（各所只留协议纯函数）。
+//! - [`market_ws`]：可组合引擎 [`market_ws::WsHubEngine`]——WS 三家共用的唯一连接生命周期
+//!   （退避/10s Ping/5s 看门狗 20s 判死/500ms 对账/重连整体重放）+ [`market_ws::WsMarketFeed`]
+//!   协议端口（各所只留协议纯函数）。引擎**自身不实现** `MarketDataStream`，由各所具名流
+//!   委托，新增所内额外处理不必改引擎或上层。
 //! - CTP 是单连接阻塞特例：业务兴趣 ∪ K线期望共用一条 `ctp-md` 线程，tick 按作用域
 //!   分流（业务集→QuoteTable/observer 原样；K线集→`ctp::market_stream` 聚合/选举/三表）。
 //!
@@ -25,7 +29,7 @@ pub mod heartbeat;
 pub mod market;
 /// hub 纯内核：消费者注册表 / 全局并集 / 订阅 diff / 按 symbol 路由 / 异常 sink 摘除。
 pub mod market_hub;
-/// WS 三家共用的唯一连接生命周期 + WsMarketFeed 协议端口。
+/// 可组合 WS 引擎 WsHubEngine（三家共用生命周期）+ WsMarketFeed 协议端口。
 pub mod market_ws;
 pub mod port;
 pub mod position_profile;

@@ -1,8 +1,10 @@
-//! 唯一一套 WS 行情生命周期（deribit / hyperliquid / binance 三家共用）。
+//! 三家 WS 交易所（deribit / hyperliquid / binance）共用的一套 WS 行情**引擎**。
 //!
-//! 此前三家各抄一份「重连退避 / 10s Ping / 5s 看门狗 20s 判死 / 500ms 对账 /
-//! 重连整体重放」骨架；本模块把生命周期收口为 [`WsDriver`]，各交易所只保留
-//! 实现 [`WsMarketFeed`] 的**协议纯函数**（频道映射、订阅编码、帧解码、规格预热）。
+//! 本模块收口连接生命周期（重连退避 / 10s Ping / 5s 看门狗 20s 判死 / 500ms 对账 /
+//! 重连整体重放）与消费者注册表，产出可组合的 [`WsHubEngine`]。引擎**自身不实现**
+//! [`crate::market::MarketDataStream`]：各交易所的具名流（`binance/stream.rs` 等）
+//! 持有引擎、委托订阅原语并实现该 trait；所内协议差异经 [`WsMarketFeed`] 的**协议纯函数**
+//! 注入（频道映射、订阅编码、帧解码、规格预热）。
 //!
 //! 数据流（零 channel，同 `QuoteObserver` 模式）：
 //! - 驱动读帧 → `feed.decode` 得 [`PriceTick`] / [`Kline`]；
@@ -23,9 +25,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use trading_core::quote::QuoteTable;
 
 use crate::backoff::ReconnectBackoff;
-use crate::market::{
-    BarSink, DesiredSource, Kline, MarketDataStream, PriceTick, SubscriptionGuard,
-};
+use crate::market::{BarSink, DesiredSource, Kline, PriceTick, SubscriptionGuard};
 use crate::market_hub::HubRegistry;
 use crate::port::QuoteObserver;
 use crate::ws::WsStream;
@@ -134,19 +134,82 @@ pub fn trading_day_of_utc_ms(start_ms: i64) -> u32 {
         .unwrap_or(0)
 }
 
-/// hub 行情流句柄（每「连接」一个进程单例）：持注册表 + 驱动任务，实现
-/// [`MarketDataStream`]。动态消费者经两个 subscribe 方法登记；托管（系统行情）
-/// 来源由 provider 注册并把 guard 永久保存在本句柄内。
-pub struct WsHubStream {
+/// WS 行情**引擎**：三家 WS 所共用的连接生命周期 + 消费者注册表，是一个被各所
+/// **组合/委托**的库构件，自身**不实现** [`crate::market::MarketDataStream`]。
+///
+/// 所有权反转：各交易所在自己模块内持有本引擎并实现具名 `impl MarketDataStream`
+/// （见 `binance/stream.rs` 等），把订阅原语委托到这里；交易所要加所内额外处理
+/// （装饰/过滤 sink、挂第二来源等）只改自己的具名流，不必动本引擎或统一 trait。
+///
+/// 持注册表 + 可选驱动任务：[`WsHubEngine::spawn_hub`] 产出带连接任务的进程单例；
+/// `spawn_driverless`（`#[cfg(test)]`）不起连接、仅供进程内单测。
+pub struct WsHubEngine {
     hub: HubRegistry,
     /// 驱动任务（进程生命周期，不主动 abort；句柄仅持有，不 await）。
-    _task: JoinHandle<()>,
+    /// driverless 构造（单测）时为 None。
+    _task: Option<JoinHandle<()>>,
     /// 托管订阅凭证（系统行情 InterestSource 等），与句柄同寿，drop 才退订。
     /// std::Mutex：注册只在启动期同步 push（无 await、临界区极短）。
     managed: Mutex<Vec<SubscriptionGuard>>,
 }
 
-impl WsHubStream {
+impl WsHubEngine {
+    /// 内部构造：给定注册表与可选驱动任务。
+    fn with_hub(hub: HubRegistry, task: Option<JoinHandle<()>>) -> Arc<Self> {
+        Arc::new(Self {
+            hub,
+            _task: task,
+            managed: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// 启动一条由 `feed` 描述协议的 WS 行情连接，返回其共享引擎单例。
+    ///
+    /// 驱动任务随进程生命周期运行：建连失败/断开按 [`ReconnectBackoff`] 退避重连，
+    /// 重连后清空已订阅集，按当前全局并集整体重放。
+    pub fn spawn_hub<F>(
+        label: &'static str,
+        feed: Arc<F>,
+        quotes: Arc<QuoteTable>,
+        observer: Option<Arc<dyn QuoteObserver>>,
+    ) -> Arc<Self>
+    where
+        F: WsMarketFeed + 'static,
+    {
+        let hub = HubRegistry::new();
+        let task = tokio::spawn(run_forever(label, feed, hub.clone(), quotes, observer));
+        Self::with_hub(hub, Some(task))
+    }
+
+    /// 不起任何连接任务的引擎（仅进程内单测用）：注册/派发纯走 [`HubRegistry`]。
+    #[cfg(test)]
+    pub fn spawn_driverless() -> Arc<Self> {
+        Self::with_hub(HubRegistry::new(), None)
+    }
+
+    /// 取出注册表句柄供测试注入定稿 bar（与引擎共享同一注册表）。
+    #[cfg(test)]
+    pub fn registry_for_test(&self) -> HubRegistry {
+        self.hub.clone()
+    }
+
+    /// 登记系统行情来源，返回 drop 即退订的凭证（具名流的 `subscribe_prices` 委托此）。
+    pub fn subscribe_prices(
+        &self,
+        src: Arc<dyn DesiredSource>,
+    ) -> anyhow::Result<SubscriptionGuard> {
+        Ok(self.hub.register_prices(src))
+    }
+
+    /// 登记 K线消费者（期望来源 + 定稿回调），返回 drop 即退订的凭证。
+    pub fn subscribe_klines(
+        &self,
+        src: Arc<dyn DesiredSource>,
+        sink: Arc<dyn BarSink>,
+    ) -> anyhow::Result<SubscriptionGuard> {
+        Ok(self.hub.register_klines(src, sink))
+    }
+
     /// 注册一个与句柄同寿的托管系统行情来源（不返回 guard，进程期内不退订）。
     pub fn register_managed_prices(&self, src: Arc<dyn DesiredSource>) {
         let guard = self.hub.register_prices(src);
@@ -155,42 +218,6 @@ impl WsHubStream {
             .expect("managed guards lock")
             .push(guard);
     }
-}
-
-impl MarketDataStream for WsHubStream {
-    fn subscribe_prices(&self, src: Arc<dyn DesiredSource>) -> anyhow::Result<SubscriptionGuard> {
-        Ok(self.hub.register_prices(src))
-    }
-
-    fn subscribe_klines(
-        &self,
-        src: Arc<dyn DesiredSource>,
-        sink: Arc<dyn BarSink>,
-    ) -> anyhow::Result<SubscriptionGuard> {
-        Ok(self.hub.register_klines(src, sink))
-    }
-}
-
-/// 启动一条由 `feed` 描述协议的 WS 行情连接，返回其 hub 流句柄。
-///
-/// 驱动任务随进程生命周期运行：建连失败/断开按 [`ReconnectBackoff`] 退避重连，
-/// 重连后清空已订阅集，按当前全局并集整体重放。
-pub fn spawn_hub<F>(
-    label: &'static str,
-    feed: Arc<F>,
-    quotes: Arc<QuoteTable>,
-    observer: Option<Arc<dyn QuoteObserver>>,
-) -> Arc<WsHubStream>
-where
-    F: WsMarketFeed + 'static,
-{
-    let hub = HubRegistry::new();
-    let task = tokio::spawn(run_forever(label, feed, hub.clone(), quotes, observer));
-    Arc::new(WsHubStream {
-        hub,
-        _task: task,
-        managed: Mutex::new(Vec::new()),
-    })
 }
 
 /// 与旧三家 worker 同构的「退避 → 单连接 → 断开退避」外层循环。

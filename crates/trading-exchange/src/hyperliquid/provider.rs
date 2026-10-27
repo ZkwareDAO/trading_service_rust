@@ -12,9 +12,10 @@ use trading_models::MarketKind;
 use crate::api::ExchangeApi;
 use crate::hyperliquid::account_consumer::{HlUserProvider, HlVenueConnector};
 use crate::hyperliquid::market::HlMarketFeed;
+use crate::hyperliquid::stream::HlMarketStream;
 use crate::hyperliquid::venue::HyperliquidUser;
 use crate::market::{InterestSource, MarketDataStream};
-use crate::market_ws::{self, WsHubStream};
+use crate::market_ws::WsHubEngine;
 use crate::port::OrderEventSink;
 use crate::provider::{ProviderDeps, VenueProvider};
 
@@ -41,7 +42,7 @@ impl HyperliquidConfig {
 pub struct HyperliquidProvider {
     deps: ProviderDeps,
     /// 交易所级行情流单例（首次取用即 spawn hub 驱动，进程内复用同一条连接）。
-    market_stream: OnceLock<Arc<WsHubStream>>,
+    market_stream: OnceLock<Arc<HlMarketStream>>,
 }
 
 impl HyperliquidProvider {
@@ -53,15 +54,17 @@ impl HyperliquidProvider {
     }
 
     /// 懒创建并返回 hyperliquid 行情 hub 单例（建一条 WsDriver 连接）。
-    fn ensure_market_stream(&self) -> anyhow::Result<Arc<WsHubStream>> {
+    fn ensure_market_stream(&self) -> anyhow::Result<Arc<HlMarketStream>> {
         let stream = self.market_stream.get_or_init(|| {
             let feed = Arc::new(HlMarketFeed::new());
-            market_ws::spawn_hub(
+            // spawn 共享 WS 引擎，再包成本所拥有的具名行情流。
+            let engine = WsHubEngine::spawn_hub(
                 "hyperliquid",
                 feed,
                 Arc::clone(&self.deps.quotes),
                 self.deps.quote_observer.clone(),
-            )
+            );
+            Arc::new(HlMarketStream::from_engine(engine))
         });
         Ok(Arc::clone(stream))
     }

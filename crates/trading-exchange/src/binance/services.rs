@@ -2,8 +2,8 @@
 //!
 //! 本模块负责：
 //! * 交易规则启动全量同步一次 + 到点整表刷新（[`spawn_rule_sync`]，失败仅告警）；
-//! * 公共行情 hub 单例（[`spawn_market_hubs`]）：现货 last 与合约 mark 各一条
-//!   无认证全市场 WS（生命周期在 [`crate::market_ws`]），写入共享行情表。
+//! * 公共行情流单例（[`spawn_market_hubs`]）：现货 last 与合约 mark 各一条
+//!   无认证全市场 WS（引擎在 [`crate::market_ws`]），写入共享行情表。
 //!
 //! 恒定连接正式网；账户测试网只影响用户级下单 REST 与账户事件流。
 
@@ -15,30 +15,32 @@ use trading_core::quote::QuoteTable;
 
 use crate::api::RuleFetcher;
 use crate::binance::market::BinanceMarketFeed;
+use crate::binance::stream::BinanceMarketStream;
 use crate::binance::venue::BinanceRuleFetcher;
-use crate::market_ws::{self, WsHubStream};
+use crate::market_ws::WsHubEngine;
 use crate::port::QuoteObserver;
 
-/// 构造现货/合约两条全市场行情 hub（调用方按 instrument_type 取用并保存单例）。
+/// 构造现货/合约两条全市场行情流（调用方按 instrument_type 取用并保存单例）。
 ///
+/// 各 spawn 一条 [`WsHubEngine`] 并立即包成本所拥有的 [`BinanceMarketStream`]；
 /// 现货不挂仓位重估观察口；合约 mark 写价后驱动仅 binance 仓位的重估。
 pub(crate) fn spawn_market_hubs(
     quotes: Arc<QuoteTable>,
     quote_observer: Option<Arc<dyn QuoteObserver>>,
-) -> (Arc<WsHubStream>, Arc<WsHubStream>) {
-    let spot = market_ws::spawn_hub(
+) -> (Arc<BinanceMarketStream>, Arc<BinanceMarketStream>) {
+    let spot = BinanceMarketStream::from_engine(WsHubEngine::spawn_hub(
         "binance-spot",
         Arc::new(BinanceMarketFeed::spot()),
         Arc::clone(&quotes),
         None,
-    );
-    let futures = market_ws::spawn_hub(
+    ));
+    let futures = BinanceMarketStream::from_engine(WsHubEngine::spawn_hub(
         "binance-futures",
         Arc::new(BinanceMarketFeed::futures()),
         quotes,
         quote_observer,
-    );
-    (spot, futures)
+    ));
+    (Arc::new(spot), Arc::new(futures))
 }
 
 /// 规则：启动全量同步一次（失败仅告警、不阻断），随后按周期整表刷新。恒定正式网。

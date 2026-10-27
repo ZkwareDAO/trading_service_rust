@@ -10,9 +10,10 @@ use trading_models::MarketKind;
 use crate::api::ExchangeApi;
 use crate::deribit::account_consumer::{DeribitUserProvider, DeribitVenueConnector};
 use crate::deribit::market::DeribitMarketFeed;
+use crate::deribit::stream::DeribitMarketStream;
 use crate::deribit::venue::DeribitUser;
 use crate::market::{InterestSource, MarketDataStream};
-use crate::market_ws::{self, WsHubStream};
+use crate::market_ws::WsHubEngine;
 use crate::port::OrderEventSink;
 use crate::provider::{ProviderDeps, VenueProvider};
 
@@ -23,7 +24,7 @@ const NAME: &str = "deribit";
 pub struct DeribitProvider {
     deps: ProviderDeps,
     /// 交易所级行情流单例（首次取用即 spawn hub 驱动，进程内复用同一条连接）。
-    market_stream: OnceLock<Arc<WsHubStream>>,
+    market_stream: OnceLock<Arc<DeribitMarketStream>>,
 }
 
 impl DeribitProvider {
@@ -35,18 +36,20 @@ impl DeribitProvider {
     }
 
     /// 懒创建并返回 deribit 行情 hub 单例（建一条 WsDriver 连接）。
-    fn ensure_market_stream(&self) -> anyhow::Result<Arc<WsHubStream>> {
+    fn ensure_market_stream(&self) -> anyhow::Result<Arc<DeribitMarketStream>> {
         let stream = self.market_stream.get_or_init(|| {
             let feed = Arc::new(DeribitMarketFeed::new(
                 self.deps.http.clone(),
                 Arc::clone(&self.deps.rules),
             ));
-            market_ws::spawn_hub(
+            // spawn 共享 WS 引擎，再包成本所拥有的具名行情流。
+            let engine = WsHubEngine::spawn_hub(
                 "deribit-option",
                 feed,
                 Arc::clone(&self.deps.quotes),
                 self.deps.quote_observer.clone(),
-            )
+            );
+            Arc::new(DeribitMarketStream::from_engine(engine))
         });
         Ok(Arc::clone(stream))
     }

@@ -19,5 +19,6 @@ pub mod pricing;
 pub mod provider;
 pub mod rpc;
 pub mod spec;
+pub mod stream;
 pub mod user_stream;
 pub mod venue;

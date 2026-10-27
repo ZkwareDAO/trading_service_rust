@@ -15,5 +15,6 @@ pub mod prep;
 pub mod provider;
 pub mod rules;
 pub mod services;
+pub mod stream;
 pub mod user_stream;
 pub mod venue;

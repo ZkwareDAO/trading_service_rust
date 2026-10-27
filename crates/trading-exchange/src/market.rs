@@ -199,13 +199,20 @@ impl Drop for SubscriptionGuard {
     }
 }
 
-/// 统一行情流：每家交易所一个进程单例（经 `registry.market_stream(venue, itype)` 取）。
+/// 统一行情流：与 [`crate::api::ExchangeApi`] 同等级的、**每家交易所各自拥有**的契约
+/// （一个进程单例，经 `registry.market_stream(venue, itype)` 取）。
+///
+/// 所有权模型（扩展性关键）：每家交易所在自己模块内有一个具名 impl，需要所内额外处理
+/// （装饰/过滤 sink、挂第二来源、拦截订阅等）只改该 impl，不动本 trait、不动其他所：
+/// - binance/deribit/hyperliquid：各自的 `XxxMarketStream` 具名 impl，内部**委托**
+///   可组合引擎 [`crate::market_ws::WsHubEngine`]（引擎本身**不实现**本 trait）；
+/// - ctp：`ctp::market_stream::CtpMarketStream` 独立 impl（单连接 tick 聚合，feature="ctp"）。
 ///
 /// 两个原语：
 /// - [`MarketDataStream::subscribe_prices`]：系统行情，tick 写 QuoteTable + observer；
 /// - [`MarketDataStream::subscribe_klines`]：K线，WS 三家=原生收盘帧，CTP=内部 tick 聚合。
 ///
-/// xili 两方法均返回 `Unsupported`。
+/// xili 不覆盖 `build_market_stream`，两方法经 provider 默认实现返回 `Unsupported`。
 pub trait MarketDataStream: Send + Sync {
     /// 订阅系统行情：返回凭证，drop 退订。
     fn subscribe_prices(&self, src: Arc<dyn DesiredSource>) -> anyhow::Result<SubscriptionGuard>;

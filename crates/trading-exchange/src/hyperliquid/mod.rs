@@ -26,5 +26,6 @@ pub(crate) mod pricing;
 pub mod provider;
 pub(crate) mod services;
 pub(crate) mod signature;
+pub(crate) mod stream;
 pub(crate) mod user_stream;
 pub(crate) mod venue;
