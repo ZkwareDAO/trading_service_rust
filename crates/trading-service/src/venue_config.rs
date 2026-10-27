@@ -30,10 +30,20 @@ pub struct LoadedVenueConfigs {
     pub deribit: PrepConfig,
     /// Hyperliquid：市价滑点。
     pub hyperliquid: HyperliquidConfig,
+    /// Binance：配置基线 K线标的（启动即订阅并全量落盘）。
+    pub binance: BinanceVenueConfig,
     /// CTP：.so 路径/流目录基准（feature="ctp" 时由 registry 消费；生产模式
     /// 开关已下沉账户级 credentials）。
     #[cfg(feature = "ctp")]
     pub ctp: trading_exchange::ctp::CtpConfig,
+}
+
+/// Binance 配置段：当前仅承载配置基线 K线标的。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BinanceVenueConfig {
+    /// 配置基线 1m K线合约（venue.toml 原值；构造基线时归一为币安原生大写口径）。
+    /// 启动即向合约行情流订阅这些标的并全量落盘，与南向客户端是否在线无关。
+    pub kline_symbols: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -78,16 +88,50 @@ fn default_slippage() -> Decimal {
     DEFAULT_HYPERLIQUID_SLIPPAGE.parse().unwrap()
 }
 
+/// 由 venue 配置构造 K线配置基线（当前仅 binance 合约作用域）。
+///
+/// binance 标的一律大写归一为原生口径（与 provider `normalize_instrument` 一致），
+/// trim/去重/排序由 [`crate::kline::BaselineKlines::new`] 完成；空配置不产生基线。
+pub fn kline_baselines(cfg: &LoadedVenueConfigs) -> Vec<crate::kline::BaselineKlines> {
+    let symbols: Vec<String> = cfg
+        .binance
+        .kline_symbols
+        .iter()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if symbols.is_empty() {
+        return Vec::new();
+    }
+    vec![crate::kline::BaselineKlines::new(
+        "binance",
+        trading_models::InstrumentType::Futures,
+        symbols,
+    )]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 struct VenueFile {
     #[serde(default)]
     deribit: DeribitSection,
     #[serde(default)]
     hyperliquid: HyperliquidSection,
+    /// Binance 段（配置基线 K线标的；缺失＝无基线）。
+    #[serde(default)]
+    binance: BinanceSection,
     /// CTP 段（feature="ctp" 时由 registry 消费；缺失回退 vendored 缺省）。
     #[serde(default)]
     #[cfg(feature = "ctp")]
     ctp: CtpSection,
+}
+
+/// binance 配置段：仅配置基线 K线标的；全部可选，缺省为空。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+struct BinanceSection {
+    /// 启动即订阅的 1m K线合约（建议币安原生大写，如 ["BTCUSDT"]；
+    /// 小写也兼容，构造基线时统一大写归一）。
+    #[serde(default)]
+    kline_symbols: Vec<String>,
 }
 
 /// CTP 配置段：.so 路径/流目录/生产模式；全部可选。
@@ -129,6 +173,9 @@ pub fn load(path: &Path) -> anyhow::Result<LoadedVenueConfigs> {
         hyperliquid: HyperliquidConfig {
             slippage: parsed.hyperliquid.slippage,
         },
+        binance: BinanceVenueConfig {
+            kline_symbols: parsed.binance.kline_symbols,
+        },
         #[cfg(feature = "ctp")]
         ctp: trading_exchange::ctp::from_values(
             parsed.ctp.trader_so,
@@ -159,6 +206,7 @@ pub fn default_configs() -> LoadedVenueConfigs {
         hyperliquid: HyperliquidConfig {
             slippage: default_slippage(),
         },
+        binance: BinanceVenueConfig::default(),
         #[cfg(feature = "ctp")]
         ctp: trading_exchange::ctp::from_values(
             None, None, None, None, None, None, None, None, None, None, None,
@@ -243,6 +291,46 @@ mod tests {
         let cfg = load(&path).expect("ok");
         assert_eq!(cfg.deribit, default_configs().deribit);
         assert_eq!(cfg.hyperliquid, default_configs().hyperliquid);
+        // binance 段缺失：基线 K线为空。
+        assert!(cfg.binance.kline_symbols.is_empty());
+    }
+
+    #[test]
+    fn parses_binance_kline_symbols_and_builds_baselines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("venue.toml");
+        std::fs::write(
+            &path,
+            "[binance]\nkline_symbols = [\"btcusdt\", \"ETHUSDT\", \"btcusdt\"]\n",
+        )
+        .unwrap();
+        let cfg = load(&path).expect("ok");
+        // 配置值原样保留（不在解析层去重/改大小写）。
+        assert_eq!(
+            cfg.binance.kline_symbols,
+            vec!["btcusdt", "ETHUSDT", "btcusdt"]
+        );
+
+        // 基线构造：归一为币安原生大写口径，去重、字典序。
+        let baselines = kline_baselines(&cfg);
+        assert_eq!(baselines.len(), 1);
+        assert_eq!(baselines[0].venue, "binance");
+        assert_eq!(baselines[0].itype, trading_models::InstrumentType::Futures);
+        assert_eq!(
+            baselines[0].symbols,
+            vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()]
+        );
+    }
+
+    #[test]
+    fn binance_empty_kline_symbols_yields_no_baseline() {
+        // 显式空表/缺字段：不产生基线作用域。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("venue.toml");
+        std::fs::write(&path, "[binance]\nkline_symbols = []\n").unwrap();
+        assert!(kline_baselines(&load(&path).expect("ok")).is_empty());
+
+        assert!(kline_baselines(&default_configs()).is_empty());
     }
 
     #[test]

@@ -218,6 +218,13 @@ impl WsHubEngine {
             .expect("managed guards lock")
             .push(guard);
     }
+
+    /// 注册无条件 bar 下游（全量持久化）：每根定稿 bar（含零订阅标的）都不经
+    /// symbol 路由地通知它。进程寿命、不可注销；应在引擎 spawn 后装配期注册一次，
+    /// 坏/慢 sink 在 dispatch 时被隔离摘除。
+    pub fn register_unconditional_bar_sink(&self, sink: Arc<dyn BarSink>) {
+        self.hub.register_unconditional_bar_sink(sink);
+    }
 }
 
 /// 与旧三家 worker 同构的「退避 → 单连接 → 断开退避」外层循环。
@@ -233,7 +240,7 @@ async fn run_forever<F: WsMarketFeed>(
         if let Some(wait) = backoff.next_wait() {
             tokio::time::sleep(wait).await;
         }
-        match run_connection(feed.as_ref(), &hub, &quotes, observer.as_deref()).await {
+        match run_connection(label, feed.as_ref(), &hub, &quotes, observer.as_deref()).await {
             Ok(()) => {
                 // run_connection 仅在对端正常关闭时返回 Ok；仍退避重连保活。
                 tracing::warn!(stream = label, "market ws closed, reconnecting");
@@ -248,6 +255,7 @@ async fn run_forever<F: WsMarketFeed>(
 
 /// 单次连接：握手 → on_connect → 周期对账 / Ping / 看门狗 / 读帧，直到关闭或错误。
 async fn run_connection<F: WsMarketFeed>(
+    label: &'static str,
     feed: &F,
     hub: &HubRegistry,
     quotes: &QuoteTable,
@@ -271,6 +279,22 @@ async fn run_connection<F: WsMarketFeed>(
                 let bar_syms = hub.desired_bar_symbols();
                 feed.on_desired_async(&price_syms, &bar_syms).await;
                 let plan = feed.reconcile(&price_syms, &bar_syms, &subscribed);
+                if !plan.subscribe.is_empty() {
+                    tracing::debug!(
+                        stream = label,
+                        price_symbols = price_syms.len(),
+                        bar_symbols = bar_syms.len(),
+                        channels = ?plan.subscribe,
+                        "行情对账：增订频道"
+                    );
+                }
+                if !plan.unsubscribe.is_empty() {
+                    tracing::debug!(
+                        stream = label,
+                        channels = ?plan.unsubscribe,
+                        "行情对账：退订频道"
+                    );
+                }
                 if !plan.subscribe.is_empty()
                     && feed.send_subscribe(&mut ws, &plan.subscribe).await.is_ok()
                 {
@@ -348,5 +372,59 @@ mod tests {
     #[test]
     fn feed_message_default_is_empty() {
         assert!(FeedMessage::default().is_empty());
+    }
+
+    /// 引擎注册的无条件 sink：driverless 引擎直接派发定稿 bar 即可收到（无任何消费者）。
+    #[test]
+    fn engine_unconditional_sink_receives_dispatched_bar() {
+        use crate::market::{FixedSymbols, KlineInterval};
+        use rust_decimal::Decimal;
+        use std::sync::Mutex;
+
+        struct RecSink {
+            seen: Mutex<Vec<String>>,
+        }
+        impl BarSink for RecSink {
+            fn on_bar(&self, bar: &Kline) {
+                self.seen.lock().unwrap().push(bar.symbol.clone());
+            }
+        }
+
+        let engine = WsHubEngine::spawn_driverless();
+        let sink = Arc::new(RecSink {
+            seen: Mutex::new(Vec::new()),
+        });
+        engine.register_unconditional_bar_sink(sink.clone());
+
+        let bar = Kline {
+            venue: "binance".into(),
+            symbol: "BTCUSDT".into(),
+            interval: KlineInterval::M1,
+            trading_day: 20261027,
+            start_ms: 0,
+            end_ms: 60_000,
+            open: Decimal::ONE,
+            high: Decimal::ONE,
+            low: Decimal::ONE,
+            close: Decimal::ONE,
+            volume: 1,
+            turnover: Decimal::ONE,
+            open_interest: Decimal::ZERO,
+        };
+        // 没有任何 register_klines 消费者：无条件 sink 仍收到，且无摘除。
+        assert_eq!(
+            engine
+                .registry_for_test()
+                .dispatch_bar(&bar, Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(*sink.seen.lock().unwrap(), vec!["BTCUSDT".to_string()]);
+        // 引擎仍接受正常消费者注册（无条件注册不影响既有路径）。
+        let _g = engine.subscribe_klines(
+            Arc::new(FixedSymbols::new(vec!["ETHUSDT".into()])),
+            Arc::new(RecSink {
+                seen: Mutex::new(Vec::new()),
+            }),
+        );
     }
 }

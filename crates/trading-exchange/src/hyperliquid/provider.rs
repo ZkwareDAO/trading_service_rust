@@ -64,7 +64,12 @@ impl HyperliquidProvider {
                 Arc::clone(&self.deps.quotes),
                 self.deps.quote_observer.clone(),
             );
-            Arc::new(HlMarketStream::from_engine(engine))
+            let stream = HlMarketStream::from_engine(engine);
+            // 无条件全量落盘 sink：单例闭包内只注册一次（行为同 binance/deribit/CTP）。
+            if let Some(persist) = &self.deps.persist_bar_sink {
+                stream.register_unconditional_bar_sink(Arc::clone(persist));
+            }
+            Arc::new(stream)
         });
         Ok(Arc::clone(stream))
     }

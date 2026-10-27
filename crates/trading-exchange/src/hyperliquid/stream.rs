@@ -25,6 +25,11 @@ impl HlMarketStream {
     pub(crate) fn register_managed_prices(&self, src: Arc<dyn DesiredSource>) {
         self.engine.register_managed_prices(src);
     }
+
+    /// 注册无条件 bar 下游（全量持久化）：委托给引擎，装配期注册一次。
+    pub(crate) fn register_unconditional_bar_sink(&self, sink: Arc<dyn BarSink>) {
+        self.engine.register_unconditional_bar_sink(sink);
+    }
 }
 
 impl MarketDataStream for HlMarketStream {
@@ -84,6 +89,20 @@ mod tests {
             turnover: Decimal::ONE,
             open_interest: Decimal::ZERO,
         }
+    }
+
+    /// 无条件 sink 经具名流注册到引擎：零路由消费者时 driverless 派发也能收到。
+    #[test]
+    fn unconditional_sink_delegates_to_engine() {
+        let engine = WsHubEngine::spawn_driverless();
+        let reg = engine.registry_for_test();
+        let stream = HlMarketStream::from_engine(engine);
+
+        let persist = RecSink::new();
+        stream.register_unconditional_bar_sink(persist.clone() as Arc<dyn BarSink>);
+
+        assert_eq!(reg.dispatch_bar(&bar("BTC"), Duration::from_secs(1)), 0);
+        assert_eq!(persist.seen(), vec!["BTC".to_string()]);
     }
 
     #[test]

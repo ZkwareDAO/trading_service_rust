@@ -106,10 +106,20 @@ impl BinanceProvider {
     /// 懒构造并返回 (现货, 合约) 两条本所行情流单例。
     fn ensure_market_hubs(&self) -> &(Arc<BinanceMarketStream>, Arc<BinanceMarketStream>) {
         self.market_hubs.get_or_init(|| {
-            spawn_market_hubs(
+            let hubs = spawn_market_hubs(
                 Arc::clone(&self.deps.quotes),
                 self.deps.quote_observer.clone(),
-            )
+            );
+            // 无条件全量落盘 sink 在单例首次创建闭包内注册一次（闭包仅执行一次，
+            // 避免 ensure 多次调用重复挂同一 sink 导致 bar 重复 append）。
+            // 本期 K线只接通合约（KlineService 作用域仅 futures）：只注册到合约引擎，
+            // 现货引擎不订阅任何 kline 频道；且 Kline/CSV 路径无 instrument_type
+            // 维度（venue="binance" 唯一），同时挂现货会让将来的现货/合约同名标的
+            // 静默写进同一 CSV，故刻意不注册现货。
+            if let Some(persist) = &self.deps.persist_bar_sink {
+                hubs.1.register_unconditional_bar_sink(Arc::clone(persist));
+            }
+            hubs
         })
     }
 }

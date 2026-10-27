@@ -19,6 +19,14 @@ open_drift_ticks = 5
 # 市价单（IOC）相对中间价 mid 的滑点比率；0.05=5%。该段或字段缺失时缺省 0.05。
 slippage = "0.05"
 
+[binance]
+# 配置基线 1m K线标的：服务启动即向 U 本位永续行情流订阅这些合约，
+# 定稿 bar 无条件全量落盘 CSV（与是否有南向客户端在线无关）；
+# 客户端运行时订阅仍走 subscribe_kline 命令并额外获得南向推送。
+# 符号用币安原生大写交易对（小写会被自动归一为大写），缺省/空表＝不订阅。
+# kline_symbols = ["BTCUSDT", "ETHUSDT"]
+kline_symbols = []
+
 # ---- CTP 国内期货（feature="ctp" 编译时生效）----
 [ctp]
 # 柜台交易/行情 API 动态库路径；缺省用仓库内 vendored v6.7.13 linux64。

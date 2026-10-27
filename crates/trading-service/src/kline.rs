@@ -3,15 +3,20 @@
 //! 对四家交易所走完全一致的一条代码路径——本类型不聚合 tick、不认品种前缀、不选
 //! 主力（全部在 CTP 适配层内完成），只负责：
 //! 1. 启动时对每个活跃且支持行情流的 (venue, itype) 调一次
-//!    [`MarketDataStream::subscribe_klines`]：来源＝客户端订阅登记表的作用域快照，
-//!    sink＝把定稿 bar 写入 [`BarTable`]；订阅凭证由本类型持有，与进程同寿。
-//! 2. 起独立线程按固定间隔把 [`BarTable`]/CTP [`TickTable`] 经 [`KlineRepo`]
+//!    [`MarketDataStream::subscribe_klines`]：来源＝配置基线 ∪ 客户端订阅登记表的
+//!    作用域快照，sink＝**仅南向 fan-out** 的 [`FanoutBarSink`]；订阅凭证由本类型
+//!    持有，与进程同寿。
+//! 2. 落盘与推送是两个交易所无关的通用 sink：落盘 sink（[`Self::persistence_sink`]）
+//!    由装配层无条件注册进各交易所行情引擎（零订阅标的也落 CSV），推送 sink 经
+//!    subscribe_klines 按订阅路由，二者正交、互不重复 append。
+//! 3. 起独立线程按固定间隔把 [`BarTable`]/CTP [`TickTable`] 经 [`KlineRepo`]
 //!    批量 append 到 CSV（行情线程绝不碰文件），停机再刷一次兜底。
 //!
 //! 客户端运行时订阅（K2）只改 [`KlineRegistry`]，交易所侧下轮 500ms 对账自动
-//! 增订/退订，本类型不重复调用 subscribe。
+//! 增订/退订，本类型不重复调用 subscribe。配置基线（[`BaselineKlines`]）只贡献线
+//! 订阅并集，**不进登记表**，故不产生任何南向推送。
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -28,9 +33,6 @@ use trading_store::{KlineFlushReport, KlineRepo, TradingStore};
 
 /// 本期唯一 K线周期标识（南向协议 / 登记表 / CSV 目录同口径）。
 pub const KLINE_INTERVAL: &str = "1m";
-
-/// CTP 的 venue 精确名（其落盘走无条件全量持久化 sink，订阅回调仅推送）。
-const CTP_VENUE: &str = "ctp";
 
 /// 一个 K线订阅作用域：交易所 × 标的类别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +75,39 @@ pub fn kline_scopes(active: &[String]) -> Vec<KlineScope> {
         .copied()
         .filter(|s| active_set.contains(s.venue))
         .collect()
+}
+
+/// 一路配置基线 K线订阅：交易所 × 标的类别 × 启动即订阅的具体合约。
+///
+/// 来源于 venue.toml（如 `[binance].kline_symbols`）：服务启动即向交易所订阅这些
+/// 合约并随定稿全量落盘，**不依赖任何南向客户端在线**；它不写入 [`KlineRegistry`]，
+/// 故不产生南向 fan-out（客户端要收 bar 仍需自行 subscribe_kline）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineKlines {
+    /// 交易所精确名。
+    pub venue: String,
+    /// 标的类别（与登记表 key 同口径）。
+    pub itype: InstrumentType,
+    /// 基线合约（构造时 trim/去空/去重；保持原大小写，频道映射各自小写化）。
+    pub symbols: Vec<String>,
+}
+
+impl BaselineKlines {
+    /// 构造基线：trim 去空白项后去重、字典序（保持原大小写）。
+    pub fn new(venue: impl Into<String>, itype: InstrumentType, symbols: Vec<String>) -> Self {
+        let mut seen = BTreeSet::new();
+        for raw in symbols {
+            let s = raw.trim();
+            if !s.is_empty() {
+                seen.insert(s.to_string());
+            }
+        }
+        Self {
+            venue: venue.into(),
+            itype,
+            symbols: seen.into_iter().collect(),
+        }
+    }
 }
 
 /// 一次 flush 的两类落盘计数。
@@ -221,6 +256,15 @@ struct PersistenceBarSink {
 
 impl BarSink for PersistenceBarSink {
     fn on_bar(&self, bar: &StreamKline) {
+        tracing::debug!(
+            venue = %bar.venue,
+            symbol = %bar.symbol,
+            trading_day = bar.trading_day,
+            start_ms = bar.start_ms,
+            close = %bar.close,
+            volume = bar.volume,
+            "定稿 bar 入待刷盘窗口（无条件全量落盘）"
+        );
         self.bars.push(bar_from_kline(bar));
     }
 }
@@ -266,27 +310,24 @@ impl BarSink for FanoutBarSink {
     }
 }
 
-/// WS 路径组合 sink：先落表再 fan-out（行为等价原 TableBarSink，单一 on_bar 顺序不变）。
-struct PersistAndFanoutSink {
-    persistence: PersistenceBarSink,
-    fanout: FanoutBarSink,
-}
-
-impl BarSink for PersistAndFanoutSink {
-    fn on_bar(&self, bar: &StreamKline) {
-        self.persistence.on_bar(bar);
-        self.fanout.fan_out(bar);
-    }
-}
-
-/// 把 core [`RegistrySource`] 薄适配为交易所层 [`DesiredSource`]（避免 core 依赖 exchange）。
-struct RegistryDesired {
+/// 把 core [`RegistrySource`] 薄适配为交易所层 [`DesiredSource`]（避免 core 依赖 exchange），
+/// 并并入该作用域的配置基线符号（登记表 ∪ 基线，去重字典序）。
+///
+/// `pub(crate)`：服务内测试需经 [`DesiredSource`] 读其快照；字段保持私有。
+pub(crate) struct BaselineDesired {
     source: RegistrySource,
+    /// 本作用域配置基线（无基线则为空 Vec）。
+    baseline: Arc<Vec<String>>,
 }
 
-impl DesiredSource for RegistryDesired {
+impl DesiredSource for BaselineDesired {
     fn symbols(&self) -> Vec<String> {
-        self.source.symbols()
+        if self.baseline.is_empty() {
+            return self.source.symbols();
+        }
+        let mut all: BTreeSet<String> = self.source.symbols().into_iter().collect();
+        all.extend(self.baseline.iter().cloned());
+        all.into_iter().collect()
     }
 }
 
@@ -302,6 +343,8 @@ pub struct KlineService {
     repo: KlineRepo,
     /// 南向推送端口（生产＝spawn 到 hub；测试可注入假实现）。
     pusher: Arc<dyn KlinePusher>,
+    /// 配置基线订阅（venue+itype → 基线合约；只贡献线订阅并集，不做南向推送）。
+    baselines: Arc<Vec<BaselineKlines>>,
     /// 慢/不可达连接丢弃的 bar 帧总数（观测）。
     dropped: Arc<AtomicU64>,
     /// 每个作用域一个 subscribe_klines 凭证（与进程同寿；drop 即整体退订）。
@@ -311,14 +354,20 @@ pub struct KlineService {
 }
 
 impl KlineService {
-    /// 从 TradingStore 取齐五表/repo 句柄构造，注入南向推送端口（内部全是进程单例）。
-    pub fn new(store: Arc<TradingStore>, pusher: Arc<dyn KlinePusher>) -> Self {
+    /// 从 TradingStore 取齐五表/repo 句柄构造，注入南向推送端口与配置基线
+    /// （内部全是进程单例）。基线只驱动线订阅/落盘，不写入客户端订阅登记表。
+    pub fn new(
+        store: Arc<TradingStore>,
+        pusher: Arc<dyn KlinePusher>,
+        baselines: Vec<BaselineKlines>,
+    ) -> Self {
         Self {
             registry: store.kline_registry(),
             bars: store.bar_table(),
             ticks: store.ctp_ticks(),
             repo: store.kline_repo(),
             pusher,
+            baselines: Arc::new(baselines),
             dropped: Arc::new(AtomicU64::new(0)),
             guards: Mutex::new(Vec::new()),
             flush_task: Mutex::new(None),
@@ -344,35 +393,37 @@ impl KlineService {
         venue_itype(venue)
     }
 
-    /// 某作用域的期望来源视图（登记表驱动；attach 与测试共用）。
-    pub fn source_for(&self, venue: &str, itype: InstrumentType) -> RegistrySource {
-        RegistrySource::new(
-            Arc::clone(&self.registry),
-            venue.to_string(),
-            itype,
-            KLINE_INTERVAL.to_string(),
-        )
+    /// 某作用域的期望来源视图（配置基线 ∪ 登记表快照；attach 与测试共用）。
+    pub fn source_for(&self, venue: &str, itype: InstrumentType) -> BaselineDesired {
+        BaselineDesired {
+            source: RegistrySource::new(
+                Arc::clone(&self.registry),
+                venue.to_string(),
+                itype,
+                KLINE_INTERVAL.to_string(),
+            ),
+            baseline: Arc::new(self.baseline_symbols(venue, itype)),
+        }
     }
 
-    /// 落盘 + fan-out 组合 sink（WS 三家：定稿即写 BarTable 并按订阅推送；行为同旧实现）。
-    pub fn bar_sink(&self) -> Arc<dyn BarSink> {
-        Arc::new(PersistAndFanoutSink {
-            persistence: self.persistence_sink_inner(),
-            fanout: self.fanout_sink_inner(),
-        })
+    /// 取某作用域的配置基线合约克隆（无基线为空 Vec）。
+    fn baseline_symbols(&self, venue: &str, itype: InstrumentType) -> Vec<String> {
+        self.baselines
+            .iter()
+            .find(|b| b.venue == venue && b.itype == itype)
+            .map(|b| b.symbols.clone())
+            .unwrap_or_default()
     }
 
-    /// **仅推送** sink（CTP 用）：按订阅 fan-out，不写 BarTable。
-    /// CTP 的全量落盘由 [`Self::persistence_sink`] 作为无条件 sink 单独负责，
-    /// 避免同一根 bar 既被无条件 sink 落盘、又在这里重复 append。
+    /// **仅推送** sink（四家统一）：按订阅 fan-out，绝不写 BarTable。
+    /// 全量落盘由 [`Self::persistence_sink`] 作为无条件 sink 单独负责，
+    /// 两个 sink 正交，同一根 bar 不会重复 append。
     pub fn push_sink(&self) -> Arc<dyn BarSink> {
         Arc::new(self.fanout_sink_inner())
     }
 
     /// **仅落盘** sink：每根定稿 bar append 进 BarTable 一次，不做南向推送。
-    /// CTP 作为「绕过订阅/主力的无条件全量持久化」注入交易所适配层。
-    /// 非 ctp 构建无消费方（state.rs 的注入在 cfg(ctp) 内），允许死代码。
-    #[cfg_attr(not(feature = "ctp"), allow(dead_code))]
+    /// 由装配层作为「绕过订阅/主力的无条件全量持久化」注入各交易所适配层。
     pub fn persistence_sink(&self) -> Arc<dyn BarSink> {
         Arc::new(self.persistence_sink_inner())
     }
@@ -404,16 +455,17 @@ impl KlineService {
         scope: &KlineScope,
         stream: Arc<dyn MarketDataStream>,
     ) -> anyhow::Result<()> {
-        let desired = Arc::new(RegistryDesired {
-            source: self.source_for(scope.venue, scope.itype),
-        }) as Arc<dyn DesiredSource>;
-        // CTP 的落盘走「无条件全量持久化 sink」（非主力/零订阅也落），故订阅回调只推送；
-        // WS 三家没有无条件 sink，定稿回调仍需既落盘又推送。
-        let sink = if scope.venue == CTP_VENUE {
-            self.push_sink()
-        } else {
-            self.bar_sink()
-        };
+        // 期望来源＝配置基线 ∪ 登记表快照（随 500ms 对账动态增退订）。
+        let desired = Arc::new(self.source_for(scope.venue, scope.itype)) as Arc<dyn DesiredSource>;
+        // 四家统一：订阅回调只做南向 fan-out；全量落盘是另一个由装配层无条件注册的
+        // sink（引擎/聚合器对每根定稿 bar 都调用，零订阅也落），二者不重复 append。
+        tracing::debug!(
+            venue = scope.venue,
+            itype = scope.wire(),
+            symbols = ?desired.symbols(),
+            "K线作用域 attach（期望集＝配置基线 ∪ 客户端登记表）"
+        );
+        let sink = self.push_sink();
         let guard = stream.subscribe_klines(desired, sink)?;
         self.guards.lock().unwrap().push(guard);
         Ok(())
@@ -686,6 +738,21 @@ mod tests {
         let s = Arc::new(KlineService::new(
             store,
             Arc::clone(&pusher) as Arc<dyn KlinePusher>,
+            Vec::new(),
+        ));
+        (s, pusher)
+    }
+
+    /// 带配置基线的服务（基线符号在构造时 trim/去空/去重，保持原大小写）。
+    fn svc_baselines(
+        store: Arc<TradingStore>,
+        baselines: Vec<BaselineKlines>,
+    ) -> (Arc<KlineService>, Arc<RecPusher>) {
+        let pusher = Arc::new(RecPusher::default());
+        let s = Arc::new(KlineService::new(
+            store,
+            Arc::clone(&pusher) as Arc<dyn KlinePusher>,
+            baselines,
         ));
         (s, pusher)
     }
@@ -721,7 +788,7 @@ mod tests {
         let (service, _pusher) = svc(store.clone());
 
         service
-            .bar_sink()
+            .persistence_sink()
             .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
 
         let pending = store.bar_table().snapshot();
@@ -750,6 +817,15 @@ mod tests {
         }
         fn call_count(&self) -> usize {
             self.calls.lock().unwrap().len()
+        }
+        /// 最后一次 subscribe_klines 看到的期望符号快照。
+        fn last_symbols(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default()
         }
     }
     impl MarketDataStream for FakeStream {
@@ -813,6 +889,89 @@ mod tests {
     }
 
     #[test]
+    fn attach_source_contains_baseline_symbols_without_any_registry_client() {
+        // 配置基线：零南向订阅时 attach 的期望来源也含基线合约（线订阅即建立）。
+        let store = test_store();
+        let (service, _pusher) = svc_baselines(
+            store.clone(),
+            vec![BaselineKlines::new(
+                "binance",
+                InstrumentType::Futures,
+                vec!["ETHUSDT".into(), "BTCUSDT".into()],
+            )],
+        );
+        let scope = KlineScope::new("binance", InstrumentType::Futures);
+        let stream = std::sync::Arc::new(FakeStream::new(false));
+
+        service
+            .attach(
+                &scope,
+                stream.clone() as std::sync::Arc<dyn MarketDataStream>,
+            )
+            .unwrap();
+
+        let captured = stream.last_symbols();
+        // 去重、字典序，与登记表快照口径一致。
+        assert_eq!(captured, vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()]);
+    }
+
+    #[test]
+    fn baseline_unions_with_registry_and_dedups_sorted() {
+        let store = test_store();
+        let (service, _pusher) = svc_baselines(
+            store.clone(),
+            vec![BaselineKlines::new(
+                "binance",
+                InstrumentType::Futures,
+                vec!["BTCUSDT".into(), " btcusdt ".into(), "".into(), "  ".into()],
+            )],
+        );
+        // 客户端运行时订阅与基线交叠（BTCUSDT）并新增 ETHUSDT。
+        service.subscribe("alpha", "binance", &["BTCUSDT".into(), "ETHUSDT".into()]);
+
+        // trim/去空/去重后基线只剩 BTCUSDT 与 btcusdt 两个原值（保持原大小写）；
+        // 与登记表取并集后去重排序，大小写不同的符号视为不同频道。
+        let got = service
+            .source_for("binance", InstrumentType::Futures)
+            .symbols();
+        assert_eq!(
+            got,
+            vec![
+                "BTCUSDT".to_string(),
+                "ETHUSDT".to_string(),
+                "btcusdt".to_string()
+            ]
+        );
+        // 别的作用域不受该基线影响。
+        assert!(service
+            .source_for("ctp", InstrumentType::Futures)
+            .symbols()
+            .is_empty());
+    }
+
+    #[test]
+    fn baseline_symbols_never_trigger_south_push_without_subscriber() {
+        // 基线只驱动线订阅与落盘，不进 KlineRegistry：基线合约定稿 bar 经推送 sink
+        // 时没有任何南向接收方（落盘由独立无条件 sink 负责，不经此路径）。
+        let store = test_store();
+        let (service, pusher) = svc_baselines(
+            store.clone(),
+            vec![BaselineKlines::new(
+                "binance",
+                InstrumentType::Futures,
+                vec!["BTCUSDT".into()],
+            )],
+        );
+
+        service
+            .push_sink()
+            .on_bar(&kline("binance", "BTCUSDT", 20261027, 60_000));
+
+        assert_eq!(pusher.total(), 0);
+        assert_eq!(service.dropped_count(), 0);
+    }
+
+    #[test]
     fn flush_once_drains_bar_and_tick_tables_to_csv() {
         let dir = tempfile::tempdir().unwrap();
         let (store, _persist) = TradingStore::open(
@@ -824,7 +983,7 @@ mod tests {
         let store = Arc::new(store);
         let (service, _pusher) = svc(store.clone());
         service
-            .bar_sink()
+            .persistence_sink()
             .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
         store.ctp_ticks().append(trading_models::RawTick {
             exchange: "ctp".into(),
@@ -903,8 +1062,9 @@ mod tests {
         service.subscribe("product", "ctp", &["cu".to_string()]);
         service.subscribe("other", "ctp", &["rb2611".to_string()]);
 
+        // 推送 sink 只 fan-out，绝不写 BarTable（落盘是另一个无条件 sink 的职责）。
         service
-            .bar_sink()
+            .push_sink()
             .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
 
         // 两个命中者各收到一帧 kline_1m；无关品种不收。
@@ -917,8 +1077,8 @@ mod tests {
             vec![("kline_1m".to_string(), "cu2512".to_string())]
         );
         assert!(pusher.events("other").is_empty());
-        // bar 仍照常落待刷盘窗口（一条）。
-        assert_eq!(store.bar_table().len(), 1);
+        // 推送 sink 不碰待刷盘窗口。
+        assert_eq!(store.bar_table().len(), 0);
         assert_eq!(service.dropped_count(), 0);
     }
 
@@ -931,13 +1091,13 @@ mod tests {
         pusher.fail_for("dead");
 
         service
-            .bar_sink()
+            .push_sink()
             .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
 
-        // 死连接丢一帧计数 1，但不影响活连接与落盘。
+        // 死连接丢一帧计数 1，但不影响活连接；推送 sink 不落盘。
         assert_eq!(service.dropped_count(), 1);
         assert_eq!(pusher.total(), 1);
-        assert_eq!(store.bar_table().len(), 1);
+        assert_eq!(store.bar_table().len(), 0);
     }
 
     #[test]
@@ -1049,7 +1209,7 @@ mod tests {
         let mut bar = kline("deribit", "ETH-18SEP26-2550-P", 20260918, 60_000);
         // deribit 走期权类别；构造 helper 默认即可，venue/symbol 已对。
         bar.interval = KlineInterval::M1;
-        service.bar_sink().on_bar(&bar);
+        service.push_sink().on_bar(&bar);
 
         assert_eq!(
             pusher.events("opt"),

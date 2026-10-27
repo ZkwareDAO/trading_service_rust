@@ -51,6 +51,9 @@ pub struct HubCore {
     price_sources: HashMap<u64, Arc<dyn DesiredSource>>,
     /// K线消费者（贡献并集，定稿 bar 按 symbol 路由回调）。
     bar_clients: HashMap<u64, BarClient>,
+    /// 无条件 bar 下游（全量持久化）：**绕过 symbol 路由**，每根定稿 bar
+    /// （含零订阅标的）都通知；不贡献订阅并集，无注销凭证（进程寿命）。
+    unconditional: Vec<Arc<dyn BarSink>>,
 }
 
 impl HubCore {
@@ -59,6 +62,7 @@ impl HubCore {
             next_id: 0,
             price_sources: HashMap::new(),
             bar_clients: HashMap::new(),
+            unconditional: Vec::new(),
         }
     }
 
@@ -205,6 +209,18 @@ impl HubRegistry {
         self.removal_guard(id)
     }
 
+    /// 注册无条件 bar 下游（全量持久化）：此后每根定稿 bar（含零订阅标的）都不经
+    /// symbol 路由地通知它；不贡献订阅并集、无注销凭证（进程寿命，装配期注册一次）。
+    /// panic/超 budget 的 sink 在 [`Self::dispatch_bar`] 内被隔离摘除，不牵连路由
+    /// 消费者与其它无条件 sink。
+    pub fn register_unconditional_bar_sink(&self, sink: Arc<dyn BarSink>) {
+        self.core
+            .lock()
+            .expect("hub core lock")
+            .unconditional
+            .push(sink);
+    }
+
     /// 当前全局期望并集（价格 ∪ K线；CTP 单连接等「频道即合约」场景用）。
     pub fn desired_symbols(&self) -> BTreeSet<String> {
         self.core.lock().expect("hub core lock").desired_union()
@@ -231,29 +247,65 @@ impl HubRegistry {
     ///
     /// 全程「锁内只取 Arc 列表、释锁后回调、再上锁摘除」，绝不在持锁时调用外部 sink。
     pub fn dispatch_bar(&self, bar: &Kline, budget: Duration) -> usize {
-        // 短临界区：克隆本轮命中的 sink 句柄。
-        let targets = self
-            .core
-            .lock()
-            .expect("hub core lock")
-            .bar_sinks_for(&bar.symbol);
-        // 释锁回调：隔离每个 sink，记录坏/慢者。
-        let mut evicted = Vec::new();
+        // 短临界区：只克隆无条件 sink 列表与本轮命中的路由 sink 句柄（连同计数），
+        // 日志移到锁外，与本模块「锁内不做外部动作」的纪律一致。
+        let (unconditional, targets, routed_n, persist_n) = {
+            let core = self.core.lock().expect("hub core lock");
+            let targets = core.bar_sinks_for(&bar.symbol);
+            let persist_n = core.unconditional.len();
+            let routed_n = targets.len();
+            (core.unconditional.clone(), targets, routed_n, persist_n)
+        };
+        tracing::debug!(
+            venue = %bar.venue,
+            symbol = %bar.symbol,
+            trading_day = bar.trading_day,
+            start_ms = bar.start_ms,
+            close = %bar.close,
+            volume = bar.volume,
+            routed = routed_n,
+            unconditional = persist_n,
+            "定稿 bar 派发（落盘无条件 + 按订阅路由推送）"
+        );
+        // 释锁回调。先无条件下游（全量落盘），再路由消费者（南向 fan-out），
+        // 顺序与 CTP BarAggSink「先持久化、后路由」一致。
+        // 无条件 sink 逐个隔离：坏/慢者不进 survivors（摘除），其余留下轮再用。
+        let mut survivors: Vec<Arc<dyn BarSink>> = Vec::with_capacity(unconditional.len());
+        let mut evicted = 0usize;
+        for sink in unconditional {
+            match safe_notify(sink.as_ref(), bar, budget) {
+                NotifyOutcome::Ok => survivors.push(sink),
+                outcome => {
+                    evicted += 1;
+                    tracing::warn!(
+                        ?outcome,
+                        "无条件 bar sink 异常，已摘除（不影响路由与其余 sink）"
+                    );
+                }
+            }
+        }
+        // 路由 sink 逐个隔离，记录坏/慢消费者 id。
+        let mut evicted_ids = Vec::new();
         for (id, sink) in targets {
             match safe_notify(sink.as_ref(), bar, budget) {
                 NotifyOutcome::Ok => {}
-                NotifyOutcome::Panicked | NotifyOutcome::Slow => evicted.push(id),
+                NotifyOutcome::Panicked | NotifyOutcome::Slow => {
+                    evicted += 1;
+                    evicted_ids.push(id);
+                }
             }
         }
-        // 再上锁摘除坏/慢消费者（其独占符号在下轮对账自然退订）。
-        if !evicted.is_empty() {
+        // 再上锁：用 survivors 覆盖无条件列表、摘除坏/慢路由消费者
+        // （被摘消费者独占的符号在下轮对账自然退订）。
+        if evicted > 0 {
             if let Ok(mut core) = self.core.lock() {
-                for id in &evicted {
+                core.unconditional = survivors;
+                for id in &evicted_ids {
                     core.remove(*id);
                 }
             }
         }
-        evicted.len()
+        evicted
     }
 }
 
@@ -464,6 +516,71 @@ mod tests {
         reg.dispatch_bar(&bar("x"), Duration::from_secs(1));
         assert_eq!(s1.seen(), vec!["x".to_string()]);
         assert_eq!(s2.seen(), vec!["y".to_string(), "x".to_string()]);
+    }
+
+    // ---- 无条件 sink（全量持久化） ----
+
+    #[test]
+    fn unconditional_sink_receives_every_bar_without_any_bar_client() {
+        // 没有任何按 symbol 注册的 K线消费者：无条件 sink 仍收到每根定稿 bar
+        // （「凡线订阅标的一律全量落盘」零客户端也成立）。
+        let reg = HubRegistry::new();
+        let persist = RecSink::new();
+        reg.register_unconditional_bar_sink(persist.clone() as Arc<dyn BarSink>);
+
+        assert_eq!(reg.desired_bar_symbols().len(), 0);
+        assert_eq!(reg.dispatch_bar(&bar("btcusdt"), Duration::from_secs(1)), 0);
+        assert_eq!(persist.seen(), vec!["btcusdt".to_string()]);
+
+        // 再来一根不同符号的 bar，无条件 sink 照样收到。
+        reg.dispatch_bar(&bar("ethusdt"), Duration::from_secs(1));
+        assert_eq!(persist.seen(), vec!["btcusdt", "ethusdt"]);
+    }
+
+    #[test]
+    fn bar_delivered_to_both_routed_clients_and_unconditional_sink() {
+        // 同一路由：按 symbol 命中的消费者与无条件 sink 各收一份（落盘/推送正交）。
+        let reg = HubRegistry::new();
+        let routed = RecSink::new();
+        let persist = RecSink::new();
+        let _g = reg.register_klines(
+            Arc::new(FixedSymbols::new(vec!["x".into()])),
+            routed.clone(),
+        );
+        reg.register_unconditional_bar_sink(persist.clone() as Arc<dyn BarSink>);
+
+        reg.dispatch_bar(&bar("x"), Duration::from_secs(1));
+        assert_eq!(routed.seen(), vec!["x".to_string()]);
+        assert_eq!(persist.seen(), vec!["x".to_string()]);
+
+        // 无人按 symbol 订阅的 bar：路由客户不收，无条件 sink 仍收。
+        reg.dispatch_bar(&bar("y"), Duration::from_secs(1));
+        assert_eq!(routed.seen(), vec!["x".to_string()]);
+        assert_eq!(persist.seen(), vec!["x", "y"]);
+    }
+
+    #[test]
+    fn panicky_unconditional_sink_is_evicted_without_blocking_others() {
+        // 无条件 sink panic：被 catch_unwind 吞住并摘除（摘除计数 1）；
+        // 另一正常无条件 sink 与按 symbol 路由的消费者全程不受影响。
+        let reg = HubRegistry::new();
+        let routed = RecSink::new();
+        let good = RecSink::new();
+        let _g = reg.register_klines(
+            Arc::new(FixedSymbols::new(vec!["x".into()])),
+            routed.clone(),
+        );
+        reg.register_unconditional_bar_sink(Arc::new(PanicSink));
+        reg.register_unconditional_bar_sink(good.clone() as Arc<dyn BarSink>);
+
+        assert_eq!(reg.dispatch_bar(&bar("x"), Duration::from_secs(1)), 1);
+        assert_eq!(routed.seen(), vec!["x".to_string()]);
+        assert_eq!(good.seen(), vec!["x".to_string()]);
+
+        // 第二轮：panic sink 已不在表中（摘除计数 0），其余两者继续收 bar。
+        assert_eq!(reg.dispatch_bar(&bar("x"), Duration::from_secs(1)), 0);
+        assert_eq!(routed.seen(), vec!["x", "x"]);
+        assert_eq!(good.seen(), vec!["x", "x"]);
     }
 
     // ---- 异常 sink 摘除 ----

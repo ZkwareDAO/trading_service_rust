@@ -120,7 +120,7 @@ impl CtpProvider {
             );
             // 无条件全量持久化 sink 只在单例首次创建时注册一次（闭包仅执行一次，
             // 避免 ensure 被多次调用时重复挂同一 sink 导致 bar 重复落盘）。
-            if let Some(persist) = &self.deps.ctp_persist_bar_sink {
+            if let Some(persist) = &self.deps.persist_bar_sink {
                 stream.register_persistent_bar_sink(Arc::clone(persist));
             }
             stream
@@ -449,7 +449,7 @@ mod tests {
             ctp_ticks: Arc::new(trading_core::kline::TickTable::new()),
             ctp_last_volumes: Arc::new(trading_core::kline::LastVolumeTable::new()),
             ctp_dominants: Arc::new(trading_core::kline::DominantTable::new()),
-            ctp_persist_bar_sink: None,
+            persist_bar_sink: None,
         }
     }
 

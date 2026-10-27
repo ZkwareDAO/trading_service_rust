@@ -1127,6 +1127,7 @@ mod tests {
     };
     use rust_decimal::Decimal;
     use std::str::FromStr;
+    use trading_exchange::market::DesiredSource;
     use trading_models::{InstrumentType, Order, OrderStatus, OrderType, Side, TimeInForce};
 
     #[test]

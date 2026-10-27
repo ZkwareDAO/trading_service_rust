@@ -207,7 +207,7 @@ fn parse_kline_frame(text: &str) -> Option<Kline> {
     // 成交量/额为字符串小数；Kline.volume 为 i64，截断取整（计划二可扩展为小数量）。
     use rust_decimal::prelude::ToPrimitive;
     let volume = dec("v").trunc().to_i64().unwrap_or(0);
-    Some(Kline {
+    let bar = Kline {
         venue: VENUE.to_string(),
         symbol,
         interval: KlineInterval::M1,
@@ -221,7 +221,22 @@ fn parse_kline_frame(text: &str) -> Option<Kline> {
         volume,
         turnover: dec("q"),
         open_interest: Decimal::ZERO,
-    })
+    };
+    // 仅收盘定稿帧打 debug（成形中帧已在上方 return，不产生噪音）；引用已构造的 bar，
+    // 不重复解析帧字段。
+    tracing::debug!(
+        symbol = %bar.symbol,
+        start_ms = bar.start_ms,
+        end_ms = bar.end_ms,
+        open = %bar.open,
+        high = %bar.high,
+        low = %bar.low,
+        close = %bar.close,
+        volume = bar.volume,
+        turnover = %bar.turnover,
+        "binance 1m K线定稿帧（k.x=true）"
+    );
+    Some(bar)
 }
 
 // =====================================================================

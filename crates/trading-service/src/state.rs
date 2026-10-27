@@ -136,6 +136,7 @@ impl AppState {
         let kline = Arc::new(crate::kline::KlineService::new(
             Arc::clone(&store),
             kline_pusher,
+            crate::venue_config::kline_baselines(&venue),
         ));
 
         let provider_deps = ProviderDeps {
@@ -166,9 +167,9 @@ impl AppState {
             ctp_last_volumes: store.ctp_last_volumes(),
             #[cfg(feature = "ctp")]
             ctp_dominants: store.ctp_dominants(),
-            // CTP K线：无条件全量持久化 sink（有 tick 定稿即落 CSV，绕过订阅/主力路由）。
-            #[cfg(feature = "ctp")]
-            ctp_persist_bar_sink: Some(kline.persistence_sink()),
+            // K线：无条件全量持久化 sink（定稿即落 CSV，绕过 symbol/主力路由）。
+            // 交易所无关：四家 provider 各自在行情流单例创建时注册到自己的引擎/聚合器。
+            persist_bar_sink: Some(kline.persistence_sink()),
         };
         let exchanges = Arc::new(ExchangeRegistry::builtin(provider_deps));
         // 启动自检（fail-fast）：汇总各 provider 自描述的仓位档案装入引擎并校验，

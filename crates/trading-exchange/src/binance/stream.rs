@@ -22,6 +22,11 @@ impl BinanceMarketStream {
     pub(crate) fn from_engine(engine: Arc<WsHubEngine>) -> Self {
         Self { engine }
     }
+
+    /// 注册无条件 bar 下游（全量持久化）：委托给引擎，装配期注册一次。
+    pub(crate) fn register_unconditional_bar_sink(&self, sink: Arc<dyn BarSink>) {
+        self.engine.register_unconditional_bar_sink(sink);
+    }
 }
 
 impl MarketDataStream for BinanceMarketStream {
@@ -130,6 +135,25 @@ mod tests {
         reg.dispatch_bar(&bar("ethusdt", 1), Duration::from_secs(1));
 
         assert_eq!(sink.seen(), vec!["ethusdt".to_string()]);
+    }
+
+    /// 无条件 sink 经具名流注册到引擎：零路由消费者时 driverless 派发也能收到。
+    #[test]
+    fn unconditional_sink_delegates_to_engine() {
+        let engine = WsHubEngine::spawn_driverless();
+        let reg = engine.registry_for_test();
+        let stream = BinanceMarketStream::from_engine(engine);
+
+        // 经具名流（而非直接摸引擎）注册全量落盘 sink。
+        let persist = RecSink::new();
+        stream.register_unconditional_bar_sink(persist.clone() as Arc<dyn BarSink>);
+
+        // 没有任何 register_klines 消费者：无条件 sink 仍收到，摘除计数 0。
+        assert_eq!(
+            reg.dispatch_bar(&bar("btcusdt", 1), Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(persist.seen(), vec!["btcusdt".to_string()]);
     }
 
     /// 扩展缝证明：交易所可在**自己的具名流**内包装/过滤 sink 增加额外处理，
