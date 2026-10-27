@@ -323,9 +323,13 @@ async fn main() -> anyhow::Result<()> {
         _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
     }
 
-    // 停止全部账户事件流长连接，再做最后落盘。
-    account_stop.store(true, Ordering::Relaxed);
+    // 停机顺序必须保证「市场侧收口 → K线最后一刷落盘 → store 落盘」：
+    // 1) 先停账户流并 join CTP 行情线程：其退出前 flush_all 把最后未闭 1m 桶推进内存；
+    // 2) 再置停机标志让 kline-flush 线程做最后一次 flush_once；
+    // 3) join 该线程，确认窗口内 bar/tick 已写入 CSV 后才继续 store 收尾。
     account_events.stop_all();
+    account_stop.store(true, Ordering::Relaxed);
+    let _ = state.kline.join_flush();
     if let Some(handle) = persist {
         handle.shutdown().await;
     } else {

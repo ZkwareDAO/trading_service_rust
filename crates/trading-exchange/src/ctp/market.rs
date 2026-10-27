@@ -37,10 +37,13 @@ fn instrument_key(symbol: &str) -> Instrument {
 /// TickSnapshot → QuoteUpdate（CTP 最新价即 last；盘口写入买一卖一；
 /// 柜台以 f64::MAX 表示无对手价，视为缺侧）。
 fn tick_to_update(t: &TickSnapshot, now_ms: i64) -> QuoteUpdate {
-    let book = if t.bid_price > 1e-9 && t.ask_price > 1e-9 && t.ask_price < f64::MAX {
+    // 业务 QuoteTable 路径本期仍只用 best1（五档全量仅落 RawTick）。
+    let bid = t.bids[0].price;
+    let ask = t.asks[0].price;
+    let book = if bid > 1e-9 && ask > 1e-9 && ask < f64::MAX {
         Some(TopOfBook::new(
-            Decimal::try_from(t.bid_price).ok(),
-            Decimal::try_from(t.ask_price).ok(),
+            Decimal::try_from(bid).ok(),
+            Decimal::try_from(ask).ok(),
         ))
     } else {
         None
@@ -85,17 +88,21 @@ pub fn spawn_market_worker(
     observer: Option<Arc<dyn QuoteObserver>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     kline: Option<MdKlineDeps>,
-) {
+) -> Option<std::thread::JoinHandle<()>> {
     // 防御性守卫：空行情前置不应到达 FFI 的 register_front。
     if params.config.md_front.trim().is_empty() {
         tracing::warn!("CTP 行情前置未配置，行情线程不启动");
-        return;
+        return None;
     }
     std::thread::Builder::new()
         .name("ctp-md".into())
         .spawn(move || run_md_loop(&params, interests, &quotes, observer, &stop, kline))
-        .map(|_| ())
-        .unwrap_or_else(|e| tracing::warn!(error = %e, "CTP 行情线程启动失败"));
+        // 返回句柄供优雅停机 join（保证 md 的 flush_all 先于 CSV 刷盘完成）。
+        .map(Some)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "CTP 行情线程启动失败");
+            None
+        })
 }
 
 /// 一次连接尝试的结果（驱动退避外循环的纯决策输入）。
@@ -308,6 +315,17 @@ fn run_md_loop(
             }
         }
     }
+    // 优雅停机收口：run_md_loop 仅在置位 stop 时退出（断线/失败仍在 loop 内重连，
+    // 不会走到这里），故在此定稿所有未闭 1m 桶恰好一次——经无条件持久化 sink 落盘、
+    // 并向南向做最后一推。重连不 flush，避免聚合器跨会话单例产生重复 bar。
+    if stop.load(Ordering::SeqCst) {
+        if let Some(k) = kline.as_ref() {
+            let n = k.stream.flush_all().len();
+            if n > 0 {
+                tracing::info!(bars = n, "CTP 停机收口：定稿未落盘的未闭 1m K线");
+            }
+        }
+    }
     tracing::info!("CTP 行情线程退出");
 }
 
@@ -396,8 +414,8 @@ fn run_md_session(
                 tracing::debug!(
                     instrument = %t.instrument,
                     last = t.last_price,
-                    bid = t.bid_price,
-                    ask = t.ask_price,
+                    bid = t.bids[0].price,
+                    ask = t.asks[0].price,
                     "CTP 行情 tick 到达"
                 );
                 // 作用域判定：业务兴趣集 / K线期望集（均会话开始预算，O(1) 查询）。
@@ -433,7 +451,10 @@ fn run_md_session(
                                     Decimal::try_from(t.turnover).unwrap_or(Decimal::ZERO),
                                     Decimal::try_from(t.open_interest).unwrap_or(Decimal::ZERO),
                                 );
-                                k.stream.on_kline_tick(&t.instrument, &candle);
+                                // 日 OHLC + 五档随同一快照落 RawTick（CandleTick 不扩字段）。
+                                let depth =
+                                    crate::ctp::market_stream::RawTickDepth::from(t.as_ref());
+                                k.stream.on_kline_tick(&t.instrument, &candle, &depth);
                             }
                         }
                     }
@@ -543,13 +564,18 @@ mod tests {
     use super::*;
 
     fn tick(bid: f64, ask: f64) -> TickSnapshot {
+        use crate::ctp::core::quote::QuoteLevel;
+        let lvl = |price: f64, vol: i32| QuoteLevel::new(price, vol);
+        let zero = || QuoteLevel::new(0.0, 0);
         TickSnapshot {
             instrument: "rb2510".into(),
             last_price: 3205.0,
-            bid_price: bid,
-            bid_volume: 10,
-            ask_price: ask,
-            ask_volume: 5,
+            bids: [lvl(bid, 10), zero(), zero(), zero(), zero()],
+            asks: [lvl(ask, 5), zero(), zero(), zero(), zero()],
+            day_open: 0.0,
+            day_high: 0.0,
+            day_low: 0.0,
+            day_close: 0.0,
             volume: 1000,
             update_time: "09:30:00".into(),
             update_millisec: 0,

@@ -45,6 +45,9 @@ pub struct CtpProvider {
     config: CtpConfig,
     /// 公共行情线程停机标志（行情是 std::thread，同样只能靠标志退出）。
     md_stop: Arc<std::sync::atomic::AtomicBool>,
+    /// 公共行情线程句柄（spawn_market_services 后才有）；优雅停机 join，
+    /// 保证 md 退出前的 flush_all（最后未闭桶进内存）先于 CSV 刷盘线程收尾。
+    md_task: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// 各账户会话注册表（停机/映射/信箱；**provider 级 + 每账户隔离**：
     /// 连接器逐次新建，这些状态必须跨热加载存活）。
     sessions: Arc<SessionRegistry>,
@@ -95,6 +98,7 @@ impl CtpProvider {
             deps,
             config,
             md_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            md_task: Mutex::new(None),
             sessions: Arc::new(SessionRegistry::default()),
             instrument_dir,
             spec_refreshing: Mutex::new(()),
@@ -107,13 +111,19 @@ impl CtpProvider {
         &self,
     ) -> anyhow::Result<Arc<crate::ctp::market_stream::CtpMarketStream>> {
         let stream = self.market_stream.get_or_init(|| {
-            crate::ctp::market_stream::CtpMarketStream::new(
+            let stream = crate::ctp::market_stream::CtpMarketStream::new(
                 Arc::clone(&self.deps.ctp_ticks),
                 Arc::clone(&self.deps.ctp_last_volumes),
                 Arc::clone(&self.deps.ctp_dominants),
                 Arc::clone(&self.instrument_dir),
                 self.config.kline_products.clone(),
-            )
+            );
+            // 无条件全量持久化 sink 只在单例首次创建时注册一次（闭包仅执行一次，
+            // 避免 ensure 被多次调用时重复挂同一 sink 导致 bar 重复落盘）。
+            if let Some(persist) = &self.deps.ctp_persist_bar_sink {
+                stream.register_persistent_bar_sink(Arc::clone(persist));
+            }
+            stream
         });
         Ok(Arc::clone(stream))
     }
@@ -121,14 +131,6 @@ impl CtpProvider {
     /// 账户当前会话的停机标志（接线测试/诊断用）。
     pub fn current_shutdown(&self, account: &str) -> Option<Arc<AtomicBool>> {
         self.sessions.current_shutdown(account)
-    }
-
-    /// 优雅停机：置位全部账户会话停机标志（`spawn_blocking` 线程无法
-    /// abort，停机标志是唯一的停机通道）。
-    pub fn stop_account_streams(&self) {
-        self.sessions.shutdown_all();
-        self.md_stop
-            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 解析 CTP 凭证并组装领域账户（非 CTP 形态凭证报错）。
@@ -234,6 +236,26 @@ impl CtpProvider {
 }
 
 impl VenueProvider for CtpProvider {
+    /// 优雅停机（覆盖 trait 默认空实现）：置位全部账户会话与公共行情线程的停机标志
+    /// （`spawn_blocking`/`std::thread` 无法 abort，标志是唯一停机通道），并 **join
+    /// 行情线程**，等它退出前的 `flush_all()` 完成（最后未闭 1m 桶已推进内存 BarTable），
+    /// 使后续 CSV 刷盘线程的最后一刷能落盘。线程曾 panic 仅记录、不阻断停机。
+    ///
+    /// 必须是 trait 覆盖而非固有方法：注册表持 `Arc<dyn VenueProvider>` 动态分发，
+    /// 固有方法不会被该路径调用（会静默落到 trait 默认空实现）。
+    fn stop_account_streams(&self) {
+        self.sessions.shutdown_all();
+        self.md_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // 先 take 出句柄使锁立即释放，再 join（绝不持锁等待线程，杜绝再入死锁）。
+        let task = self.md_task.lock().unwrap().take();
+        if let Some(handle) = task {
+            if let Err(e) = handle.join() {
+                tracing::error!(?e, "CTP 行情线程停机 join 异常");
+            }
+        }
+    }
+
     fn matches(&self, exchange: &str) -> bool {
         exchange.trim() == NAME
     }
@@ -320,7 +342,7 @@ impl VenueProvider for CtpProvider {
             stream.preset_dominants(&self.config.preset_dominants);
         }
         stream.spawn_election(Arc::clone(&self.md_stop));
-        crate::ctp::market::spawn_market_worker(
+        let handle = crate::ctp::market::spawn_market_worker(
             crate::ctp::market::MdParams {
                 // 行情前置需要合法账户结构（BrokerID/UserID 编码进登录请求），
                 // 无活动账户时上面已 return，这里取行情账户的领域凭证。
@@ -333,6 +355,8 @@ impl VenueProvider for CtpProvider {
             Arc::clone(&self.md_stop),
             Some(crate::ctp::market::MdKlineDeps { stream }),
         );
+        // 留存句柄供优雅停机 join（None=未配前置/起线程失败，停机无需等待）。
+        *self.md_task.lock().unwrap() = handle;
     }
 
     fn build_market_stream(
@@ -425,6 +449,7 @@ mod tests {
             ctp_ticks: Arc::new(trading_core::kline::TickTable::new()),
             ctp_last_volumes: Arc::new(trading_core::kline::LastVolumeTable::new()),
             ctp_dominants: Arc::new(trading_core::kline::DominantTable::new()),
+            ctp_persist_bar_sink: None,
         }
     }
 
@@ -455,6 +480,26 @@ mod tests {
 
     fn test_config() -> CtpConfig {
         CtpConfig::for_tests()
+    }
+
+    #[test]
+    fn dyn_trait_stop_sets_md_stop_flag() {
+        // 注册表持有 Arc<dyn VenueProvider>，停机走的是 trait 动态分发，
+        // 必须真的置位 md_stop（而不是落到 trait 默认空实现）。
+        let p = CtpProvider::new(
+            deps_with(Arc::new(StubResolver(Mutex::new(
+                std::collections::HashMap::new(),
+            )))),
+            test_config(),
+        );
+        use std::sync::atomic::Ordering;
+        assert!(!p.md_stop.load(Ordering::SeqCst));
+        let provider: &dyn VenueProvider = &p;
+        provider.stop_account_streams();
+        assert!(
+            p.md_stop.load(Ordering::SeqCst),
+            "dyn 分发停机必须置位 md_stop"
+        );
     }
 
     #[test]

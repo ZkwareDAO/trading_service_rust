@@ -94,6 +94,10 @@ pub struct ProviderDeps {
     /// CTP K线：品种 → 当前主力（收盘选举写入）。
     #[cfg(feature = "ctp")]
     pub ctp_dominants: Arc<trading_core::kline::DominantTable>,
+    /// CTP K线：无条件全量持久化 sink（进程一份）。注册后每根定稿 bar（含非主力、
+    /// 零南向订阅）都不经路由地 append 落盘；None=不做无条件持久化（默认/测试）。
+    #[cfg(feature = "ctp")]
+    pub ctp_persist_bar_sink: Option<Arc<dyn crate::market::BarSink>>,
     /// Hyperliquid 可调参数（市价滑点）。
     pub hyperliquid: HyperliquidConfig,
     /// 行情订阅兴趣供给（宿主读仓位∪规则）；None=不做动态订阅。

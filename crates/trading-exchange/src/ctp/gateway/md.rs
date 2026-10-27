@@ -9,8 +9,54 @@ use std::time::Duration;
 use crate::ctp::core::account::CtpAccount;
 use crate::ctp::core::encoding::decode_fixed;
 use crate::ctp::core::error::{CtpError, Result};
-use crate::ctp::core::quote::TickSnapshot;
-use ctp2rs::v1alpha1::{MdApi, MdSpi};
+use crate::ctp::core::quote::{QuoteLevel, TickSnapshot};
+use ctp2rs::v1alpha1::{CThostFtdcDepthMarketDataField as Depth, MdApi, MdSpi};
+
+/// 柜台用 `DBL_MAX` 哨兵表示「无此价」；转换时归一为 0.0，避免把 f64::MAX 带进内存/落盘。
+fn norm_price(p: f64) -> f64 {
+    if p.is_finite() && p < f64::MAX {
+        p
+    } else {
+        0.0
+    }
+}
+
+/// FFI 深度行情 → 安全快照（纯函数：日 OHLC + 五档 + K线聚合字段逐档拷贝）。
+///
+/// 文档铁律：`day_open/high/low/close` 是 CTP **当日累计**的日开高低收
+/// （盘中 close 常为 0），**不是** 1m bar 的 OHLC；1m OHLC 由 candle 聚合得到。
+fn depth_to_snapshot(d: &Depth) -> TickSnapshot {
+    let lvl = |price: f64, volume: i32| QuoteLevel::new(norm_price(price), volume);
+    TickSnapshot {
+        instrument: decode_fixed(&d.InstrumentID),
+        last_price: norm_price(d.LastPrice),
+        bids: [
+            lvl(d.BidPrice1, d.BidVolume1),
+            lvl(d.BidPrice2, d.BidVolume2),
+            lvl(d.BidPrice3, d.BidVolume3),
+            lvl(d.BidPrice4, d.BidVolume4),
+            lvl(d.BidPrice5, d.BidVolume5),
+        ],
+        asks: [
+            lvl(d.AskPrice1, d.AskVolume1),
+            lvl(d.AskPrice2, d.AskVolume2),
+            lvl(d.AskPrice3, d.AskVolume3),
+            lvl(d.AskPrice4, d.AskVolume4),
+            lvl(d.AskPrice5, d.AskVolume5),
+        ],
+        day_open: norm_price(d.OpenPrice),
+        day_high: norm_price(d.HighestPrice),
+        day_low: norm_price(d.LowestPrice),
+        day_close: norm_price(d.ClosePrice),
+        volume: d.Volume,
+        update_time: decode_fixed(&d.UpdateTime),
+        update_millisec: d.UpdateMillisec,
+        trading_day: decode_fixed(&d.TradingDay),
+        action_day: decode_fixed(&d.ActionDay),
+        turnover: d.Turnover,
+        open_interest: d.OpenInterest,
+    }
+}
 
 /// 行情侧事件。
 #[derive(Debug, Clone)]
@@ -27,8 +73,8 @@ pub enum MdEvent {
         code: i32,
         msg: String,
     },
-    /// 一笔行情 tick。
-    Tick(TickSnapshot),
+    /// 一笔行情 tick（Box：快照含五档+日OHLC，体积大，避免 enum 各变体尺寸悬殊）。
+    Tick(Box<TickSnapshot>),
     /// 错误。
     Error { code: i32, msg: String },
 }
@@ -103,21 +149,7 @@ impl MdSpi for EventMdSpi {
         data: Option<&ctp2rs::v1alpha1::CThostFtdcDepthMarketDataField>,
     ) {
         if let Some(d) = data {
-            self.emit(MdEvent::Tick(TickSnapshot {
-                instrument: decode_fixed(&d.InstrumentID),
-                last_price: d.LastPrice,
-                bid_price: d.BidPrice1,
-                bid_volume: d.BidVolume1,
-                ask_price: d.AskPrice1,
-                ask_volume: d.AskVolume1,
-                volume: d.Volume,
-                update_time: decode_fixed(&d.UpdateTime),
-                update_millisec: d.UpdateMillisec,
-                trading_day: decode_fixed(&d.TradingDay),
-                action_day: decode_fixed(&d.ActionDay),
-                turnover: d.Turnover,
-                open_interest: d.OpenInterest,
-            }));
+            self.emit(MdEvent::Tick(Box::new(depth_to_snapshot(d))));
         }
     }
 }
@@ -293,5 +325,100 @@ mod tests {
             code: 0,
             msg: String::new(),
         };
+    }
+
+    use ctp2rs::v1alpha1::CThostFtdcDepthMarketDataField as Depth;
+
+    fn encode(buf: &mut [i8], text: &str) {
+        crate::ctp::core::encoding::encode_fixed(buf, text);
+    }
+
+    #[test]
+    fn depth_to_snapshot_carries_daily_ohlc_and_five_levels() {
+        let mut d = Depth::default();
+        encode(&mut d.InstrumentID, "cu2512");
+        encode(&mut d.TradingDay, "20261027");
+        encode(&mut d.ActionDay, "20261027");
+        encode(&mut d.UpdateTime, "09:46:05");
+        d.UpdateMillisec = 123;
+        d.LastPrice = 74_500.0;
+        // 日 OHLC（当日累计，非 1m）。
+        d.OpenPrice = 74_100.0;
+        d.HighestPrice = 74_800.0;
+        d.LowestPrice = 74_000.0;
+        d.ClosePrice = 0.0; // 盘中 close 常为 0，如实保留
+        d.Volume = 1234;
+        d.Turnover = 9.0e8;
+        d.OpenInterest = 12_181.0;
+        // 五档：价/量逐档。
+        let bp = [74_490.0, 74_480.0, 74_470.0, 74_460.0, 74_450.0];
+        let bv = [11, 12, 13, 14, 15];
+        let ap = [74_510.0, 74_520.0, 74_530.0, 74_540.0, 74_550.0];
+        let av = [21, 22, 23, 24, 25];
+        d.BidPrice1 = bp[0];
+        d.BidPrice2 = bp[1];
+        d.BidPrice3 = bp[2];
+        d.BidPrice4 = bp[3];
+        d.BidPrice5 = bp[4];
+        d.BidVolume1 = bv[0];
+        d.BidVolume2 = bv[1];
+        d.BidVolume3 = bv[2];
+        d.BidVolume4 = bv[3];
+        d.BidVolume5 = bv[4];
+        d.AskPrice1 = ap[0];
+        d.AskPrice2 = ap[1];
+        d.AskPrice3 = ap[2];
+        d.AskPrice4 = ap[3];
+        d.AskPrice5 = ap[4];
+        d.AskVolume1 = av[0];
+        d.AskVolume2 = av[1];
+        d.AskVolume3 = av[2];
+        d.AskVolume4 = av[3];
+        d.AskVolume5 = av[4];
+
+        let s = super::depth_to_snapshot(&d);
+
+        assert_eq!(s.instrument, "cu2512");
+        assert_eq!(s.trading_day, "20261027");
+        assert_eq!(s.action_day, "20261027");
+        assert_eq!(s.update_time, "09:46:05");
+        assert_eq!(s.update_millisec, 123);
+        assert_eq!(s.last_price, 74_500.0);
+        assert_eq!(s.volume, 1234);
+        assert_eq!(s.open_interest, 12_181.0);
+        // 日 OHLC 透传。
+        assert_eq!(s.day_open, 74_100.0);
+        assert_eq!(s.day_high, 74_800.0);
+        assert_eq!(s.day_low, 74_000.0);
+        assert_eq!(s.day_close, 0.0);
+        // 一档（bids[0]/asks[0]）与五档全量。
+        assert_eq!(s.bids[0].price, 74_490.0);
+        assert_eq!(s.bids[0].volume, 11);
+        assert_eq!(s.asks[0].price, 74_510.0);
+        for i in 0..5 {
+            assert_eq!(s.bids[i].price, bp[i]);
+            assert_eq!(s.bids[i].volume, bv[i]);
+            assert_eq!(s.asks[i].price, ap[i]);
+            assert_eq!(s.asks[i].volume, av[i]);
+        }
+    }
+
+    #[test]
+    fn depth_to_snapshot_normalizes_dbl_max_and_zero_sentinels() {
+        // 柜台用 DBL_MAX 表示无对手价/无价：转换后归一为 0，不把 f64::MAX 带进快照。
+        let d = Depth {
+            LastPrice: f64::MAX,
+            BidPrice1: f64::MAX,
+            AskPrice1: f64::MAX,
+            OpenPrice: f64::MAX,
+            HighestPrice: 0.0,
+            ..Default::default()
+        };
+        let s = super::depth_to_snapshot(&d);
+        assert_eq!(s.last_price, 0.0);
+        assert_eq!(s.bids[0].price, 0.0);
+        assert_eq!(s.asks[0].price, 0.0);
+        assert_eq!(s.day_open, 0.0);
+        assert_eq!(s.day_high, 0.0);
     }
 }

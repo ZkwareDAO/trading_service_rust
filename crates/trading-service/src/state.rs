@@ -125,6 +125,19 @@ impl AppState {
         ));
         let market_interest: Arc<dyn trading_exchange::port::MarketInterest> =
             Arc::new(MarketInterests::new(positions.clone(), watch_rules.clone()));
+
+        // K线服务提前构造：CTP 需要把其「无条件全量持久化 sink」经 ProviderDeps 注入
+        // 交易所适配层（非主力/零订阅也落 CSV）；句柄全部取自 store 单例，fan-out
+        // 复用南向连接 hub。assemble 只在 tokio runtime 内调用，可直接取 Handle。
+        let kline_pusher = Arc::new(crate::kline::HubKlinePusher::new(
+            hub.clone(),
+            tokio::runtime::Handle::current(),
+        ));
+        let kline = Arc::new(crate::kline::KlineService::new(
+            Arc::clone(&store),
+            kline_pusher,
+        ));
+
         let provider_deps = ProviderDeps {
             http,
             rules,
@@ -153,6 +166,9 @@ impl AppState {
             ctp_last_volumes: store.ctp_last_volumes(),
             #[cfg(feature = "ctp")]
             ctp_dominants: store.ctp_dominants(),
+            // CTP K线：无条件全量持久化 sink（有 tick 定稿即落 CSV，绕过订阅/主力路由）。
+            #[cfg(feature = "ctp")]
+            ctp_persist_bar_sink: Some(kline.persistence_sink()),
         };
         let exchanges = Arc::new(ExchangeRegistry::builtin(provider_deps));
         // 启动自检（fail-fast）：汇总各 provider 自描述的仓位档案装入引擎并校验，
@@ -193,14 +209,7 @@ impl AppState {
         .with_order_querier(rule_querier)
         .with_notify_hub(notify.clone());
 
-        // K线服务：句柄全部取自 store 单例；fan-out 复用既有南向连接 hub。
-        // assemble 只在 tokio runtime（main / #[tokio::test]）内调用，故可直接取 Handle。
-        let pusher = Arc::new(crate::kline::HubKlinePusher::new(
-            hub.clone(),
-            tokio::runtime::Handle::current(),
-        ));
-        let kline = Arc::new(crate::kline::KlineService::new(Arc::clone(&store), pusher));
-
+        // K线服务已在 provider_deps 之前构造（其 CTP 无条件持久化 sink 需注入 deps）。
         Self {
             store,
             hub,

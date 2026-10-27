@@ -29,6 +29,38 @@ use crate::ctp::instrument_dir::InstrumentDir;
 use crate::market::{BarSink, DesiredSource, Kline, MarketDataStream, SubscriptionGuard};
 use crate::market_hub::{safe_notify, NotifyOutcome};
 
+/// 落 RawTick 时除聚合三量外的盘口/日 OHLC 字段（CandleTick 保持精简，1m 聚合不用它们）。
+///
+/// 这些是 CTP **当日累计**日开高低收（盘中 close 常为 0）与五档量价，**不是**
+/// 1m bar 的 OHLC；1m OHLC 由 candle 聚合得到。`Default` 全 0（FFI 字段缺失/测试用）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RawTickDepth {
+    pub day_open: Decimal,
+    pub day_high: Decimal,
+    pub day_low: Decimal,
+    pub day_close: Decimal,
+    pub bid: [Decimal; 5],
+    pub ask: [Decimal; 5],
+    pub bid_vol: [i32; 5],
+    pub ask_vol: [i32; 5],
+}
+
+impl From<&crate::ctp::core::quote::TickSnapshot> for RawTickDepth {
+    fn from(t: &crate::ctp::core::quote::TickSnapshot) -> Self {
+        let dec = |p: f64| Decimal::try_from(p).unwrap_or(Decimal::ZERO);
+        Self {
+            day_open: dec(t.day_open),
+            day_high: dec(t.day_high),
+            day_low: dec(t.day_low),
+            day_close: dec(t.day_close),
+            bid: t.bids.map(|l| dec(l.price)),
+            ask: t.asks.map(|l| dec(l.price)),
+            bid_vol: t.bids.map(|l| l.volume),
+            ask_vol: t.asks.map(|l| l.volume),
+        }
+    }
+}
+
 /// bar sink 单次回调摘除阈值（目标 <1µs，1ms 兜底）。
 const BAR_BUDGET: Duration = Duration::from_millis(1);
 
@@ -228,32 +260,45 @@ impl CtpMarketStream {
         !self.kline_products.is_empty() || !self.router.clients.lock().unwrap().is_empty()
     }
 
-    /// drain 在 K线集 tick 上调用：原始 tick 入 WAL 待刷盘窗口、覆盖最新累计量、
-    /// 并喂聚合器。（QuoteTable/observer 的业务路径在 drain 内单独完成，不经本方法。）
+    /// drain 在 K线集 tick 上调用：原始 tick（含日 OHLC/五档）入 WAL 待刷盘窗口、
+    /// 覆盖最新累计量、并喂聚合器。（QuoteTable/observer 的业务路径在 drain 内单独完成。）
     ///
-    /// 五档量价/日 OHLC 待 FFI 全透传后补齐，当前落 0（K线聚合只依赖
-    /// price/累计量额/持仓，不受影响）。
-    pub fn on_kline_tick(&self, symbol: &str, t: &CandleTick) {
+    /// `depth` 为日 OHLC + 五档（FFI 全透传）；K线聚合只依赖 `CandleTick` 的
+    /// price/累计量额/持仓，日 OHLC/五档仅落 RawTick。
+    pub fn on_kline_tick(&self, symbol: &str, t: &CandleTick, depth: &RawTickDepth) {
         self.ticks.append(RawTick {
             exchange: CTP_VENUE.to_string(),
             symbol: symbol.to_string(),
             timestamp: t.update_ms,
             trading_day: t.trading_day,
             price: t.price,
-            open: Decimal::ZERO,
-            high: Decimal::ZERO,
-            low: Decimal::ZERO,
-            close: Decimal::ZERO,
+            open: depth.day_open,
+            high: depth.day_high,
+            low: depth.day_low,
+            close: depth.day_close,
             volume: t.cum_volume,
             turnover: t.cum_turnover,
             open_interest: t.open_interest,
-            bid: [Decimal::ZERO; 5],
-            ask: [Decimal::ZERO; 5],
-            bid_vol: [0; 5],
-            ask_vol: [0; 5],
+            bid: depth.bid,
+            ask: depth.ask,
+            bid_vol: depth.bid_vol,
+            ask_vol: depth.ask_vol,
         });
         self.last_volumes.put(symbol, t.cum_volume);
         self.bar_agg.lock().unwrap().on_tick(symbol, t);
+    }
+
+    /// 注册全量持久化 sink：此后**每根定稿 bar（含非主力、零南向订阅）**都不经
+    /// 订阅/主力路由地通知它（用于「有 tick 定稿即落 CSV」）。须在行情喂 tick 前
+    /// 注册一次；panic/慢 sink 在聚合层被隔离摘除，不影响行情连接与南向路由。
+    pub fn register_persistent_bar_sink(&self, sink: Arc<dyn BarSink>) {
+        self.bar_agg.lock().unwrap().add_unconditional_sink(sink);
+    }
+
+    /// 强制定稿所有未闭桶并把 bar 同时送全量持久化 sink 与南向路由（优雅停机收口用）。
+    /// 重连场景**不得**调用（聚合器随单例跨会话存活，重连 flush 会产生重复 bar）。
+    pub fn flush_all(&self) -> Vec<Kline> {
+        self.bar_agg.lock().unwrap().flush_all()
     }
 
     /// 收盘选举一轮：按合约所属 product（目录 product_id，缺失则剥尾数字）分组，
@@ -574,11 +619,11 @@ mod tests {
             .unwrap();
 
         // 非主力 cu2511 跨分钟：聚合但不路由。
-        s.on_kline_tick("cu2511", &mk(10, 600_000));
-        s.on_kline_tick("cu2511", &mk(11, 660_000));
+        s.on_kline_tick("cu2511", &mk(10, 600_000), &RawTickDepth::default());
+        s.on_kline_tick("cu2511", &mk(11, 660_000), &RawTickDepth::default());
         // 主力 cu2512 跨分钟：定稿路由 1 根。
-        s.on_kline_tick("cu2512", &mk(20, 600_000));
-        s.on_kline_tick("cu2512", &mk(25, 660_000));
+        s.on_kline_tick("cu2512", &mk(20, 600_000), &RawTickDepth::default());
+        s.on_kline_tick("cu2512", &mk(25, 660_000), &RawTickDepth::default());
         assert_eq!(sink.count(), 1);
 
         // WAL 每笔留档：cu2511×2（非主力也留）+ cu2512×2，共 4 行待刷盘。
@@ -646,9 +691,80 @@ mod tests {
             .unwrap();
 
         // 非主力 cu2611 跨分钟定稿：具体合约订阅必须收到 1 根。
-        s.on_kline_tick("cu2611", &mk(10, 600_000));
-        s.on_kline_tick("cu2611", &mk(11, 660_000));
+        s.on_kline_tick("cu2611", &mk(10, 600_000), &RawTickDepth::default());
+        s.on_kline_tick("cu2611", &mk(11, 660_000), &RawTickDepth::default());
         assert_eq!(sink.count(), 1);
+    }
+
+    #[test]
+    fn persistent_sink_receives_non_dominant_bar_without_any_router_client() {
+        // 无任何南向订阅（router 客户端为空），合约也非主力：全量持久化 sink 仍须收到定稿 bar。
+        let (ticks, vols, doms) = tables();
+        let dir = dir_with(vec![info("cu2511", "cu", true), info("cu2512", "cu", true)]);
+        doms.put(
+            "cu",
+            DominantEntry {
+                symbol: "cu2512".into(),
+                trading_day: 20261023,
+                cum_volume: 0,
+            },
+        );
+        let persist = Arc::new(CountSink::default());
+        let s = CtpMarketStream::new(ticks, vols, doms, dir, Vec::new());
+        s.register_persistent_bar_sink(persist.clone() as Arc<dyn BarSink>);
+
+        // 非主力 cu2511 跨分钟定稿：无 router 客户端，但持久化 sink 收到 1 根。
+        s.on_kline_tick("cu2511", &mk(10, 600_000), &RawTickDepth::default());
+        s.on_kline_tick("cu2511", &mk(11, 660_000), &RawTickDepth::default());
+        assert_eq!(persist.count(), 1);
+        // flush 收口 cu2511 在 660_000 开的新桶：持久化 sink 再收 1 根。
+        let flushed = s.flush_all();
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(persist.count(), 2);
+    }
+
+    #[test]
+    fn raw_tick_depth_is_persisted_into_tick_wal() {
+        // FFI 全透传：日 OHLC + 五档量价随 RawTick 落 WAL（不再硬编码 0）。
+        let (ticks, vols, doms) = tables();
+        let s = CtpMarketStream::new(ticks.clone(), vols, doms, dir_with(vec![]), Vec::new());
+        // 盘中 close=0 如实保留（..Default 取 0）。
+        let mut bid = [Decimal::ZERO; 5];
+        bid[0] = Decimal::from(74_490);
+        bid[4] = Decimal::from(74_450);
+        let mut ask = [Decimal::ZERO; 5];
+        ask[0] = Decimal::from(74_510);
+        ask[4] = Decimal::from(74_550);
+        let mut bid_vol = [0; 5];
+        bid_vol[0] = 11;
+        let mut ask_vol = [0; 5];
+        ask_vol[0] = 21;
+        let depth = RawTickDepth {
+            day_open: Decimal::from(74_100),
+            day_high: Decimal::from(74_800),
+            day_low: Decimal::from(74_000),
+            bid,
+            ask,
+            bid_vol,
+            ask_vol,
+            ..Default::default()
+        };
+
+        s.on_kline_tick("cu2512", &mk(30, 600_000), &depth);
+
+        let pending = ticks.snapshot();
+        assert_eq!(pending.len(), 1);
+        let r = &pending[0];
+        assert_eq!(r.open, Decimal::from(74_100));
+        assert_eq!(r.high, Decimal::from(74_800));
+        assert_eq!(r.low, Decimal::from(74_000));
+        assert_eq!(r.close, Decimal::ZERO); // 盘中 close 0
+        assert_eq!(r.bid[0], Decimal::from(74_490));
+        assert_eq!(r.bid_vol[0], 11);
+        assert_eq!(r.ask[0], Decimal::from(74_510));
+        assert_eq!(r.ask_vol[0], 21);
+        assert_eq!(r.bid[4], Decimal::from(74_450));
+        assert_eq!(r.ask[4], Decimal::from(74_550));
     }
 
     #[test]
@@ -690,8 +806,8 @@ mod tests {
             )
             .unwrap();
         // 跨分钟定稿触发 panic sink：被吞住并摘除（不 panic 出 drain）。
-        s.on_kline_tick("cu2512", &mk(1, 600_000));
-        s.on_kline_tick("cu2512", &mk(2, 660_000));
+        s.on_kline_tick("cu2512", &mk(1, 600_000), &RawTickDepth::default());
+        s.on_kline_tick("cu2512", &mk(2, 660_000), &RawTickDepth::default());
         assert_eq!(s.router.clients.lock().unwrap().len(), 0);
     }
 

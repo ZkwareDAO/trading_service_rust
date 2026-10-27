@@ -1,20 +1,39 @@
 //! 行情快照：柜台 `CThostFtdcDepthMarketDataField` 的安全副本。
 
-/// 一笔行情 tick（盘口一档 + 最新价 + 成交量 + K线聚合所需字段）。
+/// 盘口一档：价 + 挂单量。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuoteLevel {
+    /// 价格（柜台无此价时为哨兵，经网关归一为 0.0）。
+    pub price: f64,
+    /// 挂单量（手）。
+    pub volume: i32,
+}
+
+impl QuoteLevel {
+    pub const fn new(price: f64, volume: i32) -> Self {
+        Self { price, volume }
+    }
+}
+
+/// 一笔行情 tick（五档盘口 + 最新价 + 日 OHLC + K线聚合所需字段）。
 #[derive(Debug, Clone)]
 pub struct TickSnapshot {
     /// 合约代码。
     pub instrument: String,
     /// 最新价。
     pub last_price: f64,
-    /// 买一价。
-    pub bid_price: f64,
-    /// 买一量（手）。
-    pub bid_volume: i32,
-    /// 卖一价。
-    pub ask_price: f64,
-    /// 卖一量（手）。
-    pub ask_volume: i32,
+    /// 买一~买五（index 0 = 买一）。
+    pub bids: [QuoteLevel; 5],
+    /// 卖一~卖五（index 0 = 卖一）。
+    pub asks: [QuoteLevel; 5],
+    /// 当日开盘价（CTP 当日累计，**非** 1m bar 的 open）。
+    pub day_open: f64,
+    /// 当日最高价（当日累计）。
+    pub day_high: f64,
+    /// 当日最低价（当日累计）。
+    pub day_low: f64,
+    /// 当日收盘价（盘中常为 0；收盘后才有值，**非** 1m bar 的 close）。
+    pub day_close: f64,
     /// 当日累计成交量（手）。
     pub volume: i32,
     /// 行情时间（`HH:MM:SS`）。
@@ -32,12 +51,14 @@ pub struct TickSnapshot {
 }
 
 impl TickSnapshot {
-    /// 买卖一价差；盘口缺一侧时返回 `None`。
+    /// 买卖一价差；任一侧无价（0/哨兵）时返回 `None`。
     pub fn spread(&self) -> Option<f64> {
-        let bid_ok = self.bid_price > 1e-9;
-        let ask_ok = self.ask_price > 1e-9 && self.ask_price < f64::MAX;
+        let bid = self.bids[0].price;
+        let ask = self.asks[0].price;
+        let bid_ok = bid > 1e-9;
+        let ask_ok = ask > 1e-9 && ask < f64::MAX;
         match (bid_ok, ask_ok) {
-            (true, true) => Some(self.ask_price - self.bid_price),
+            (true, true) => Some(ask - bid),
             _ => None,
         }
     }
@@ -82,16 +103,34 @@ pub fn md_timestamp_utc_ms(action_day: &str, update_time: &str, millisec: i32) -
 
 #[cfg(test)]
 mod tests {
-    use super::{md_timestamp_utc_ms, TickSnapshot};
+    use super::{md_timestamp_utc_ms, QuoteLevel, TickSnapshot};
+
+    fn level(price: f64, volume: i32) -> QuoteLevel {
+        QuoteLevel::new(price, volume)
+    }
 
     fn tick(bid: f64, ask: f64) -> TickSnapshot {
         TickSnapshot {
             instrument: "rb2611".into(),
             last_price: 3800.0,
-            bid_price: bid,
-            bid_volume: 10,
-            ask_price: ask,
-            ask_volume: 5,
+            bids: [
+                level(bid, 10),
+                level(0.0, 0),
+                level(0.0, 0),
+                level(0.0, 0),
+                level(0.0, 0),
+            ],
+            asks: [
+                level(ask, 5),
+                level(0.0, 0),
+                level(0.0, 0),
+                level(0.0, 0),
+                level(0.0, 0),
+            ],
+            day_open: 3790.0,
+            day_high: 3810.0,
+            day_low: 3780.0,
+            day_close: 0.0,
             volume: 1000,
             update_time: "13:30:01".into(),
             update_millisec: 500,

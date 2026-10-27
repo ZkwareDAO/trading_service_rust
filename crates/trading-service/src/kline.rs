@@ -29,6 +29,9 @@ use trading_store::{KlineFlushReport, KlineRepo, TradingStore};
 /// 本期唯一 K线周期标识（南向协议 / 登记表 / CSV 目录同口径）。
 pub const KLINE_INTERVAL: &str = "1m";
 
+/// CTP 的 venue 精确名（其落盘走无条件全量持久化 sink，订阅回调仅推送）。
+const CTP_VENUE: &str = "ctp";
+
 /// 一个 K线订阅作用域：交易所 × 标的类别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KlineScope {
@@ -210,20 +213,30 @@ impl KlinePusher for HubKlinePusher {
     }
 }
 
-/// 定稿 bar → BarTable + 订阅者 fan-out 的 sink（纯内存、同步廉价，满足 BarSink 契约）。
-struct TableBarSink {
+/// 仅负责**持久化**的 sink：把定稿 bar append 进待刷盘 BarTable（每根只由此处写一次）。
+/// 纯内存、同步廉价。WS 路径与 CTP 无条件全量持久化共用。
+struct PersistenceBarSink {
     bars: Arc<BarTable>,
+}
+
+impl BarSink for PersistenceBarSink {
+    fn on_bar(&self, bar: &StreamKline) {
+        self.bars.push(bar_from_kline(bar));
+    }
+}
+
+/// 仅负责**南向 fan-out** 的 sink：查订阅登记表逐连接推送（满/断即丢不阻塞），不写表。
+/// CTP 全量持久化路径用它，落盘由无条件 [`PersistenceBarSink`] 单独负责，避免重复 append。
+struct FanoutBarSink {
     registry: Arc<KlineRegistry>,
     pusher: Arc<dyn KlinePusher>,
     /// 慢/不可达连接丢弃计数（service 级共享，观测用）。
     dropped: Arc<AtomicU64>,
 }
 
-impl BarSink for TableBarSink {
-    fn on_bar(&self, bar: &StreamKline) {
-        // 1) 落待刷盘窗口（持久化与推送解耦）。
-        self.bars.push(bar_from_kline(bar));
-        // 2) 查订阅者（精确/品种前缀），逐连接入既有发送队列，满/断即丢不阻塞。
+impl FanoutBarSink {
+    fn fan_out(&self, bar: &StreamKline) {
+        // 查订阅者（精确/品种前缀），逐连接入既有发送队列，满/断即丢不阻塞。
         let itype = venue_itype(&bar.venue);
         let targets =
             self.registry
@@ -244,6 +257,25 @@ impl BarSink for TableBarSink {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+}
+
+impl BarSink for FanoutBarSink {
+    fn on_bar(&self, bar: &StreamKline) {
+        self.fan_out(bar);
+    }
+}
+
+/// WS 路径组合 sink：先落表再 fan-out（行为等价原 TableBarSink，单一 on_bar 顺序不变）。
+struct PersistAndFanoutSink {
+    persistence: PersistenceBarSink,
+    fanout: FanoutBarSink,
+}
+
+impl BarSink for PersistAndFanoutSink {
+    fn on_bar(&self, bar: &StreamKline) {
+        self.persistence.on_bar(bar);
+        self.fanout.fan_out(bar);
     }
 }
 
@@ -274,6 +306,8 @@ pub struct KlineService {
     dropped: Arc<AtomicU64>,
     /// 每个作用域一个 subscribe_klines 凭证（与进程同寿；drop 即整体退订）。
     guards: Mutex<Vec<SubscriptionGuard>>,
+    /// 后台 CSV 刷盘线程句柄（start 后才有）；优雅停机 join 以保证最后一刷落盘。
+    flush_task: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl KlineService {
@@ -287,6 +321,21 @@ impl KlineService {
             pusher,
             dropped: Arc::new(AtomicU64::new(0)),
             guards: Mutex::new(Vec::new()),
+            flush_task: Mutex::new(None),
+        }
+    }
+
+    /// 优雅停机：等后台刷盘线程退出（其退出前已做最后一次 flush_once）。
+    ///
+    /// 必须在置位停机标志**之后**调用；调用方据此获得「bar 已从内存窗口刷入 CSV」
+    /// 的 happens-before 保证（join 返回 ⇒ 线程最后一刷已完成）。未 start 或重复
+    /// 调用均安全（句柄只 take/join 一次），返回 Err 仅表示线程曾 panic（已记录）。
+    pub fn join_flush(&self) -> thread::Result<()> {
+        // 先 take 释放锁再 join，不持锁等待线程。
+        let task = self.flush_task.lock().unwrap().take();
+        match task {
+            Some(handle) => handle.join(),
+            None => Ok(()),
         }
     }
 
@@ -305,14 +354,41 @@ impl KlineService {
         )
     }
 
-    /// 定稿 bar sink（写 BarTable + 订阅者 fan-out；各 sink 共享丢弃计数）。
+    /// 落盘 + fan-out 组合 sink（WS 三家：定稿即写 BarTable 并按订阅推送；行为同旧实现）。
     pub fn bar_sink(&self) -> Arc<dyn BarSink> {
-        Arc::new(TableBarSink {
+        Arc::new(PersistAndFanoutSink {
+            persistence: self.persistence_sink_inner(),
+            fanout: self.fanout_sink_inner(),
+        })
+    }
+
+    /// **仅推送** sink（CTP 用）：按订阅 fan-out，不写 BarTable。
+    /// CTP 的全量落盘由 [`Self::persistence_sink`] 作为无条件 sink 单独负责，
+    /// 避免同一根 bar 既被无条件 sink 落盘、又在这里重复 append。
+    pub fn push_sink(&self) -> Arc<dyn BarSink> {
+        Arc::new(self.fanout_sink_inner())
+    }
+
+    /// **仅落盘** sink：每根定稿 bar append 进 BarTable 一次，不做南向推送。
+    /// CTP 作为「绕过订阅/主力的无条件全量持久化」注入交易所适配层。
+    /// 非 ctp 构建无消费方（state.rs 的注入在 cfg(ctp) 内），允许死代码。
+    #[cfg_attr(not(feature = "ctp"), allow(dead_code))]
+    pub fn persistence_sink(&self) -> Arc<dyn BarSink> {
+        Arc::new(self.persistence_sink_inner())
+    }
+
+    fn persistence_sink_inner(&self) -> PersistenceBarSink {
+        PersistenceBarSink {
             bars: Arc::clone(&self.bars),
+        }
+    }
+
+    fn fanout_sink_inner(&self) -> FanoutBarSink {
+        FanoutBarSink {
             registry: Arc::clone(&self.registry),
             pusher: Arc::clone(&self.pusher),
             dropped: Arc::clone(&self.dropped),
-        })
+        }
     }
 
     /// 累计因慢/不可达连接丢弃的 bar 帧数（测试断言；生产由 flush 周期日志消费）。
@@ -331,7 +407,14 @@ impl KlineService {
         let desired = Arc::new(RegistryDesired {
             source: self.source_for(scope.venue, scope.itype),
         }) as Arc<dyn DesiredSource>;
-        let guard = stream.subscribe_klines(desired, self.bar_sink())?;
+        // CTP 的落盘走「无条件全量持久化 sink」（非主力/零订阅也落），故订阅回调只推送；
+        // WS 三家没有无条件 sink，定稿回调仍需既落盘又推送。
+        let sink = if scope.venue == CTP_VENUE {
+            self.push_sink()
+        } else {
+            self.bar_sink()
+        };
+        let guard = stream.subscribe_klines(desired, sink)?;
         self.guards.lock().unwrap().push(guard);
         Ok(())
     }
@@ -435,7 +518,7 @@ impl KlineService {
     /// 独立 OS 线程定时刷盘（同步 IO 不进 tokio worker）；停机被打断后最后再刷一次。
     fn spawn_flush(self: &Arc<Self>, interval: Duration, stop: Arc<AtomicBool>) {
         let me = Arc::clone(self);
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("kline-flush".into())
             .spawn(move || {
                 loop {
@@ -488,6 +571,8 @@ impl KlineService {
             // spawn 失败（资源耗尽）必须 fail-fast：否则 K线永不刷盘、内存窗口
             // 无界增长且无任何告警，是静默数据丢失。启动期错误直接 panic 暴露。
             .expect("启动 kline-flush 线程失败");
+        // 留存句柄供优雅停机 join（保证最后一刷落盘后进程才退出）。
+        *self.flush_task.lock().unwrap() = Some(handle);
     }
 }
 
@@ -856,6 +941,48 @@ mod tests {
     }
 
     #[test]
+    fn push_sink_fans_out_but_never_writes_bar_table() {
+        // CTP 路径用 push-only sink：全量落盘由无条件 persistence sink 负责，
+        // 这里绝不能再写 BarTable（否则同一根 bar 重复 append）。
+        let store = test_store();
+        let (service, pusher) = svc(store.clone());
+        service.subscribe("direct", "ctp", &["cu2512".to_string()]);
+
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
+
+        // 订阅者照常收到推送。
+        assert_eq!(
+            pusher.events("direct"),
+            vec![("kline_1m".to_string(), "cu2512".to_string())]
+        );
+        // 但 BarTable 不被 push sink 写入。
+        assert_eq!(store.bar_table().len(), 0);
+    }
+
+    #[test]
+    fn persistence_sink_appends_once_and_does_not_push() {
+        let store = test_store();
+        let (service, pusher) = svc(store.clone());
+        service.subscribe("direct", "ctp", &["cu2512".to_string()]);
+
+        service
+            .persistence_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
+
+        // 仅落待刷盘窗口一次，不触发任何南向推送。
+        assert_eq!(store.bar_table().len(), 1);
+        assert_eq!(pusher.total(), 0);
+
+        // 另一根 bar 再落一条（每根仅 append 一次）。
+        service
+            .persistence_sink()
+            .on_bar(&kline("ctp", "cu2511", 20261024, 60_000));
+        assert_eq!(store.bar_table().len(), 2);
+    }
+
+    #[test]
     fn itype_maps_deribit_to_option_others_futures() {
         let store = test_store();
         let (service, _p) = svc(store.clone());
@@ -863,6 +990,39 @@ mod tests {
         assert_eq!(service.itype_for("binance"), InstrumentType::Futures);
         assert_eq!(service.itype_for("ctp"), InstrumentType::Futures);
         assert_eq!(service.itype_for("nope"), InstrumentType::Futures);
+    }
+
+    #[test]
+    fn join_flush_without_start_is_safe_noop() {
+        // 未起 flush 线程（如无 K线作用域的部署）：join 立即安全返回，不挂死。
+        let store = test_store();
+        let (service, _p) = svc(store);
+        assert!(service.join_flush().is_ok());
+        // 重复调用也安全（句柄已 take）。
+        assert!(service.join_flush().is_ok());
+    }
+
+    #[test]
+    fn spawned_flush_thread_is_joined_after_stop() {
+        use std::sync::atomic::AtomicBool;
+        let store = test_store();
+        let (service, _p) = svc(store.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        // 直接起 flush 线程（短间隔），句柄应被留存。
+        service.spawn_flush(Duration::from_millis(20), Arc::clone(&stop));
+
+        // 预置一根 bar，停机收尾时线程做最后一次 flush_once（join 返回即保证已执行）。
+        service
+            .persistence_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
+        stop.store(true, Ordering::SeqCst);
+
+        // join 必须正常返回（线程看到 stop 后 break + 最后一刷），不挂死。
+        assert!(service.join_flush().is_ok());
+        // join 的 happens-before：返回时最后一次 flush_once 已完成，BarTable 已被清空。
+        assert!(store.bar_table().is_empty());
+        // 再次 join 安全（句柄只 join 一次）。
+        assert!(service.join_flush().is_ok());
     }
 
     #[test]
