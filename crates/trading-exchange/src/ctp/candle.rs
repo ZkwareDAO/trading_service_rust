@@ -334,4 +334,116 @@ mod tests {
         assert_eq!(floor_minute(60_000), 60_000);
         assert_eq!(floor_minute(61_234), 60_000);
     }
+
+    // 特征钉死（方案①·事件时间归属）：稀疏 tick 跨分钟缺口时，缺口期空分钟不出 bar，
+    // 增量随「周期结束后第一根 tick」归入其所在桶。样例：22/23/27/29，cum 30/60/80/90/100。
+    #[test]
+    fn sparse_gap_ticks_attribute_volume_by_event_time() {
+        const DAY: u32 = 20261027;
+        // 分钟:秒 → 当日毫秒（与 update_ms 同坐标系）。
+        let m = |mm: i64, sec: i64| mm * 60_000 + sec * 1_000;
+        let mut agg = CandleAggregator::new("ctp", "cu2701");
+        let mut finished = Vec::new();
+
+        // t1 22:59 cum=30（当日首观测点，无基线）。
+        assert!(agg.on_tick(&tick(DAY, m(22, 59), 1000, 30, 0, 1)).is_none());
+        // t2 23:10 cum=60 → 定稿 22 桶。
+        if let Some(b) = agg.on_tick(&tick(DAY, m(23, 10), 1010, 60, 0, 2)) {
+            finished.push(b);
+        }
+        // t3 27:05 cum=80 → 定稿 23 桶（跨过 24/25/26，空分钟不出 bar）。
+        if let Some(b) = agg.on_tick(&tick(DAY, m(27, 5), 1030, 80, 0, 3)) {
+            finished.push(b);
+        }
+        // t4 27:58 cum=90 同桶 fold，不产 bar。
+        assert!(agg.on_tick(&tick(DAY, m(27, 58), 1025, 90, 0, 4)).is_none());
+        // t5 29:03 cum=100 → 定稿 27 桶（跨过 28）。
+        if let Some(b) = agg.on_tick(&tick(DAY, m(29, 3), 1050, 100, 0, 5)) {
+            finished.push(b);
+        }
+
+        // on_tick 仅定稿 3 根：22 / 23 / 27。
+        assert_eq!(finished.len(), 3);
+        let starts: Vec<i64> = finished.iter().map(|b| b.start_ms).collect();
+        assert_eq!(starts, vec![m(22, 0), m(23, 0), m(27, 0)]);
+
+        // 22 桶：单笔 1000，当日首观测点差分记 0，持仓取桶末 1。
+        let b22 = &finished[0];
+        assert_eq!(b22.open, dec(1000));
+        assert_eq!(b22.high, dec(1000));
+        assert_eq!(b22.low, dec(1000));
+        assert_eq!(b22.close, dec(1000));
+        assert_eq!(b22.volume, 0);
+        assert_eq!(b22.open_interest, dec(1));
+
+        // 23 桶：单笔 1010，量 = 60−30 = 30，持仓 2。
+        let b23 = &finished[1];
+        assert_eq!(b23.open, dec(1010));
+        assert_eq!(b23.volume, 30);
+        assert_eq!(b23.open_interest, dec(2));
+
+        // 27 桶：O=1030（t3），H=1030，L=C=1025（t4），量 = 90−60 = 30，持仓取桶末 4。
+        let b27 = &finished[2];
+        assert_eq!(b27.open, dec(1030));
+        assert_eq!(b27.high, dec(1030));
+        assert_eq!(b27.low, dec(1025));
+        assert_eq!(b27.close, dec(1025));
+        assert_eq!(b27.volume, 30);
+        assert_eq!(b27.open_interest, dec(4));
+
+        // 缺口空分钟 24/25/26/28 绝不出 bar。
+        assert!(finished
+            .iter()
+            .all(|b| ![m(24, 0), m(25, 0), m(26, 0), m(28, 0)].contains(&b.start_ms)));
+
+        // flush 收口最后活跃桶 29：单笔 1050，量 = 100−90 = 10，持仓 5。
+        let b29 = agg.flush().expect("最后活跃桶");
+        assert_eq!(b29.start_ms, m(29, 0));
+        assert_eq!(b29.open, dec(1050));
+        assert_eq!(b29.volume, 10);
+        assert_eq!(b29.open_interest, dec(5));
+
+        // 总量守恒：0+30+30+10 = 70 = 末累计 100 − 首观测点基线 30。
+        let total: i64 = finished.iter().map(|b| b.volume).sum::<i64>() + b29.volume;
+        assert_eq!(total, 70);
+        // flush 后再 flush 无桶。
+        assert!(agg.flush().is_none());
+    }
+
+    // 成交额与成交量同口径：按累计额差分（非负），跨分钟缺口同样归入恢复桶。
+    #[test]
+    fn sparse_gap_turnover_uses_cumulative_delta() {
+        const DAY: u32 = 20261027;
+        let m = |mm: i64, sec: i64| mm * 60_000 + sec * 1_000;
+        let mut agg = CandleAggregator::new("ctp", "cu2701");
+        agg.on_tick(&tick(DAY, m(23, 10), 1010, 60, 600_000, 2));
+        // 跨过 24/25/26，27:05 累计额 800_000：定稿 23 桶，额 = 600_000 − 首笔基线 0。
+        let b23 = agg
+            .on_tick(&tick(DAY, m(27, 5), 1030, 80, 800_000, 3))
+            .expect("23 桶定稿");
+        // 23 桶首笔基线为其自身累计额，故差分 0。
+        assert_eq!(b23.turnover, dec(0));
+        // 27 桶再来一笔累计额 900_000，flush 收口：额 = 900_000 − 600_000 = 300_000。
+        agg.on_tick(&tick(DAY, m(27, 58), 1025, 90, 900_000, 4));
+        let b27 = agg.flush().expect("27 桶");
+        assert_eq!(b27.turnover, dec(300_000));
+    }
+
+    // 跨桶首笔累计量回退（乱序/重发导致比上一桶末累计还小）：新桶差分钳 0，不为负。
+    #[test]
+    fn cross_bucket_cumulative_regression_clamps_to_zero() {
+        const DAY: u32 = 20261027;
+        let m = |mm: i64, sec: i64| mm * 60_000 + sec * 1_000;
+        let mut agg = CandleAggregator::new("ctp", "rb2601");
+        agg.on_tick(&tick(DAY, m(10, 0), 3800, 100, 1_000, 1));
+        // 下一分钟首笔累计量异常回退到 90（< 上一桶末 100）：先定稿旧桶。
+        let prev = agg
+            .on_tick(&tick(DAY, m(11, 0), 3799, 90, 900, 1))
+            .expect("上一桶定稿");
+        assert_eq!(prev.volume, 0); // 上一桶仅首笔，差分 0
+                                    // 新桶基线=100，本笔 90 回退 → 钳 0，绝不出现负成交量。
+        let cur = agg.flush().expect("新桶");
+        assert_eq!(cur.volume, 0);
+        assert_eq!(cur.turnover, dec(0));
+    }
 }
