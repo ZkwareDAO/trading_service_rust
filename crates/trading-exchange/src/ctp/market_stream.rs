@@ -26,7 +26,9 @@ use crate::ctp::bar_agg::BarAggSink;
 use crate::ctp::candle::CandleTick;
 use crate::ctp::dominant::{pick_dominant, product_prefix, ContractVolume};
 use crate::ctp::instrument_dir::InstrumentDir;
-use crate::market::{BarSink, DesiredSource, Kline, MarketDataStream, SubscriptionGuard};
+use crate::market::{
+    BarSink, DesiredSource, Kline, KlineInterval, MarketDataStream, SubscriptionGuard,
+};
 use crate::market_hub::{safe_notify, NotifyOutcome};
 
 /// 落 RawTick 时除聚合三量外的盘口/日 OHLC 字段（CandleTick 保持精简，1m 聚合不用它们）。
@@ -200,7 +202,7 @@ impl CtpMarketStream {
         kline_products: Vec<String>,
     ) -> Arc<Self> {
         let router = Arc::new(BarRouter::new(Arc::clone(&dominants)));
-        let bar_agg = BarAggSink::new("ctp", router.clone() as Arc<dyn BarSink>);
+        let bar_agg = BarAggSink::new("ctp", router.clone() as Arc<dyn BarSink>, KlineInterval::M1);
         Arc::new(Self {
             next_price_id: Mutex::new(0),
             price_clients: Arc::new(Mutex::new(Vec::new())),
@@ -299,6 +301,16 @@ impl CtpMarketStream {
     /// 重连场景**不得**调用（聚合器随单例跨会话存活，重连 flush 会产生重复 bar）。
     pub fn flush_all(&self) -> Vec<Kline> {
         self.bar_agg.lock().unwrap().flush_all()
+    }
+
+    /// 墙钟到点 sweep（md 线程每个 poll 节拍调一次，空闲超时拍也调）：把所有已收到过
+    /// tick 且到收盘边界（grace=0：start+interval ≤ now）的合约上一周期桶一次性定稿，先落盘再路由。
+    ///
+    /// 与 [`Self::on_kline_tick`] 内的事件时间墙钟是同一判定——稀疏成交也由每拍 sweep 到边界定稿；
+    /// 两者对同一在途桶 `Option::take`，最多定稿一次。`now_ms` 由调用方按 SystemTime 注入，
+    /// 判定本身是纯函数，便于单测；锁内只做内存取桶/聚合（守 `BarSink::on_bar` 同步廉价契约）。
+    pub fn sweep_kline_finalized(&self, now_ms: i64) -> Vec<Kline> {
+        self.bar_agg.lock().unwrap().sweep_finalized(now_ms)
     }
 
     /// 收盘选举一轮：按合约所属 product（目录 product_id，缺失则剥尾数字）分组，
@@ -721,6 +733,37 @@ mod tests {
         let flushed = s.flush_all();
         assert_eq!(flushed.len(), 1);
         assert_eq!(persist.count(), 2);
+    }
+
+    #[test]
+    fn wallclock_sweep_finalizes_due_bucket_without_next_tick() {
+        // md 线程每拍墙钟 sweep：桶到 start+interval 边界即定稿（grace=0），不等下一周期首笔 tick。
+        let (ticks, vols, doms) = tables();
+        let sink = Arc::new(CountSink::default());
+        let s = CtpMarketStream::new(ticks, vols, doms, dir_with(vec![]), Vec::new());
+        let _g = s
+            .subscribe_klines(
+                Arc::new(FixedSymbols::new(vec!["cu2701".into()])),
+                sink.clone(),
+            )
+            .unwrap();
+
+        // 仅一笔 tick 开 10:00 桶，无跨分钟翻转 → 暂不定稿。
+        s.on_kline_tick("cu2701", &mk(10, 600_000), &RawTickDepth::default());
+        assert_eq!(sink.count(), 0);
+        // 未到收盘边界（660_000）：659_999 不出棒。
+        assert!(s.sweep_kline_finalized(659_999).is_empty());
+        assert_eq!(sink.count(), 0);
+        // 到点 sweep：定稿 10:00 桶并路由，无需任何新 tick。
+        let bars = s.sweep_kline_finalized(660_000);
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].symbol, "cu2701");
+        assert_eq!(bars[0].start_ms, 600_000);
+        assert_eq!(bars[0].end_ms, 660_000);
+        assert_eq!(sink.count(), 1);
+        // take 语义：重复 sweep 不再出棒。
+        assert!(s.sweep_kline_finalized(660_000).is_empty());
+        assert_eq!(sink.count(), 1);
     }
 
     #[test]

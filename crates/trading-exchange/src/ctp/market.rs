@@ -466,9 +466,17 @@ fn run_md_session(
             }
             _ => {}
         }
-        // 每个 poll 节拍（约 1s）对账一次 K线期望集：配置基线品种展开 ∪ 客户端
-        // 运行时订阅发生增删时，会话内增量 subscribe/unsubscribe，不等断线重连。
+        // 每个 poll 节拍（约 1s，空闲超时拍也到此）：
+        // 1) 墙钟 sweep 定稿已到边界（grace=0：start+interval ≤ now）的上一周期 K线——
+        //    稀疏成交也无需等下一周期首笔 tick，最坏定稿延迟 ≈ 一个 poll 节拍（约 1s）；
+        //    不新增 sleep/线程（新周期首笔 tick 另在 on_tick 内以事件时间走同一墙钟判定）；
+        // 2) 对账 K线期望集：配置基线品种展开 ∪ 客户端运行时订阅发生增删时，会话内增量
+        //    subscribe/unsubscribe，不等断线重连。
         if let Some(k) = kline {
+            let swept = k.stream.sweep_kline_finalized(now_ms());
+            if !swept.is_empty() {
+                tracing::debug!(count = swept.len(), "CTP 墙钟 sweep 定稿 K线");
+            }
             reconcile_kline_subscriptions(&md, k, &business_set, &mut kline_set);
         }
     }

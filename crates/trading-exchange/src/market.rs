@@ -43,6 +43,11 @@ impl KlineInterval {
         }
     }
 
+    /// 周期的毫秒长度（墙钟定稿按此推导绝对边界，不写死 60_000；未来加 M30 只需在此补值）。
+    pub fn duration_ms(self) -> i64 {
+        self.minutes() * 60_000
+    }
+
     /// 南向/CSV 使用的稳定字符串标识。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -278,5 +283,15 @@ mod tests {
     fn interval_minutes_and_tag() {
         assert_eq!(KlineInterval::M1.minutes(), 1);
         assert_eq!(KlineInterval::M1.as_str(), "1m");
+    }
+
+    #[test]
+    fn interval_duration_ms_matches_minutes() {
+        // 墙钟定稿按毫秒绝对边界算：M1 = 60_000ms，且与 minutes() 自洽。
+        assert_eq!(KlineInterval::M1.duration_ms(), 60_000);
+        assert_eq!(
+            KlineInterval::M1.duration_ms(),
+            KlineInterval::M1.minutes() * 60_000
+        );
     }
 }
