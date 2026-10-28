@@ -182,9 +182,10 @@ const PUSH_IN_FLIGHT_PER_STRATEGY: usize = 16;
 const KLINE_PUSH_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
 /// 分钟桶安全超时（自桶内首根 bar 到达起，ms）：同 (strategy, venue) 迟迟没有更晚分钟
-/// bar 驱动水位线时，桶最迟在此年龄关桶出帧。实测健康连接同所多标的定稿散布 ~880ms，
-/// WS 重连突发可达数秒；取 8s 覆盖重连长尾，又远小于 1 分钟（不会跨到下一分钟桶）。
-const KLINE_PUSH_MAX_AGE_MS: i64 = 8_000;
+/// bar 驱动水位线时，桶最迟在此年龄关桶出帧。取 2s 优先低延迟（健康连接同所多标的收盘帧
+/// 散布 ~880ms，仍能合帧）；代价：WS 重连抖动 >2s 的迟到标的可能落到下一帧/拆帧，
+/// 但远小于 1 分钟（不会跨到下一分钟桶）。
+const KLINE_PUSH_MAX_AGE_MS: i64 = 2_000;
 
 /// per-connection 在途发送闸门（背压）：同步 `try_acquire` 取许可，拿到的
 /// [`OwnedSemaphorePermit`] 在异步发送任务结束时自动归还；该连接在途达上限则返 None。
