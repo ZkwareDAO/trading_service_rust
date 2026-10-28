@@ -328,48 +328,65 @@ pub struct ClientEvent {
     /// ack / order_event / error / positions。
     #[serde(rename = "type")]
     pub kind: String,
-    #[serde(default)]
+    /// 统一信封按事件类别只填空载荷；空字段序列化时整体省略（不输出 null），
+    /// 读侧仍由 `default` 兼容缺省。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_order_id: Option<String>,
     /// 来源信号 id（原样回传下单时的 signal_id），供策略侧据此识别回报归属；
-    /// 规则单（无 signal_id）为 null。
-    #[serde(default)]
+    /// 规则单（无 signal_id）省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exchange_order_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exchange: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instrument: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub side: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order_type: Option<String>,
-    #[serde(default)]
-    #[serde(with = "decimal_wire::opt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "decimal_wire::opt"
+    )]
     pub order_price: Option<Decimal>,
-    #[serde(default)]
-    #[serde(with = "decimal_wire::opt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "decimal_wire::opt"
+    )]
     pub order_quantity: Option<Decimal>,
     /// 平仓单标记（reduce_only=true）；仅 ack/order_event 随订单快照带出。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reduce_only: Option<bool>,
-    #[serde(default)]
-    #[serde(with = "decimal_wire::opt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "decimal_wire::opt"
+    )]
     pub filled_price: Option<Decimal>,
-    #[serde(default)]
-    #[serde(with = "decimal_wire::opt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "decimal_wire::opt"
+    )]
     pub filled_quantity: Option<Decimal>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub positions: Option<Vec<PositionSnapshot>>,
-    /// type=kline_1m 时的定稿 bar 载荷（其余事件为 None）。
-    #[serde(default)]
+    /// type=kline_1m 时的定稿 bar 载荷（其余事件省略）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kline: Option<KlineEvent>,
+    /// type=kline_1m_batch 时的同所批量定稿 bar 载荷（一帧多标的，其余事件省略）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub klines: Option<Vec<KlineEvent>>,
 }
 
 /// `kline_1m` 推送载荷：一根已定稿的 1 分钟 K线（只推定稿，不补历史）。
@@ -447,6 +464,7 @@ impl ClientEvent {
             message: None,
             positions: None,
             kline: None,
+            klines: None,
         }
     }
 
@@ -470,6 +488,7 @@ impl ClientEvent {
             message: Some(message.into()),
             positions: None,
             kline: None,
+            klines: None,
         }
     }
 
@@ -494,6 +513,7 @@ impl ClientEvent {
             message: Some(message.into()),
             positions: None,
             kline: None,
+            klines: None,
         }
     }
 
@@ -519,6 +539,7 @@ impl ClientEvent {
             ),
             positions: Some(positions),
             kline: None,
+            klines: None,
         }
     }
 
@@ -543,6 +564,41 @@ impl ClientEvent {
             message: None,
             positions: None,
             kline: Some(k),
+            klines: None,
+        }
+    }
+
+    /// 同一交易所同一时刻定稿的多标的 1 分钟 K线**批量**推送
+    /// （type=kline_1m_batch）：一帧携带数组，南向客户端按 venue 一次收齐。
+    ///
+    /// 组内按 `(symbol, start_time)` 升序排序，保证帧内容确定（不依赖入序）；
+    /// 不带任何订单身份，`kline`(单数) 恒为 None。
+    pub fn kline_1m_batch(venue: String, mut klines: Vec<KlineEvent>) -> Self {
+        klines.sort_by(|a, b| {
+            a.symbol
+                .cmp(&b.symbol)
+                .then_with(|| a.start_time.cmp(&b.start_time))
+        });
+        ClientEvent {
+            kind: "kline_1m_batch".to_string(),
+            status: None,
+            client_order_id: None,
+            signal_id: None,
+            exchange_order_id: None,
+            exchange: Some(venue),
+            strategy_name: None,
+            instrument: None,
+            side: None,
+            order_type: None,
+            order_price: None,
+            order_quantity: None,
+            reduce_only: None,
+            filled_price: None,
+            filled_quantity: None,
+            message: None,
+            positions: None,
+            kline: None,
+            klines: Some(klines),
         }
     }
 }
@@ -728,6 +784,117 @@ mod tests {
         assert!(json.contains("\"type\":\"kline_1m\""));
         // 避免未用告警：占位引用宏路径（实际用全路径）。
         let _ = std::any::type_name::<Decimal>();
+    }
+
+    /// 构造一根最小可辨 K线（仅关键字段，便于断言排序/透传）。
+    fn batch_kline(venue: &str, symbol: &str, start: i64, close: i64) -> KlineEvent {
+        KlineEvent {
+            venue: venue.into(),
+            symbol: symbol.into(),
+            interval: "1m".into(),
+            trading_day: 20261027,
+            start_time: start,
+            end_time: start + 60_000,
+            open: Decimal::from(close),
+            high: Decimal::from(close),
+            low: Decimal::from(close),
+            close: Decimal::from(close),
+            volume: 1,
+            turnover: None,
+            open_interest: None,
+        }
+    }
+
+    #[test]
+    fn kline_1m_batch_carries_sorted_array_and_round_trips() {
+        // 故意乱序传入：构造器须按 (symbol, start_time) 排序，帧内容确定。
+        let ev = ClientEvent::kline_1m_batch(
+            "binance".to_string(),
+            vec![
+                batch_kline("binance", "ETHUSDT", 120_000, 2),
+                batch_kline("binance", "BTCUSDT", 60_000, 1),
+                batch_kline("binance", "BTCUSDT", 0, 9),
+            ],
+        );
+
+        // 帧头：新 type 名、exchange=venue；单帧 kline(单数) 必为 None。
+        assert_eq!(ev.kind, "kline_1m_batch");
+        assert_eq!(ev.exchange.as_deref(), Some("binance"));
+        assert!(ev.kline.is_none());
+        assert!(ev.instrument.is_none());
+
+        let klines = ev.klines.clone().expect("批量载荷存在");
+        assert_eq!(klines.len(), 3);
+        // 组内按 (symbol, start_time) 升序：BTCUSDT(0) < BTCUSDT(60000) < ETHUSDT(120000)。
+        assert_eq!(
+            klines
+                .iter()
+                .map(|k| (k.symbol.as_str(), k.start_time))
+                .collect::<Vec<_>>(),
+            vec![("BTCUSDT", 0), ("BTCUSDT", 60_000), ("ETHUSDT", 120_000)]
+        );
+
+        // serde 往返：JSON 含批量 type；单数 kline 为 None 时整个键省略（不再输出 null），
+        // klines 三元素回读齐全。
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"kline_1m_batch\""));
+        assert!(!json.contains("\"kline\""));
+        assert!(json.contains("\"exchange\":\"binance\""));
+        let back: ClientEvent = serde_json::from_str(&json).unwrap();
+        let back_klines = back.klines.expect("回读批量载荷存在");
+        assert_eq!(back_klines, klines);
+        assert!(back.kline.is_none());
+    }
+
+    #[test]
+    fn kline_1m_batch_empty_is_still_distinct_frame() {
+        // 空数组也是合法批量帧（生产不会主动发空帧，但协议层不禁止、可往返）。
+        let ev = ClientEvent::kline_1m_batch("ctp".to_string(), Vec::new());
+        assert_eq!(ev.kind, "kline_1m_batch");
+        assert_eq!(ev.exchange.as_deref(), Some("ctp"));
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: ClientEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.klines.as_ref().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn kline_batch_frame_omits_all_unrelated_null_fields() {
+        // 信封只保留有值的键：批量 K线帧恰为 type/exchange/klines，
+        // 不再附带订单/成交/持仓/ack 等十几个无关 null 字段。
+        let ev = ClientEvent::kline_1m_batch(
+            "ctp".to_string(),
+            vec![batch_kline("ctp", "rb2612", 0, 1)],
+        );
+        let v = serde_json::to_value(&ev).unwrap();
+        let keys: std::collections::BTreeSet<String> =
+            v.as_object().unwrap().keys().cloned().collect();
+        let expected: std::collections::BTreeSet<String> = ["type", "exchange", "klines"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(keys, expected);
+        // 省略空字段后仍能靠 #[serde(default)] 完整回读。
+        let back: ClientEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back.kind, "kline_1m_batch");
+        assert_eq!(back.klines.unwrap().len(), 1);
+        assert!(back.client_order_id.is_none() && back.positions.is_none() && back.kline.is_none());
+    }
+
+    #[test]
+    fn non_kline_frames_omit_kline_and_other_null_fields() {
+        // 对称性：订单/ack/持仓类帧同样不出现与本事件无关的 null 键（含 kline/klines）。
+        let ack = serde_json::to_string(&ClientEvent::ack("OK", None)).unwrap();
+        assert!(ack.contains("\"type\":\"ack\""));
+        for absent in [
+            "\"kline\"",
+            "\"klines\"",
+            "\"positions\"",
+            "\"client_order_id\"",
+            "\"filled_price\"",
+            "\"side\"",
+        ] {
+            assert!(!ack.contains(absent), "ack 不应出现空字段 {absent}: {ack}");
+        }
     }
 
     #[test]

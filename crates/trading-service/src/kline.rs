@@ -16,7 +16,7 @@
 //! 增订/退订，本类型不重复调用 subscribe。配置基线（[`BaselineKlines`]）只贡献线
 //! 订阅并集，**不进登记表**，故不产生任何南向推送。
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -177,6 +177,15 @@ pub trait KlinePusher: Send + Sync {
 /// 防止单条慢/断连接让 tokio 任务无限堆积；bar 为分钟级，正常在途≈1。
 const PUSH_IN_FLIGHT_PER_STRATEGY: usize = 16;
 
+/// 推送线程轮询周期：每拍关闭超龄分钟桶、并取走「已关帧」发送。出帧时机由分钟桶的
+/// 有序水位线 / 安全超时决定（与本周期无关），本周期只决定发送与超时检测的反应粒度。
+const KLINE_PUSH_TICK_INTERVAL: Duration = Duration::from_millis(200);
+
+/// 分钟桶安全超时（自桶内首根 bar 到达起，ms）：同 (strategy, venue) 迟迟没有更晚分钟
+/// bar 驱动水位线时，桶最迟在此年龄关桶出帧。实测健康连接同所多标的定稿散布 ~880ms，
+/// WS 重连突发可达数秒；取 8s 覆盖重连长尾，又远小于 1 分钟（不会跨到下一分钟桶）。
+const KLINE_PUSH_MAX_AGE_MS: i64 = 8_000;
+
 /// per-connection 在途发送闸门（背压）：同步 `try_acquire` 取许可，拿到的
 /// [`OwnedSemaphorePermit`] 在异步发送任务结束时自动归还；该连接在途达上限则返 None。
 /// 各连接独立计数，一条慢连接不牵连其它连接。
@@ -241,10 +250,178 @@ impl KlinePusher for HubKlinePusher {
             // 持有 permit 直到发送完成：慢连接期间在途计数真实反映未完成帧。
             let _permit = permit;
             if !hub.send(&name, &json).await {
-                tracing::warn!(strategy = %name, "kline_1m 推送失败（连接不可达），丢弃该帧");
+                tracing::warn!(strategy = %name, "kline_1m_batch 推送失败（连接不可达），丢弃该帧");
             }
         });
         true
+    }
+}
+
+/// 一个待推送的**分钟桶**：同一 (strategy, venue, 分钟起始 ms) 内定稿的多标的 bar，
+/// 在桶关闭前持续累积，关闭时聚成一个数组帧。
+struct MinuteBucket {
+    /// 桶内多标的 bar（保持入序，出帧时按 symbol 排序）。
+    events: Vec<KlineEvent>,
+    /// 桶内**首根** bar 到达（墙钟 ms）时刻：安全超时以此为龄起点。
+    first_arrival_ms: i64,
+}
+
+/// 推送聚合内核（纯内存、时钟由参数注入，不依赖 pusher/线程，便于单测）。
+///
+/// 解决的问题：同一分钟多标的的定稿事件并非同一刻到齐——实测 binance 测试网
+/// BTC/ETH 相差约 880ms（健康连接）、WS 重连突发时可达数秒。固定短窗（200ms）会
+/// 把它们拆成多条帧。改为按 **(strategy, venue, 分钟起始)** 分桶，满足以下任一
+/// 条件即关桶出帧（同一分钟的多标的在关桶前都会被收进同一帧）：
+/// 1. **有序水位线**：同 (strategy, venue) 到达了一根*更晚分钟*的 bar，说明更旧的
+///    分钟桶已不可能再来同分钟 bar，立即关闭；
+/// 2. **安全超时**：桶龄（自首根 bar 到达）达到 [`Self::max_age_ms`]，兜底无后续
+///    分钟 bar 驱动水位线、或定稿长时间散布的情形（覆盖重连数秒抖动）。
+///
+/// 关桶后的帧进入 [`Self::outbox`]，由后台推送线程下一拍统一取走发送；行情 sink
+/// 线程只做入桶（同步纯内存），**绝不直接发送**。
+struct BatcherCore {
+    /// 在途分钟桶：key=(strategy, venue, bar.start_time)。
+    buckets: BTreeMap<(String, String, i64), MinuteBucket>,
+    /// 已关桶、待推送线程取走的成帧组 (strategy, venue, bars)。
+    outbox: Vec<(String, String, Vec<KlineEvent>)>,
+    /// 桶安全超时（自首根 bar 到达起，ms）。
+    max_age_ms: i64,
+}
+
+impl Default for BatcherCore {
+    fn default() -> Self {
+        Self::new(KLINE_PUSH_MAX_AGE_MS)
+    }
+}
+
+impl BatcherCore {
+    fn new(max_age_ms: i64) -> Self {
+        Self {
+            buckets: BTreeMap::new(),
+            outbox: Vec::new(),
+            max_age_ms,
+        }
+    }
+
+    /// 入桶一根定稿 bar（同步、廉价）。先按有序水位线关闭同 (strategy, venue) 的更旧
+    /// 分钟桶，再把本 bar 追加到其所属分钟桶（桶不存在则以 `now_ms` 为龄起点新建）。
+    fn push(&mut self, now_ms: i64, strategy: &str, venue: &str, event: KlineEvent) {
+        let bucket_start = event.start_time;
+        // 水位线：关闭键序严格更旧（且同 strategy+venue）的桶。BTreeMap 范围查询后
+        // 显式比对前缀，避免把别的 strategy/venue 的桶误关。
+        let upper = (strategy.to_string(), venue.to_string(), bucket_start);
+        let stale: Vec<(String, String, i64)> = self
+            .buckets
+            .range(..&upper)
+            .filter(|((s, v, _), _)| s == strategy && v == venue)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in stale {
+            if let Some(bucket) = self.buckets.remove(&key) {
+                self.emit(key.0, key.1, bucket.events);
+            }
+        }
+        // 追加到当前分钟桶（晚到的同分钟标的仍并入同一桶；仅当它晚于水位线/超时关桶
+        // 之后才会另起一帧，属罕见长尾，语义不漏不重）。先取/建桶再 push：两个分支都
+        // 按值消费 event，不引入 clone（KlineEvent 含多个 String）。
+        let bucket = self
+            .buckets
+            .entry((strategy.to_string(), venue.to_string(), bucket_start))
+            .or_insert_with(|| MinuteBucket {
+                first_arrival_ms: now_ms,
+                events: Vec::new(),
+            });
+        bucket.events.push(event);
+    }
+
+    /// 推送线程每拍调用：把达到安全超时的桶关入 outbox，并取走全部待发帧（取空）。
+    fn poll(&mut self, now_ms: i64) -> Vec<(String, String, Vec<KlineEvent>)> {
+        // BTreeMap 键序＝(strategy, venue, 分钟) 字典序，出帧顺序确定。
+        let matured: Vec<(String, String, i64)> = self
+            .buckets
+            .iter()
+            .filter(|(_, b)| now_ms.saturating_sub(b.first_arrival_ms) >= self.max_age_ms)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in matured {
+            if let Some(bucket) = self.buckets.remove(&key) {
+                self.emit(key.0, key.1, bucket.events);
+            }
+        }
+        self.take_outbox()
+    }
+
+    /// 停机兜底：关闭全部在途桶（含未超时的）并取走，尽力推出、不丢缓冲。
+    fn flush_all(&mut self) -> Vec<(String, String, Vec<KlineEvent>)> {
+        let all: Vec<(String, String, i64)> = self.buckets.keys().cloned().collect();
+        for key in all {
+            if let Some(bucket) = self.buckets.remove(&key) {
+                self.emit(key.0, key.1, bucket.events);
+            }
+        }
+        self.take_outbox()
+    }
+
+    /// 关桶成帧：组内按 `(symbol, start_time)` 排序，帧内容确定、不依赖入序。
+    fn emit(&mut self, strategy: String, venue: String, mut events: Vec<KlineEvent>) {
+        events.sort_by(|a, b| {
+            a.symbol
+                .cmp(&b.symbol)
+                .then_with(|| a.start_time.cmp(&b.start_time))
+        });
+        self.outbox.push((strategy, venue, events));
+    }
+
+    fn take_outbox(&mut self) -> Vec<(String, String, Vec<KlineEvent>)> {
+        std::mem::take(&mut self.outbox)
+    }
+}
+
+/// 当前墙钟 UTC 毫秒（生产时钟；测试直接调 [`BatcherCore`] 注入虚拟时钟）。
+fn wall_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// [`BatcherCore`] 的共享句柄：行情 sink（多所 drain 线程）`push` 入桶、后台推送线程
+/// `poll`/`flush_all` 取帧，`Arc<Mutex<_>>` 共享同一内核（项目约定不用 channel）。
+/// 锁内只做 BTreeMap/Vec 的短操作，临界区极短。时钟默认取墙钟。
+#[derive(Clone)]
+pub(crate) struct KlineBatcher {
+    inner: Arc<Mutex<BatcherCore>>,
+}
+
+impl Default for KlineBatcher {
+    fn default() -> Self {
+        Self::new(BatcherCore::default())
+    }
+}
+
+impl KlineBatcher {
+    fn new(core: BatcherCore) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(core)),
+        }
+    }
+
+    /// 入桶一根定稿 bar（读取墙钟作为到达时刻）。
+    fn push(&self, strategy: &str, venue: &str, event: KlineEvent) {
+        self.inner
+            .lock()
+            .unwrap()
+            .push(wall_now_ms(), strategy, venue, event);
+    }
+
+    /// 每拍：关超龄桶并取走待发帧。
+    fn poll(&self) -> Vec<(String, String, Vec<KlineEvent>)> {
+        self.inner.lock().unwrap().poll(wall_now_ms())
+    }
+
+    /// 停机：关闭全部在途桶并取走。
+    fn flush_all(&self) -> Vec<(String, String, Vec<KlineEvent>)> {
+        self.inner.lock().unwrap().flush_all()
     }
 }
 
@@ -269,18 +446,20 @@ impl BarSink for PersistenceBarSink {
     }
 }
 
-/// 仅负责**南向 fan-out** 的 sink：查订阅登记表逐连接推送（满/断即丢不阻塞），不写表。
-/// CTP 全量持久化路径用它，落盘由无条件 [`PersistenceBarSink`] 单独负责，避免重复 append。
+/// 仅负责**南向 fan-out** 的 sink：查订阅登记表，把 bar 追加进分钟桶缓冲，不写表、
+/// 不直接发送。同所同分钟的多标的在关桶（水位线/安全超时）前聚成一个数组帧，由后台
+/// 推送线程统一发出；CTP 全量持久化路径也用它，落盘由无条件 [`PersistenceBarSink`]
+/// 单独负责，避免重复 append。
 struct FanoutBarSink {
     registry: Arc<KlineRegistry>,
-    pusher: Arc<dyn KlinePusher>,
-    /// 慢/不可达连接丢弃计数（service 级共享，观测用）。
-    dropped: Arc<AtomicU64>,
+    /// 命中策略的 bar 入此聚合缓冲（service 与推送线程共享同一句柄）。
+    batcher: KlineBatcher,
 }
 
 impl FanoutBarSink {
     fn fan_out(&self, bar: &StreamKline) {
-        // 查订阅者（精确/品种前缀），逐连接入既有发送队列，满/断即丢不阻塞。
+        // 查订阅者（精确/品种前缀），逐连接把 bar 入批量缓冲；发送（满/断即丢）延后到
+        // 后台推送线程，保证 on_bar 同步纯内存、绝不阻塞行情 drain（safe_notify <1ms 契约）。
         let itype = venue_itype(&bar.venue);
         let targets =
             self.registry
@@ -291,15 +470,10 @@ impl FanoutBarSink {
             trading_day = bar.trading_day,
             volume = bar.volume,
             recipients = targets.len(),
-            "定稿 bar fan-out"
+            "定稿 bar fan-out（入批量推送缓冲）"
         );
         for strategy in targets {
-            if !self
-                .pusher
-                .push(&strategy, ClientEvent::kline_1m(kline_event(bar)))
-            {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-            }
+            self.batcher.push(&strategy, &bar.venue, kline_event(bar));
         }
     }
 }
@@ -343,6 +517,8 @@ pub struct KlineService {
     repo: KlineRepo,
     /// 南向推送端口（生产＝spawn 到 hub；测试可注入假实现）。
     pusher: Arc<dyn KlinePusher>,
+    /// 定稿 bar 批量推送缓冲（sink 多线程 push、推送线程 drain；同所多标的聚一帧）。
+    batcher: KlineBatcher,
     /// 配置基线订阅（venue+itype → 基线合约；只贡献线订阅并集，不做南向推送）。
     baselines: Arc<Vec<BaselineKlines>>,
     /// 慢/不可达连接丢弃的 bar 帧总数（观测）。
@@ -351,6 +527,8 @@ pub struct KlineService {
     guards: Mutex<Vec<SubscriptionGuard>>,
     /// 后台 CSV 刷盘线程句柄（start 后才有）；优雅停机 join 以保证最后一刷落盘。
     flush_task: Mutex<Option<thread::JoinHandle<()>>>,
+    /// 后台批量推送线程句柄（start 后才有）；优雅停机 join 以保证最后一拍缓冲推出。
+    push_task: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl KlineService {
@@ -367,25 +545,26 @@ impl KlineService {
             ticks: store.ctp_ticks(),
             repo: store.kline_repo(),
             pusher,
+            batcher: KlineBatcher::default(),
             baselines: Arc::new(baselines),
             dropped: Arc::new(AtomicU64::new(0)),
             guards: Mutex::new(Vec::new()),
             flush_task: Mutex::new(None),
+            push_task: Mutex::new(None),
         }
     }
 
-    /// 优雅停机：等后台刷盘线程退出（其退出前已做最后一次 flush_once）。
+    /// 优雅停机：等后台刷盘线程与批量推送线程退出（刷盘线程退出前已做最后一次
+    /// flush_once；推送线程退出前已做最后一拍 drain）。
     ///
-    /// 必须在置位停机标志**之后**调用；调用方据此获得「bar 已从内存窗口刷入 CSV」
-    /// 的 happens-before 保证（join 返回 ⇒ 线程最后一刷已完成）。未 start 或重复
-    /// 调用均安全（句柄只 take/join 一次），返回 Err 仅表示线程曾 panic（已记录）。
+    /// 必须在置位停机标志**之后**调用；调用方据此获得「bar 已从内存窗口刷入 CSV、
+    /// 缓冲内最后一批 bar 已尽力推送」的 happens-before 保证。未 start 或重复调用均
+    /// 安全（句柄只 take/join 一次）；返回 Err 仅表示某线程曾 panic（已记录）。
     pub fn join_flush(&self) -> thread::Result<()> {
-        // 先 take 释放锁再 join，不持锁等待线程。
-        let task = self.flush_task.lock().unwrap().take();
-        match task {
-            Some(handle) => handle.join(),
-            None => Ok(()),
-        }
+        // 逐个 take 释放锁再 join，不持锁等待线程。
+        // 先 join 推送线程：保证停机前入缓冲的最后一批 bar 已发出，再收口刷盘线程。
+        join_take(&self.push_task)?;
+        join_take(&self.flush_task)
     }
 
     /// 某 venue 的标的类别（deribit=option，其余本期=futures；未知默认 futures）。
@@ -437,8 +616,7 @@ impl KlineService {
     fn fanout_sink_inner(&self) -> FanoutBarSink {
         FanoutBarSink {
             registry: Arc::clone(&self.registry),
-            pusher: Arc::clone(&self.pusher),
-            dropped: Arc::clone(&self.dropped),
+            batcher: self.batcher.clone(),
         }
     }
 
@@ -512,6 +690,33 @@ impl KlineService {
         self.guards.lock().unwrap().len()
     }
 
+    /// 把已关桶成帧组逐帧发送：每个 (strategy, venue, 分钟) 只调一次
+    /// [`KlinePusher::push`]（同所同分钟多标的＝一条消息）；pusher 返 false（连接不可达/
+    /// 在途满）则该帧丢弃并计入 dropped，不阻塞、不重试。
+    fn send_frames(&self, frames: Vec<(String, String, Vec<KlineEvent>)>) {
+        for (strategy, venue, events) in frames {
+            if events.is_empty() {
+                continue;
+            }
+            let frame = ClientEvent::kline_1m_batch(venue, events);
+            if !self.pusher.push(&strategy, frame) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// 推送线程每拍：关闭超龄分钟桶、取走水位线已关帧并发送。
+    fn poll_push(&self) {
+        let frames = self.batcher.poll();
+        self.send_frames(frames);
+    }
+
+    /// 停机兜底：关闭全部在途分钟桶并尽力发送（断连/在途满的帧计入 dropped，不阻塞停机）。
+    fn flush_remaining_push(&self) {
+        let frames = self.batcher.flush_all();
+        self.send_frames(frames);
+    }
+
     /// 立即各刷一批 bar/tick 到 CSV（同步；测试与停机兜底用）。
     /// IO 失败时 KlineRepo 已把整批放回窗口队首下轮重试（不丢数据，可能重复），
     /// 这里仅记日志、该类计数按 0 处理，绝不向 flush 线程传播 panic。
@@ -564,7 +769,32 @@ impl KlineService {
                 ),
             }
         }
-        self.spawn_flush(flush_interval, stop);
+        self.spawn_flush(flush_interval, Arc::clone(&stop));
+        self.spawn_push_ticker(stop);
+    }
+
+    /// 独立 OS 线程按 200ms 拍轮询：关闭超龄分钟桶并把已关帧发出（同步 `pusher.push`
+    /// 只做闸门+spawn，不进 tokio worker）。分钟桶通常由「更晚分钟 bar」的水位线在
+    /// 到达后下一拍即发出；停机被打断后 flush 全部在途桶，尽力推出缓冲内剩余 bar。
+    fn spawn_push_ticker(self: &Arc<Self>, stop: Arc<AtomicBool>) {
+        let me = Arc::clone(self);
+        let handle = thread::Builder::new()
+            .name("kline-push".into())
+            .spawn(move || {
+                loop {
+                    interruptible_sleep(KLINE_PUSH_TICK_INTERVAL, &stop);
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    me.poll_push();
+                }
+                // 停机兜底：关闭全部在途分钟桶并尽力推出（断连/在途满的帧按 pusher
+                // 返回值计入 dropped，不阻塞停机、不重试）。
+                me.flush_remaining_push();
+            })
+            // 与刷盘线程同口径：启动期 spawn 失败直接 fail-fast，避免静默不推送。
+            .expect("启动 kline-push 线程失败");
+        *self.push_task.lock().unwrap() = Some(handle);
     }
 
     /// 独立 OS 线程定时刷盘（同步 IO 不进 tokio worker）；停机被打断后最后再刷一次。
@@ -591,7 +821,7 @@ impl KlineService {
                     // 慢/断连接推送丢弃计数：有积压才报，便于发现南向推送异常。
                     let dropped = me.dropped.swap(0, Ordering::Relaxed);
                     if dropped > 0 {
-                        tracing::warn!(dropped, "kline_1m 推送丢弃（连接不可达/在途积压）");
+                        tracing::warn!(dropped, "kline_1m_batch 推送丢弃（连接不可达/在途积压）");
                     }
                     // 刷盘窗口背压丢弃（flush 持续失败致 BarTable 积压超上限）。
                     let bar_dropped = me.bars.take_dropped();
@@ -625,6 +855,15 @@ impl KlineService {
             .expect("启动 kline-flush 线程失败");
         // 留存句柄供优雅停机 join（保证最后一刷落盘后进程才退出）。
         *self.flush_task.lock().unwrap() = Some(handle);
+    }
+}
+
+/// take 出可选线程句柄并 join：先释放锁再等待，句柄为 None（未 start/已 join）安全空转；
+/// 线程曾 panic 时向上传播 [`thread::Result`] 错误。
+fn join_take(slot: &Mutex<Option<thread::JoinHandle<()>>>) -> thread::Result<()> {
+    match slot.lock().unwrap().take() {
+        Some(handle) => handle.join(),
+        None => Ok(()),
     }
 }
 
@@ -676,20 +915,29 @@ mod tests {
         Arc::new(store)
     }
 
-    /// 记录推送、可模拟失败的假推送端口。
+    /// 记录推送、可模拟失败的假推送端口。每次 push 记录 (strategy, kind, 帧内 symbols)；
+    /// 批量帧 symbols 来自 klines 数组（已排序），非批量帧为空。
     #[derive(Default)]
     struct RecPusher {
-        sent: Mutex<Vec<(String, String, String)>>,
+        sent: Mutex<Vec<(String, String, Vec<String>)>>,
         fail: Mutex<std::collections::HashSet<String>>,
     }
     impl RecPusher {
-        fn events(&self, strategy: &str) -> Vec<(String, String)> {
+        /// 某策略收到的 (帧类型, 帧内标的列表)，按推送顺序。
+        fn frames(&self, strategy: &str) -> Vec<(String, Vec<String>)> {
             self.sent
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|(s, _, _)| s == strategy)
-                .map(|(_, kind, sym)| (kind.clone(), sym.clone()))
+                .map(|(_, kind, syms)| (kind.clone(), syms.clone()))
+                .collect()
+        }
+        /// 某策略在所有批量帧里收到的标的（按推送/帧内顺序摊平）。
+        fn symbols(&self, strategy: &str) -> Vec<String> {
+            self.frames(strategy)
+                .into_iter()
+                .flat_map(|(_, syms)| syms)
                 .collect()
         }
         fn total(&self) -> usize {
@@ -704,17 +952,165 @@ mod tests {
             if self.fail.lock().unwrap().contains(strategy) {
                 return false;
             }
-            let sym = event
-                .kline
-                .as_ref()
+            let syms = event
+                .klines
+                .unwrap_or_default()
+                .iter()
                 .map(|k| k.symbol.clone())
-                .unwrap_or_default();
+                .collect();
             self.sent
                 .lock()
                 .unwrap()
-                .push((strategy.to_string(), event.kind.clone(), sym));
+                .push((strategy.to_string(), event.kind.clone(), syms));
             true
         }
+    }
+
+    /// 把测试 StreamKline 转成南向载荷（batcher 收的元素）。
+    fn event(venue: &str, symbol: &str, start: i64) -> KlineEvent {
+        kline_event(&kline(venue, symbol, 20261027, start))
+    }
+
+    /// 取一帧的 (strategy, venue, [symbol])，便于断言。
+    fn frame_triple(f: &(String, String, Vec<KlineEvent>)) -> (&str, &str, Vec<&str>) {
+        (
+            f.0.as_str(),
+            f.1.as_str(),
+            f.2.iter().map(|k| k.symbol.as_str()).collect(),
+        )
+    }
+
+    #[test]
+    fn batcher_coalesces_same_minute_symbols_until_next_minute_watermark() {
+        // 关键需求：同分钟多标的即便 ~880ms 后才到齐，也必须在关桶前并入同一帧；
+        // 直到「同 strategy+venue 的更晚分钟 bar」到达（有序水位线）才关桶。
+        let mut core = BatcherCore::new(1_000_000); // 极大超时：本用例只靠水位线关桶
+                                                    // 分钟 60000：ETH 先到、BTC 在 880ms 后到（乱序、跨接近 1s）。
+        core.push(
+            1_000,
+            "alpha",
+            "binance",
+            event("binance", "ETHUSDT", 60_000),
+        );
+        core.push(
+            1_880,
+            "alpha",
+            "binance",
+            event("binance", "BTCUSDT", 60_000),
+        );
+        // 未到更晚分钟、也未超时 → 不出帧，两标的都还在桶内。
+        assert!(core.poll(5_000).is_empty());
+
+        // 分钟 120000 的首根 bar 到达 → 水位线关闭分钟 60000 桶。
+        core.push(
+            62_000,
+            "alpha",
+            "binance",
+            event("binance", "BTCUSDT", 120_000),
+        );
+        let frames = core.poll(62_000);
+        assert_eq!(frames.len(), 1);
+        // 一帧含两标的、按 symbol 排序；新分钟桶仍在途，不被本轮带出。
+        assert_eq!(
+            frame_triple(&frames[0]),
+            ("alpha", "binance", vec!["BTCUSDT", "ETHUSDT"])
+        );
+        assert!(frames[0].2.iter().all(|k| k.start_time == 60_000));
+        // 已取走的帧下轮不重复；新分钟桶未关仍不出。
+        assert!(core.poll(62_100).is_empty());
+    }
+
+    #[test]
+    fn batcher_closes_idle_bucket_by_safety_timeout() {
+        // 没有更晚分钟 bar 驱动水位线时（该所这一分钟后无新定稿），桶到安全超时关闭。
+        let mut core = BatcherCore::new(8_000);
+        core.push(0, "alpha", "binance", event("binance", "BTCUSDT", 60_000));
+        assert!(core.poll(7_999).is_empty());
+        let frames = core.poll(8_000);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frame_triple(&frames[0]),
+            ("alpha", "binance", vec!["BTCUSDT"])
+        );
+        // 取空后不重复。
+        assert!(core.poll(9_000).is_empty());
+    }
+
+    #[test]
+    fn batcher_watermark_is_scoped_per_strategy_and_venue() {
+        // 别的 strategy 或别的 venue 的更晚分钟 bar，不得关闭本 (strategy,venue) 的桶。
+        let mut core = BatcherCore::new(1_000_000);
+        core.push(0, "alpha", "binance", event("binance", "BTCUSDT", 60_000));
+        // beta/binance 与 alpha/ctp 进到更晚分钟：都不应触发 alpha/binance 的水位线。
+        core.push(0, "beta", "binance", event("binance", "BTCUSDT", 120_000));
+        core.push(0, "alpha", "ctp", event("ctp", "cu2512", 120_000));
+        assert!(core.poll(0).is_empty());
+
+        // 只有 alpha/binance 自己的更晚分钟 bar 才关它的 60000 桶。
+        core.push(1, "alpha", "binance", event("binance", "BTCUSDT", 120_000));
+        let frames = core.poll(1);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frame_triple(&frames[0]),
+            ("alpha", "binance", vec!["BTCUSDT"])
+        );
+    }
+
+    #[test]
+    fn batcher_separates_frames_by_strategy_venue_and_minute() {
+        // strategy × venue × 分钟 三元组各自独立成帧，绝不串帧。
+        let mut core = BatcherCore::new(1_000_000);
+        core.push(0, "alpha", "binance", event("binance", "BTCUSDT", 60_000));
+        core.push(0, "alpha", "binance", event("binance", "BTCUSDT", 120_000));
+        core.push(0, "alpha", "ctp", event("ctp", "cu2512", 60_000));
+        core.push(0, "beta", "binance", event("binance", "ETHUSDT", 60_000));
+
+        // flush_all 一次关闭全部在途桶；BTreeMap 键序确定。
+        let frames = core.flush_all();
+        let got: Vec<(&str, &str, i64, Vec<&str>)> = frames
+            .iter()
+            .map(|(s, v, ks)| {
+                (
+                    s.as_str(),
+                    v.as_str(),
+                    ks[0].start_time,
+                    ks.iter().map(|k| k.symbol.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("alpha", "binance", 60_000, vec!["BTCUSDT"]),
+                ("alpha", "binance", 120_000, vec!["BTCUSDT"]),
+                ("alpha", "ctp", 60_000, vec!["cu2512"]),
+                ("beta", "binance", 60_000, vec!["ETHUSDT"]),
+            ]
+        );
+        // 已全部取空。
+        assert!(core.flush_all().is_empty());
+    }
+
+    #[test]
+    fn batcher_empty_poll_and_flush_yield_no_frames() {
+        let mut core = BatcherCore::new(8_000);
+        assert!(core.poll(0).is_empty());
+        assert!(core.flush_all().is_empty());
+    }
+
+    #[test]
+    fn kline_batcher_handle_is_shareable_across_clones() {
+        // KlineBatcher(Arc<Mutex<_>>) 的 clone 共享同一内核：一个句柄 push，另一个可见；
+        // flush_all 关闭在途桶（不依赖墙钟超时），跨 clone 一致取空。
+        let batcher = KlineBatcher::default();
+        let other = batcher.clone();
+        other.push("alpha", "binance", event("binance", "BTCUSDT", 60_000));
+
+        let frames = batcher.flush_all();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].2[0].symbol, "BTCUSDT");
+        // flush 后两个句柄看到的都是空。
+        assert!(other.flush_all().is_empty());
     }
 
     #[test]
@@ -1062,21 +1458,27 @@ mod tests {
         service.subscribe("product", "ctp", &["cu".to_string()]);
         service.subscribe("other", "ctp", &["rb2611".to_string()]);
 
-        // 推送 sink 只 fan-out，绝不写 BarTable（落盘是另一个无条件 sink 的职责）。
+        // 推送 sink 只把 bar 入分钟桶，绝不写 BarTable（落盘是另一个无条件 sink 的职责）。
         service
             .push_sink()
             .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
+        // on_bar 不同步发送：同所更晚分钟 bar 形成水位线，下一拍 poll 才关桶出帧。
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 120_000));
+        service.poll_push();
 
-        // 两个命中者各收到一帧 kline_1m；无关品种不收。
+        // 两个命中者各收到分钟 60000 的一帧 kline_1m_batch；无关品种不收。
+        // 分钟 120000 桶仍在途（未关），本轮不产生第二帧。
         assert_eq!(
-            pusher.events("direct"),
-            vec![("kline_1m".to_string(), "cu2512".to_string())]
+            pusher.frames("direct"),
+            vec![("kline_1m_batch".to_string(), vec!["cu2512".to_string()])]
         );
         assert_eq!(
-            pusher.events("product"),
-            vec![("kline_1m".to_string(), "cu2512".to_string())]
+            pusher.frames("product"),
+            vec![("kline_1m_batch".to_string(), vec!["cu2512".to_string()])]
         );
-        assert!(pusher.events("other").is_empty());
+        assert!(pusher.frames("other").is_empty());
         // 推送 sink 不碰待刷盘窗口。
         assert_eq!(store.bar_table().len(), 0);
         assert_eq!(service.dropped_count(), 0);
@@ -1093,10 +1495,17 @@ mod tests {
         service
             .push_sink()
             .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
+        // 更晚分钟 bar 形成水位线关桶，下一拍 poll 才真正发送：死连接的帧被丢、活连接照常。
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 120_000));
+        service.poll_push();
 
-        // 死连接丢一帧计数 1，但不影响活连接；推送 sink 不落盘。
+        // 死连接的分钟 60000 帧丢一帧计数 1，但不影响活连接；推送 sink 不落盘。
+        // （分钟 120000 桶仍在途，dead 的那一帧尚未发出，故不计入本轮丢弃。）
         assert_eq!(service.dropped_count(), 1);
         assert_eq!(pusher.total(), 1);
+        assert_eq!(pusher.symbols("alive"), vec!["cu2512".to_string()]);
         assert_eq!(store.bar_table().len(), 0);
     }
 
@@ -1111,11 +1520,16 @@ mod tests {
         service
             .push_sink()
             .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
+        // 更晚分钟 bar 关桶后 poll。
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 120_000));
+        service.poll_push();
 
-        // 订阅者照常收到推送。
+        // 订阅者照常收到分钟 60000 的一个批量帧（帧内含该标的）。
         assert_eq!(
-            pusher.events("direct"),
-            vec![("kline_1m".to_string(), "cu2512".to_string())]
+            pusher.frames("direct"),
+            vec![("kline_1m_batch".to_string(), vec!["cu2512".to_string()])]
         );
         // 但 BarTable 不被 push sink 写入。
         assert_eq!(store.bar_table().len(), 0);
@@ -1210,10 +1624,146 @@ mod tests {
         // deribit 走期权类别；构造 helper 默认即可，venue/symbol 已对。
         bar.interval = KlineInterval::M1;
         service.push_sink().on_bar(&bar);
+        // 无更晚分钟 bar 驱动水位线：停机 flush 关闭在途桶后出帧。
+        service.flush_remaining_push();
 
         assert_eq!(
-            pusher.events("opt"),
-            vec![("kline_1m".to_string(), "ETH-18SEP26-2550-P".to_string())]
+            pusher.frames("opt"),
+            vec![(
+                "kline_1m_batch".to_string(),
+                vec!["ETH-18SEP26-2550-P".to_string()]
+            )]
         );
+    }
+
+    #[test]
+    fn push_ticker_emits_on_watermark_and_flushes_remaining_on_shutdown() {
+        use std::sync::atomic::AtomicBool;
+        let store = test_store();
+        let (service, pusher) = svc(store.clone());
+        // alpha 订 binance 两标的；beta 订 ctp 一标的（不同所/策略不串帧）。
+        service.subscribe(
+            "alpha",
+            "binance",
+            &["BTCUSDT".to_string(), "ETHUSDT".to_string()],
+        );
+        service.subscribe("beta", "ctp", &["cu2512".to_string()]);
+        let stop = Arc::new(AtomicBool::new(false));
+        service.spawn_push_ticker(Arc::clone(&stop));
+
+        // 分钟 60000：alpha 同所两标的（乱序、模拟 ~880ms 散布）+ beta 一所一标的。
+        service
+            .push_sink()
+            .on_bar(&kline("binance", "ETHUSDT", 20261027, 60_000));
+        service
+            .push_sink()
+            .on_bar(&kline("binance", "BTCUSDT", 20261027, 60_000));
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261027, 60_000));
+
+        // 各 (strategy,venue) 再来一根更晚分钟 bar → 有序水位线把分钟 60000 桶关闭，
+        // 后台线程下一拍（≤200ms）发出：alpha 1 帧含两标的、beta 1 帧含一标的。
+        service
+            .push_sink()
+            .on_bar(&kline("binance", "BTCUSDT", 20261027, 120_000));
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261027, 120_000));
+
+        // 轮询等待后台线程拍出（≤约 1s）。
+        let mut deadline = 0u32;
+        while pusher.total() < 2 && deadline < 50 {
+            thread::sleep(Duration::from_millis(20));
+            deadline += 1;
+        }
+        assert_eq!(
+            pusher.frames("alpha"),
+            vec![(
+                "kline_1m_batch".to_string(),
+                vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()]
+            )]
+        );
+        assert_eq!(
+            pusher.frames("beta"),
+            vec![("kline_1m_batch".to_string(), vec!["cu2512".to_string()])]
+        );
+
+        // 置 stop + join：停机 flush 关闭分钟 120000 在途桶，最后缓冲也必须推出（不漏不重）。
+        stop.store(true, Ordering::SeqCst);
+        assert!(service.join_flush().is_ok());
+
+        // alpha 现有 2 帧：首帧（分钟60000）两标的，停机收尾帧（分钟120000）单标的。
+        assert_eq!(
+            pusher.frames("alpha"),
+            vec![
+                (
+                    "kline_1m_batch".to_string(),
+                    vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()]
+                ),
+                ("kline_1m_batch".to_string(), vec!["BTCUSDT".to_string()]),
+            ]
+        );
+        // beta 分钟60000/120000 各一帧（cu2512），与 binance 帧互不影响。
+        assert_eq!(
+            pusher.frames("beta"),
+            vec![
+                ("kline_1m_batch".to_string(), vec!["cu2512".to_string()]),
+                ("kline_1m_batch".to_string(), vec!["cu2512".to_string()]),
+            ]
+        );
+        assert_eq!(pusher.total(), 4);
+        // 缓冲已空：join 后再 poll/flush 无新增。
+        service.poll_push();
+        assert_eq!(pusher.total(), 4);
+        // 再次 join 安全（push/flush 句柄都只 join 一次）。
+        assert!(service.join_flush().is_ok());
+    }
+
+    #[test]
+    fn multi_symbol_same_minute_collapses_into_one_batch_frame_per_strategy() {
+        // 核心需求：同所同分钟多标的即便散布到齐，关桶前也并入**同一帧**；每策略 1 条。
+        let store = test_store();
+        let (service, pusher) = svc(store.clone());
+        // 两个策略都订阅 BTC/ETH（具体合约）。
+        for who in ["alpha", "beta"] {
+            service.subscribe(
+                who,
+                "binance",
+                &["BTCUSDT".to_string(), "ETHUSDT".to_string()],
+            );
+        }
+        // 无关策略只订别的所，不应收到 binance 帧。
+        service.subscribe("gamma", "ctp", &["cu2512".to_string()]);
+
+        // 同分钟（60000）乱序定稿两根 binance bar（模拟相邻 dispatch、~880ms 散布）。
+        service
+            .push_sink()
+            .on_bar(&kline("binance", "ETHUSDT", 20261027, 60_000));
+        service
+            .push_sink()
+            .on_bar(&kline("binance", "BTCUSDT", 20261027, 60_000));
+        // 关桶前：on_bar 只入分钟桶，零发送。
+        assert_eq!(pusher.total(), 0);
+
+        // 更晚分钟 bar 形成水位线关闭分钟 60000 桶，下一拍 poll 出帧。
+        service
+            .push_sink()
+            .on_bar(&kline("binance", "BTCUSDT", 20261027, 120_000));
+        service.poll_push();
+
+        // 每个命中策略恰好 1 帧，帧内两标的按 symbol 排序。
+        let expected = vec![(
+            "kline_1m_batch".to_string(),
+            vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()],
+        )];
+        assert_eq!(pusher.frames("alpha"), expected);
+        assert_eq!(pusher.frames("beta"), expected);
+        assert!(pusher.frames("gamma").is_empty());
+        assert_eq!(pusher.total(), 2);
+        // 分钟 120000 桶仍在途且远未到 8s 超时：再 poll 无新增（不重复、不早发）。
+        service.poll_push();
+        assert_eq!(pusher.total(), 2);
+        assert_eq!(service.dropped_count(), 0);
     }
 }
