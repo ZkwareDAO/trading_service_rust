@@ -445,6 +445,7 @@ fn run_md_session(
                             {
                                 let candle = crate::ctp::bar_agg::to_candle_tick(
                                     day,
+                                    t.exchange_id.clone(),
                                     update_ms,
                                     price,
                                     t.volume as i64,
@@ -577,6 +578,7 @@ mod tests {
         let zero = || QuoteLevel::new(0.0, 0);
         TickSnapshot {
             instrument: "rb2510".into(),
+            exchange_id: "SHFE".into(),
             last_price: 3205.0,
             bids: [lvl(bid, 10), zero(), zero(), zero(), zero()],
             asks: [lvl(ask, 5), zero(), zero(), zero(), zero()],

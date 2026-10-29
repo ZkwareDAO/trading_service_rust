@@ -29,6 +29,7 @@ fn depth_to_snapshot(d: &Depth) -> TickSnapshot {
     let lvl = |price: f64, volume: i32| QuoteLevel::new(norm_price(price), volume);
     TickSnapshot {
         instrument: decode_fixed(&d.InstrumentID),
+        exchange_id: decode_fixed(&d.ExchangeID),
         last_price: norm_price(d.LastPrice),
         bids: [
             lvl(d.BidPrice1, d.BidVolume1),
@@ -337,6 +338,7 @@ mod tests {
     fn depth_to_snapshot_carries_daily_ohlc_and_five_levels() {
         let mut d = Depth::default();
         encode(&mut d.InstrumentID, "cu2512");
+        encode(&mut d.ExchangeID, "SHFE");
         encode(&mut d.TradingDay, "20261027");
         encode(&mut d.ActionDay, "20261027");
         encode(&mut d.UpdateTime, "09:46:05");
@@ -379,6 +381,7 @@ mod tests {
         let s = super::depth_to_snapshot(&d);
 
         assert_eq!(s.instrument, "cu2512");
+        assert_eq!(s.exchange_id, "SHFE");
         assert_eq!(s.trading_day, "20261027");
         assert_eq!(s.action_day, "20261027");
         assert_eq!(s.update_time, "09:46:05");

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use store_core::persistence::sanitize_dir_name;
 use trading_core::kline::{BarTable, TickTable};
-use trading_models::{Bar, RawTick, BAR_CSV_HEADER, RAW_TICK_CSV_HEADER};
+use trading_models::{bar_csv_header, Bar, RawTick, RAW_TICK_CSV_HEADER};
 
 /// 本期唯一周期对应的目录段（Bar 行不携带 interval，固定 1m）。
 const M1_DIR: &str = "1m";
@@ -80,17 +80,33 @@ impl KlineRepo {
 
     /// 批量落盘定稿 bar：drain 待写窗口，按 venue/周期/交易日/合约分组追加，
     /// 写成功后窗口已空。空表直接返回不落任何文件。
+    ///
+    /// 表头按 **venue 动态**生成（公共列 + 该所 extras 列）；同一目标文件的 venue 恒定，
+    /// 故分组内表头一致。
     pub fn flush_bars(&self, table: &BarTable) -> std::io::Result<FlushReport> {
-        self.flush_window(table, BAR_CSV_HEADER, bar_target, encode_bar)
+        self.flush_window(
+            table,
+            |b| bar_csv_header(&b.exchange),
+            bar_target,
+            encode_bar,
+        )
     }
 
     /// 批量落盘原始 tick：drain WAL 窗口，按 venue/tick/交易日/合约分组追加。
     /// 失败语义同 [`Self::flush_bars`]。
     pub fn flush_ticks(&self, table: &TickTable) -> std::io::Result<FlushReport> {
-        self.flush_window(table, RAW_TICK_CSV_HEADER, tick_target, encode_tick)
+        self.flush_window(
+            table,
+            |_| RAW_TICK_CSV_HEADER.to_string(),
+            tick_target,
+            encode_tick,
+        )
     }
 
     /// 通用「drain 窗口 → 按目标文件分组编码 → 逐文件 append（新文件写表头）」。
+    ///
+    /// `header_of` 给每个目标文件的表头（bar 按 venue 动态、tick 固定）；同一分组内
+    /// venue 恒定，故取组内首行即可。
     ///
     /// 失败语义（at-least-once）：先完成全部序列化再逐文件追加；若中途 IO 失败，
     /// 整批放回窗口队首下轮重试——已写出的文件可能在重试时重复追加该批，
@@ -98,7 +114,7 @@ impl KlineRepo {
     fn flush_window<T>(
         &self,
         window: &dyn BatchWindow<T>,
-        header: &str,
+        header_of: impl Fn(&T) -> String,
         target: impl Fn(&T) -> CsvTarget,
         encode_row: impl Fn(&T) -> std::io::Result<Vec<u8>>,
     ) -> std::io::Result<FlushReport> {
@@ -112,16 +128,18 @@ impl KlineRepo {
             groups.entry(target(row)).or_default().push(row);
         }
         // 先在内存编码全部批次（编码失败时尚未触碰任何文件）。
-        let mut encoded: Vec<(CsvTarget, Vec<u8>)> = Vec::new();
+        let mut encoded: Vec<(CsvTarget, String, Vec<u8>)> = Vec::new();
         for (key, batch) in groups {
+            // 同组 venue 恒定 → 表头取首行；理论上 batch 非空（分组即有行）。
+            let header = header_of(batch[0]);
             let mut buf = Vec::new();
             for row in batch {
                 buf.extend_from_slice(&encode_row(row)?);
             }
-            encoded.push((key, buf));
+            encoded.push((key, header, buf));
         }
         // 逐文件追加；任一失败把整批放回窗口队首。
-        if let Err(err) = self.append_encoded(&encoded, header) {
+        if let Err(err) = self.append_encoded(&encoded) {
             window.requeue_front(rows);
             return Err(err);
         }
@@ -131,13 +149,9 @@ impl KlineRepo {
         })
     }
 
-    /// 把已编码的各分组按路径追加（新文件先写表头）。
-    fn append_encoded(
-        &self,
-        encoded: &[(CsvTarget, Vec<u8>)],
-        header: &str,
-    ) -> std::io::Result<()> {
-        for (t, buf) in encoded {
+    /// 把已编码的各分组按路径追加（新文件先写该组表头）。
+    fn append_encoded(&self, encoded: &[(CsvTarget, String, Vec<u8>)]) -> std::io::Result<()> {
+        for (t, header, buf) in encoded {
             let path = self.csv_path(&t.venue, &t.interval, t.trading_day, &t.symbol);
             append_with_header(&path, header, buf)?;
         }
@@ -176,14 +190,15 @@ fn tick_target(tick: &RawTick) -> CsvTarget {
     }
 }
 
-/// 单行 bar 编码为无表头 CSV 字节（含换行）。
+/// 单行 bar 编码为无表头 CSV 字节（公共列 + 本所 extras 列，含换行）。
 fn encode_bar(bar: &Bar) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     {
         let mut wtr = csv::WriterBuilder::new()
             .has_headers(false)
             .from_writer(&mut buf);
-        wtr.serialize(bar)?;
+        // Bar 携带按 venue 动态的 extras，不能用 serde 固定字段序，改为手动按列拍平。
+        wtr.write_record(bar.to_record())?;
         wtr.flush()?;
     }
     Ok(buf)
@@ -231,14 +246,19 @@ mod tests {
     }
 
     fn bar(symbol: &str, day: u32, start: i64, vol: i64) -> Bar {
+        use trading_models::KlineExtra;
         let mut b = Bar::new("ctp", symbol, day, start, start + 60_000);
         b.open = d("75000");
         b.close = d("75100");
         b.high = d("75200");
         b.low = d("74950");
         b.volume = vol;
-        b.turnover = d("9000000");
-        b.open_interest = d("120000");
+        b.quote_volume = d("9000000");
+        // CTP 专有指标：真实交易所代码 + 周期末持仓量（extras 追加在公共列后）。
+        b.extras
+            .insert("exchange_id".into(), KlineExtra::Str("SHFE".into()));
+        b.extras
+            .insert("open_interest".into(), KlineExtra::Num(d("120000")));
         b
     }
 
@@ -249,6 +269,7 @@ mod tests {
     fn tick(symbol: &str, day: u32, ts: i64, vol: i64) -> RawTick {
         RawTick {
             exchange: "ctp".into(),
+            exchange_id: "SHFE".into(),
             symbol: symbol.into(),
             timestamp: ts,
             trading_day: day,
@@ -258,7 +279,7 @@ mod tests {
             low: zero(),
             close: zero(),
             volume: vol,
-            turnover: d("8000000"),
+            quote_volume: d("8000000"),
             open_interest: d("120000"),
             bid: [d("75090"), zero(), zero(), zero(), zero()],
             ask: [d("75110"), zero(), zero(), zero(), zero()],
@@ -295,10 +316,11 @@ mod tests {
         assert_eq!(report.rows, 2);
         let lines = read_lines(&path);
         assert_eq!(lines.len(), 3); // 表头 + 2 行
-        assert_eq!(lines[0], trading_models::BAR_CSV_HEADER);
+        assert_eq!(lines[0], trading_models::bar_csv_header("ctp"));
+        // 11 公共列 + CTP extras（exchange_id,open_interest 追加末尾）。
         assert_eq!(
             lines[1],
-            "ctp,cu2512,20261024,75000,75200,74950,75100,10,9000000,120000,60000,120000"
+            "ctp,cu2512,20261024,75000,75200,74950,75100,10,9000000,60000,120000,SHFE,120000"
         );
         // flush 后待写窗口清空。
         assert!(table.is_empty());
@@ -309,7 +331,7 @@ mod tests {
         assert_eq!(report2.rows, 1);
         let lines2 = read_lines(&path);
         assert_eq!(lines2.len(), 4); // 表头仍只一行
-        assert_eq!(lines2[0], trading_models::BAR_CSV_HEADER);
+        assert_eq!(lines2[0], trading_models::bar_csv_header("ctp"));
         assert!(lines2[3].starts_with("ctp,cu2512,20261024,"));
     }
 
@@ -330,7 +352,7 @@ mod tests {
 
         // Assert：首行必须是表头（不得因文件 exists 而漏写）。
         let lines = read_lines(&path);
-        assert_eq!(lines[0], trading_models::BAR_CSV_HEADER);
+        assert_eq!(lines[0], trading_models::bar_csv_header("ctp"));
         assert_eq!(lines.len(), 2);
     }
 
@@ -361,7 +383,54 @@ mod tests {
     }
 
     #[test]
-    fn flush_ticks_writes_32_columns_and_round_trips() {
+    fn flush_bars_writes_binance_extra_columns_and_round_trips_by_header() {
+        use trading_models::KlineExtra;
+        // Arrange：一根 binance bar（3 个 extras），落到 binance/1m 文件。
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new(dir.path().to_path_buf());
+        let mut b = Bar::new("binance", "BTCUSDT", 20261028, 0, 60_000);
+        b.close = d("108");
+        b.volume = 4;
+        b.quote_volume = d("432");
+        b.extras.insert("trade_num".into(), KlineExtra::Int(1280));
+        b.extras
+            .insert("active_buy_volume".into(), KlineExtra::Num(d("2.5")));
+        b.extras
+            .insert("active_buy_quote_volume".into(), KlineExtra::Num(d("270")));
+        let table = BarTable::new();
+        table.push(b);
+
+        // Act：flush 后按列名读回。
+        repo.flush_bars(&table).unwrap();
+        let path = dir.path().join("kline/binance/1m/20261028/BTCUSDT.csv");
+        let lines = read_lines(&path);
+        assert_eq!(lines[0], trading_models::bar_csv_header("binance"));
+        assert_eq!(
+            lines[1],
+            "binance,BTCUSDT,20261028,0,0,0,108,4,432,0,60000,1280,2.5,270"
+        );
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_path(&path)
+            .unwrap();
+        let header: Vec<String> = rdr.headers().unwrap().iter().map(str::to_string).collect();
+        let hdr: Vec<&str> = header.iter().map(String::as_str).collect();
+        let rec = rdr.records().next().unwrap().unwrap();
+        let fields: Vec<String> = rec.iter().map(str::to_string).collect();
+        let back = Bar::from_record(&hdr, &fields).unwrap();
+        assert_eq!(back.quote_volume, d("432"));
+        assert_eq!(back.extras.get("trade_num"), Some(&KlineExtra::Int(1280)));
+        assert_eq!(
+            back.extras
+                .get("active_buy_quote_volume")
+                .and_then(|v| v.as_decimal()),
+            Some(d("270"))
+        );
+        assert!(!back.extras.contains_key("open_interest"));
+    }
+
+    #[test]
+    fn flush_ticks_writes_33_columns_and_round_trips() {
         let dir = tempdir().unwrap();
         let repo = KlineRepo::new(dir.path().to_path_buf());
         let table = TickTable::new();

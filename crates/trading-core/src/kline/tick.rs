@@ -105,6 +105,7 @@ mod tests {
     fn tick(symbol: &str, ts: i64, vol: i64) -> RawTick {
         RawTick {
             exchange: "ctp".into(),
+            exchange_id: "SHFE".into(),
             symbol: symbol.into(),
             timestamp: ts,
             trading_day: 20261024,
@@ -114,7 +115,7 @@ mod tests {
             low: Decimal::ZERO,
             close: Decimal::ZERO,
             volume: vol,
-            turnover: Decimal::ZERO,
+            quote_volume: Decimal::ZERO,
             open_interest: Decimal::ZERO,
             bid: [Decimal::ZERO; 5],
             ask: [Decimal::ZERO; 5],

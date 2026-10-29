@@ -8,7 +8,7 @@
 //! 写价后回调 `QuoteObserver` 驱动仓位重估。频道/帧解析为纯函数。
 //! Hyperliquid 行情订阅与符号映射见本模块。
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -163,8 +163,9 @@ impl HlMarketFeed {
             low: c.low,
             close: c.close,
             volume: 0,
-            turnover: Decimal::ZERO,
-            open_interest: Decimal::ZERO,
+            quote_volume: Decimal::ZERO,
+            // hyperliquid 当前无 K线扩展指标。
+            extras: BTreeMap::new(),
         }
     }
 }

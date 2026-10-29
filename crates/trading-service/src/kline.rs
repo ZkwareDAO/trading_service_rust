@@ -128,6 +128,9 @@ fn venue_itype(venue: &str) -> InstrumentType {
 }
 
 /// 把交易所层定稿 [`StreamKline`] 映射为落盘行 [`Bar`]（字段一一搬运，不重算）。
+///
+/// 公共字段直搬；各所专有指标（CTP exchange_id/open_interest、币安 trade_num/…）
+/// 整包透传 [`Bar::extras`]，本映射 venue-neutral、不为具体所写特例。
 fn bar_from_kline(k: &StreamKline) -> Bar {
     Bar {
         exchange: k.venue.clone(),
@@ -138,14 +141,14 @@ fn bar_from_kline(k: &StreamKline) -> Bar {
         low: k.low,
         close: k.close,
         volume: k.volume,
-        turnover: k.turnover,
-        open_interest: k.open_interest,
+        quote_volume: k.quote_volume,
         start_time: k.start_ms,
         end_time: k.end_ms,
+        extras: k.extras.clone(),
     }
 }
 
-/// 把定稿 bar 映射为南向 `kline_1m` 载荷（不产出成交额/持仓的所给 None）。
+/// 把定稿 bar 映射为南向 `kline_1m` 载荷：公共字段直搬，extras flatten 平铺。
 fn kline_event(k: &StreamKline) -> KlineEvent {
     KlineEvent {
         venue: k.venue.clone(),
@@ -159,8 +162,8 @@ fn kline_event(k: &StreamKline) -> KlineEvent {
         low: k.low,
         close: k.close,
         volume: k.volume,
-        turnover: Some(k.turnover).filter(|d| *d != rust_decimal::Decimal::ZERO),
-        open_interest: Some(k.open_interest).filter(|d| *d != rust_decimal::Decimal::ZERO),
+        quote_volume: k.quote_volume,
+        extras: k.extras.clone(),
     }
 }
 
@@ -886,6 +889,18 @@ mod tests {
     use trading_exchange::market::KlineInterval;
 
     fn kline(venue: &str, symbol: &str, day: u32, start: i64) -> StreamKline {
+        // CTP bar 带本所 extras（真实交易所代码 + 周期末持仓量）；其余所 extras 为空。
+        let mut extras = BTreeMap::new();
+        if venue == "ctp" {
+            extras.insert(
+                "exchange_id".to_string(),
+                trading_models::KlineExtra::Str("SHFE".into()),
+            );
+            extras.insert(
+                "open_interest".to_string(),
+                trading_models::KlineExtra::Num(Decimal::from(100)),
+            );
+        }
         StreamKline {
             venue: venue.into(),
             symbol: symbol.into(),
@@ -898,8 +913,8 @@ mod tests {
             low: Decimal::from(9),
             close: Decimal::from(11),
             volume: 3,
-            turnover: Decimal::from(33),
-            open_interest: Decimal::from(100),
+            quote_volume: Decimal::from(33),
+            extras,
         }
     }
 
@@ -982,6 +997,28 @@ mod tests {
     }
 
     #[test]
+    fn kline_event_passes_through_quote_volume_and_venue_extras() {
+        // CTP bar：公共 quote_volume 直搬，extras 带真实交易所代码与持仓量。
+        let ctp = event("ctp", "cu2512", 60_000);
+        assert_eq!(ctp.quote_volume, Decimal::from(33));
+        assert_eq!(
+            ctp.extras.get("exchange_id"),
+            Some(&trading_models::KlineExtra::Str("SHFE".into()))
+        );
+        assert_eq!(
+            ctp.extras.get("open_interest").and_then(|v| v.as_decimal()),
+            Some(Decimal::from(100))
+        );
+
+        // 非 CTP bar（binance 测试夹具）：extras 为空，不含 CTP 专有键。
+        let bin = event("binance", "BTCUSDT", 60_000);
+        assert_eq!(bin.quote_volume, Decimal::from(33));
+        assert!(bin.extras.is_empty());
+        assert!(!bin.extras.contains_key("exchange_id"));
+        assert!(!bin.extras.contains_key("open_interest"));
+    }
+
+    #[test]
     fn batcher_coalesces_same_minute_symbols_until_next_minute_watermark() {
         // 关键需求：同分钟多标的即便 ~880ms 后才到齐，也必须在关桶前并入同一帧；
         // 直到「同 strategy+venue 的更晚分钟 bar」到达（有序水位线）才关桶。
@@ -1019,6 +1056,45 @@ mod tests {
         assert!(frames[0].2.iter().all(|k| k.start_time == 60_000));
         // 已取走的帧下轮不重复；新分钟桶未关仍不出。
         assert!(core.poll(62_100).is_empty());
+    }
+
+    #[test]
+    fn batcher_coalesces_multiple_ctp_products_into_one_batch_frame() {
+        // 真机场景：订阅纯品种 cu/rb，分钟边界把两个品种的当前主力
+        // （cu2701、rb2701）的定稿 bar 合进同一条 kline_1m_batch。
+        let mut core = BatcherCore::new(8_000);
+        core.push(0, "alpha", "ctp", event("ctp", "cu2701", 60_000));
+        core.push(880, "alpha", "ctp", event("ctp", "rb2701", 60_000));
+        // 未到安全超时：两品种都在同一桶内，不出帧。
+        assert!(core.poll(7_999).is_empty());
+
+        let frames = core.poll(8_000);
+        assert_eq!(frames.len(), 1, "两个品种必须合为一条帧");
+        let (strategy, venue, bars) = frame_triple(&frames[0]);
+        assert_eq!(strategy, "alpha");
+        assert_eq!(venue, "ctp");
+        // 同帧含两个品种、按 symbol 排序；分钟桶一致。
+        assert_eq!(bars, vec!["cu2701", "rb2701"]);
+        assert!(frames[0].2.iter().all(|k| k.start_time == 60_000));
+        // 每根都带 CTP 平铺 extras（exchange_id + open_interest），不串味成币安键。
+        for k in &frames[0].2 {
+            assert_eq!(
+                k.extras.get("exchange_id"),
+                Some(&trading_models::KlineExtra::Str("SHFE".into())),
+                "{} 应带 exchange_id=SHFE",
+                k.symbol
+            );
+            assert!(
+                k.extras
+                    .get("open_interest")
+                    .and_then(|v| v.as_decimal())
+                    .is_some(),
+                "{} 应带 open_interest",
+                k.symbol
+            );
+            assert!(!k.extras.contains_key("trade_num"));
+        }
+        assert!(core.poll(8_001).is_empty());
     }
 
     #[test]
@@ -1197,7 +1273,12 @@ mod tests {
         assert_eq!(b.start_time, 60_000);
         assert_eq!(b.end_time, 120_000);
         assert_eq!(b.volume, 3);
-        assert_eq!(b.open_interest, Decimal::from(100));
+        // open_interest 现为 CTP extras（Num），公共 Bar 不再有该具名字段。
+        assert_eq!(
+            b.extras.get("open_interest").and_then(|v| v.as_decimal()),
+            Some(Decimal::from(100))
+        );
+        assert_eq!(b.quote_volume, Decimal::from(33));
     }
 
     /// 记录 subscribe_klines 调用的假行情流。
@@ -1384,6 +1465,7 @@ mod tests {
             .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
         store.ctp_ticks().append(trading_models::RawTick {
             exchange: "ctp".into(),
+            exchange_id: "SHFE".into(),
             symbol: "cu2512".into(),
             timestamp: 60_000,
             trading_day: 20261024,
@@ -1393,7 +1475,7 @@ mod tests {
             low: Decimal::ZERO,
             close: Decimal::ZERO,
             volume: 3,
-            turnover: Decimal::from(33),
+            quote_volume: Decimal::from(33),
             open_interest: Decimal::from(100),
             bid: [Decimal::ZERO; 5],
             ask: [Decimal::ZERO; 5],

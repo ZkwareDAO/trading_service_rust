@@ -11,9 +11,11 @@
 //!   [`RestCancelOrder`] / [`RestAck`]；
 //! * 回报/应答（trading-service -> strategy）：[`ClientEvent`]。
 
+use std::collections::BTreeMap;
+
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use trading_models::{Order, OrderStatus, OrderType, Side};
+use trading_models::{KlineExtra, Order, OrderStatus, OrderType, Side};
 
 use crate::decimal_wire;
 
@@ -390,6 +392,10 @@ pub struct ClientEvent {
 }
 
 /// `kline_1m` 推送载荷：一根已定稿的 1 分钟 K线（只推定稿，不补历史）。
+///
+/// 12 个公共强类型字段四所一致；各所差异（CTP 的 exchange_id/open_interest、
+/// 币安的成交笔数/主动买入量额）经 [`Self::extras`] 以 `#[serde(flatten)]` 平铺到
+/// bar JSON 根。反序列化对未知 extra 键天然宽容（收进 map），客户端勿开 deny_unknown。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KlineEvent {
     /// 交易所标识（binance/deribit/hyperliquid/ctp）。
@@ -414,14 +420,13 @@ pub struct KlineEvent {
     pub close: Decimal,
     /// 周期内成交量（增量；WS 所按各自口径，CTP 为累计差分）。
     pub volume: i64,
-    /// 周期内成交额（增量）；不产出该字段的所为 None。
-    #[serde(default)]
-    #[serde(with = "decimal_wire::opt")]
-    pub turnover: Option<Decimal>,
-    /// 周期末总持仓量（CTP）；其余所为 None。
-    #[serde(default)]
-    #[serde(with = "decimal_wire::opt")]
-    pub open_interest: Option<Decimal>,
+    /// 周期内成交额（增量，计价货币口径；CTP=Turnover、币安=q）。
+    #[serde(with = "decimal_wire")]
+    pub quote_volume: Decimal,
+    /// 各所扩展字段，flatten 平铺到 bar 根（CTP: exchange_id/open_interest；
+    /// 币安: trade_num/active_buy_volume/active_buy_quote_volume；其余所空）。
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extras: BTreeMap<String, KlineExtra>,
 }
 
 /// 持仓快照（get_position 应答元素，来自交易所实时查询）。
@@ -770,8 +775,8 @@ mod tests {
             low: rust_decimal::Decimal::from(74950),
             close: rust_decimal::Decimal::from(75100),
             volume: 12,
-            turnover: Some(rust_decimal::Decimal::from(900000)),
-            open_interest: None,
+            quote_volume: rust_decimal::Decimal::from(900000),
+            extras: BTreeMap::new(),
         });
         assert_eq!(ev.kind, "kline_1m");
         let json = serde_json::to_string(&ev).unwrap();
@@ -780,8 +785,12 @@ mod tests {
         assert_eq!(k.symbol, "cu2512");
         assert_eq!(k.trading_day, 20261024);
         assert_eq!(k.volume, 12);
-        assert_eq!(k.turnover, Some(rust_decimal::Decimal::from(900000)));
+        assert_eq!(k.quote_volume, rust_decimal::Decimal::from(900000));
         assert!(json.contains("\"type\":\"kline_1m\""));
+        // 成交额键已更名 quote_volume；旧键 turnover/open_interest 不再出现在公共字段。
+        assert!(json.contains("\"quote_volume\":900000"));
+        assert!(!json.contains("turnover"));
+        assert!(!json.contains("open_interest"));
         // 避免未用告警：占位引用宏路径（实际用全路径）。
         let _ = std::any::type_name::<Decimal>();
     }
@@ -800,9 +809,122 @@ mod tests {
             low: Decimal::from(close),
             close: Decimal::from(close),
             volume: 1,
-            turnover: None,
-            open_interest: None,
+            quote_volume: Decimal::ZERO,
+            extras: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn binance_bar_flattens_three_extras_and_omits_open_interest() {
+        use trading_models::KlineExtra;
+        let mut extras = BTreeMap::new();
+        extras.insert("trade_num".into(), KlineExtra::Int(1280));
+        // 小数取值证明 Num 走精确 JSON 数字（不经 f64、不带引号）。
+        let frac: Decimal = "55.5".parse().unwrap();
+        extras.insert("active_buy_volume".into(), KlineExtra::Num(frac));
+        extras.insert(
+            "active_buy_quote_volume".into(),
+            KlineExtra::Num(Decimal::from(5500)),
+        );
+        let k = KlineEvent {
+            venue: "binance".into(),
+            symbol: "BTCUSDT".into(),
+            interval: "1m".into(),
+            trading_day: 20261028,
+            start_time: 0,
+            end_time: 60_000,
+            open: Decimal::from(1),
+            high: Decimal::from(1),
+            low: Decimal::from(1),
+            close: Decimal::from(1),
+            volume: 100,
+            quote_volume: Decimal::from(9000),
+            extras,
+        };
+        let json = serde_json::to_string(&k).unwrap();
+        // 12 个公共字段中的 quote_volume；3 个币安 extra 平铺到根；无 open_interest/exchange_id。
+        assert!(json.contains("\"quote_volume\":9000"));
+        assert!(json.contains("\"trade_num\":1280"));
+        assert!(json.contains("\"active_buy_volume\":55.5"));
+        assert!(json.contains("\"active_buy_quote_volume\":5500"));
+        assert!(!json.contains("open_interest"));
+        assert!(!json.contains("exchange_id"));
+        // 往返：Int 严格回整数；小数 Num 必须保持 Num（Int 装不下分数，as_decimal 相等即无损）。
+        let back: KlineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.extras.get("trade_num"), Some(&KlineExtra::Int(1280)));
+        assert_eq!(
+            back.extras
+                .get("active_buy_volume")
+                .and_then(|v| v.as_decimal()),
+            Some(frac)
+        );
+        assert_eq!(
+            back.extras
+                .get("active_buy_quote_volume")
+                .and_then(|v| v.as_decimal()),
+            Some(Decimal::from(5500))
+        );
+    }
+
+    #[test]
+    fn ctp_bar_flattens_exchange_id_and_open_interest_extras() {
+        use trading_models::KlineExtra;
+        let mut extras = BTreeMap::new();
+        extras.insert("exchange_id".into(), KlineExtra::Str("SHFE".into()));
+        extras.insert(
+            "open_interest".into(),
+            KlineExtra::Num(Decimal::from(120000)),
+        );
+        let k = KlineEvent {
+            venue: "ctp".into(),
+            symbol: "cu2512".into(),
+            interval: "1m".into(),
+            trading_day: 20261028,
+            start_time: 60_000,
+            end_time: 120_000,
+            open: Decimal::from(75200),
+            high: Decimal::from(75350),
+            low: Decimal::from(75180),
+            close: Decimal::from(75300),
+            volume: 128,
+            quote_volume: Decimal::from(9650000),
+            extras,
+        };
+        let json = serde_json::to_string(&k).unwrap();
+        assert!(json.contains("\"exchange_id\":\"SHFE\""));
+        assert!(json.contains("\"open_interest\":120000"));
+        // open_interest 来自 extras 平铺，KlineEvent 上不再有该具名字段。
+        let back: KlineEvent = serde_json::from_str(&json).unwrap();
+        // Str 严格回字符串；数值型 open_interest 整数取值可能回为 Int，按数值口径比较。
+        assert_eq!(
+            back.extras.get("exchange_id"),
+            Some(&KlineExtra::Str("SHFE".into()))
+        );
+        assert_eq!(
+            back.extras
+                .get("open_interest")
+                .and_then(KlineExtra::as_decimal),
+            Some(Decimal::from(120000))
+        );
+    }
+
+    #[test]
+    fn unknown_extra_keys_are_tolerated_on_deserialize() {
+        // 未来新所/新键：未知的标量 extra（字符串/数字）收进 flatten map，不致反序列化失败，
+        // 公共协议零改动即可透传。extras 约定为 str/int/num 三种标量。
+        let raw = r#"{"venue":"binance","symbol":"X","interval":"1m","trading_day":20261028,
+            "start_time":0,"end_time":60000,"open":1,"high":1,"low":1,"close":1,
+            "volume":1,"quote_volume":2,"future_metric":"abc","trade_num":7,"future_amt":1.25}"#;
+        let k: KlineEvent = serde_json::from_str(raw).unwrap();
+        assert_eq!(k.extras.get("trade_num"), Some(&KlineExtra::Int(7)));
+        assert_eq!(
+            k.extras.get("future_metric"),
+            Some(&KlineExtra::Str("abc".into()))
+        );
+        assert_eq!(
+            k.extras.get("future_amt").and_then(KlineExtra::as_decimal),
+            Some("1.25".parse::<Decimal>().unwrap())
+        );
     }
 
     #[test]

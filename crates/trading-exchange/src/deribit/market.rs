@@ -9,7 +9,7 @@
 //!
 //! Deribit 行情订阅渠道与符号映射见本模块协议函数。
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -249,8 +249,9 @@ impl DeribitMarketFeed {
             close: c.close,
             // 三家原生 K线量为浮点，统一 Kline.volume 取整（手/张口径由各所定义）。
             volume: c.volume.to_string().parse::<i64>().unwrap_or(0),
-            turnover: Decimal::ZERO,
-            open_interest: Decimal::ZERO,
+            quote_volume: Decimal::ZERO,
+            // deribit 当前无 K线扩展指标。
+            extras: BTreeMap::new(),
         }
     }
 }

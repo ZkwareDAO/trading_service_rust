@@ -35,8 +35,10 @@ use crate::market_hub::{safe_notify, NotifyOutcome};
 ///
 /// 这些是 CTP **当日累计**日开高低收（盘中 close 常为 0）与五档量价，**不是**
 /// 1m bar 的 OHLC；1m OHLC 由 candle 聚合得到。`Default` 全 0（FFI 字段缺失/测试用）。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RawTickDepth {
+    /// 真实交易所代码（SHFE/DCE/…，随原始 tick 落盘 exchange_id 列）。
+    pub exchange_id: String,
     pub day_open: Decimal,
     pub day_high: Decimal,
     pub day_low: Decimal,
@@ -51,6 +53,7 @@ impl From<&crate::ctp::core::quote::TickSnapshot> for RawTickDepth {
     fn from(t: &crate::ctp::core::quote::TickSnapshot) -> Self {
         let dec = |p: f64| Decimal::try_from(p).unwrap_or(Decimal::ZERO);
         Self {
+            exchange_id: t.exchange_id.clone(),
             day_open: dec(t.day_open),
             day_high: dec(t.day_high),
             day_low: dec(t.day_low),
@@ -267,27 +270,57 @@ impl CtpMarketStream {
     ///
     /// `depth` 为日 OHLC + 五档（FFI 全透传）；K线聚合只依赖 `CandleTick` 的
     /// price/累计量额/持仓，日 OHLC/五档仅落 RawTick。
+    ///
+    /// `exchange_id` 兜底（CTP 专属，不上提共有层）：优先用 tick 原生 ExchangeID
+    /// （生产柜台回填）；部分前置（如 SimNow）行情回调不回填该字段，则回退查进程级
+    /// [`InstrumentDir`]（ReqQryInstrument 预热的合约静态信息）；两者皆无则留空，
+    /// 不因此丢 tick 或阻塞行情。
     pub fn on_kline_tick(&self, symbol: &str, t: &CandleTick, depth: &RawTickDepth) {
+        // exchange_id 解析（CTP 专属，不上提共有层）：原生非空直接用（生产柜台路径，
+        // 不查表、零额外分配）；原生为空（如 SimNow 回调不回填）才查 InstrumentDir；
+        // 两者皆无留空。
+        let resolved = if !t.exchange_id.trim().is_empty() {
+            None // 沿用 t 自身的原生 exchange_id
+        } else {
+            self.instrument_dir
+                .exchange(symbol)
+                .filter(|e| !e.trim().is_empty())
+        };
+        // 仅在确实兜底到不同值时构造一个 owned tick，避免生产热路径逐笔整结构 clone。
+        let owned;
+        let tick = match &resolved {
+            Some(eid) => {
+                owned = CandleTick {
+                    exchange_id: eid.clone(),
+                    ..t.clone()
+                };
+                &owned
+            }
+            None => t,
+        };
+        // 聚合器与 WAL 共用同一 exchange_id，保证 bar extras 与 tick 列一致。
+        let exchange_id = resolved.unwrap_or_else(|| t.exchange_id.clone());
         self.ticks.append(RawTick {
             exchange: CTP_VENUE.to_string(),
+            exchange_id,
             symbol: symbol.to_string(),
-            timestamp: t.update_ms,
-            trading_day: t.trading_day,
-            price: t.price,
+            timestamp: tick.update_ms,
+            trading_day: tick.trading_day,
+            price: tick.price,
             open: depth.day_open,
             high: depth.day_high,
             low: depth.day_low,
             close: depth.day_close,
-            volume: t.cum_volume,
-            turnover: t.cum_turnover,
-            open_interest: t.open_interest,
+            volume: tick.cum_volume,
+            quote_volume: tick.cum_turnover,
+            open_interest: tick.open_interest,
             bid: depth.bid,
             ask: depth.ask,
             bid_vol: depth.bid_vol,
             ask_vol: depth.ask_vol,
         });
-        self.last_volumes.put(symbol, t.cum_volume);
-        self.bar_agg.lock().unwrap().on_tick(symbol, t);
+        self.last_volumes.put(symbol, tick.cum_volume);
+        self.bar_agg.lock().unwrap().on_tick(symbol, tick);
     }
 
     /// 注册全量持久化 sink：此后**每根定稿 bar（含非主力、零南向订阅）**都不经
@@ -525,11 +558,20 @@ mod tests {
     fn mk(vol: i64, ms: i64) -> CandleTick {
         CandleTick {
             trading_day: 20261023,
+            exchange_id: "SHFE".into(),
             update_ms: ms,
             price: Decimal::from(100),
             cum_volume: vol,
             cum_turnover: Decimal::ZERO,
             open_interest: Decimal::ZERO,
+        }
+    }
+
+    /// 原生 tick 不带 ExchangeID（SimNow 形态）：exchange_id 为空，靠 InstrumentDir 兜底。
+    fn mk_no_eid(vol: i64, ms: i64) -> CandleTick {
+        CandleTick {
+            exchange_id: String::new(),
+            ..mk(vol, ms)
         }
     }
 
@@ -783,6 +825,7 @@ mod tests {
         let mut ask_vol = [0; 5];
         ask_vol[0] = 21;
         let depth = RawTickDepth {
+            exchange_id: "SHFE".into(),
             day_open: Decimal::from(74_100),
             day_high: Decimal::from(74_800),
             day_low: Decimal::from(74_000),
@@ -798,6 +841,9 @@ mod tests {
         let pending = ticks.snapshot();
         assert_eq!(pending.len(), 1);
         let r = &pending[0];
+        // 真实交易所代码随原始 tick 落 WAL（venue=ctp，exchange_id=SHFE）。
+        assert_eq!(r.exchange, "ctp");
+        assert_eq!(r.exchange_id, "SHFE");
         assert_eq!(r.open, Decimal::from(74_100));
         assert_eq!(r.high, Decimal::from(74_800));
         assert_eq!(r.low, Decimal::from(74_000));
@@ -808,6 +854,43 @@ mod tests {
         assert_eq!(r.ask_vol[0], 21);
         assert_eq!(r.bid[4], Decimal::from(74_450));
         assert_eq!(r.ask[4], Decimal::from(74_550));
+    }
+
+    #[test]
+    fn empty_native_exchange_id_falls_back_to_instrument_dir() {
+        // SimNow 形态：行情回调 ExchangeID 空，合约目录已由 ReqQryInstrument 预热为 SHFE。
+        let (ticks, vols, doms) = tables();
+        let dir = dir_with(vec![info("cu2611", "cu", true)]);
+        let s = CtpMarketStream::new(ticks.clone(), vols, doms, dir, Vec::new());
+
+        s.on_kline_tick("cu2611", &mk_no_eid(30, 600_000), &RawTickDepth::default());
+
+        // WAL tick 经目录兜底得到 SHFE（venue 仍是 ctp）。
+        let pending = ticks.snapshot();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].exchange_id, "SHFE");
+
+        // 聚合定稿 bar 的 extras.exchange_id 同样兜底为 SHFE（墙钟定稿）。
+        let bar = s
+            .sweep_kline_finalized(660_000)
+            .pop()
+            .expect("10:00 桶墙钟定稿");
+        assert_eq!(
+            bar.extras.get("exchange_id"),
+            Some(&crate::market::KlineExtra::Str("SHFE".into()))
+        );
+    }
+
+    #[test]
+    fn missing_native_and_dir_exchange_id_stays_blank_without_error() {
+        // 原生空、合约目录也未预热：exchange_id 留空，tick 不丢、聚合不报错。
+        let (ticks, vols, doms) = tables();
+        let s = CtpMarketStream::new(ticks.clone(), vols, doms, dir_with(vec![]), Vec::new());
+        s.on_kline_tick("cu9999", &mk_no_eid(1, 600_000), &RawTickDepth::default());
+        let pending = ticks.snapshot();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].exchange_id, "");
+        assert!(s.sweep_kline_finalized(660_000).len() == 1);
     }
 
     #[test]

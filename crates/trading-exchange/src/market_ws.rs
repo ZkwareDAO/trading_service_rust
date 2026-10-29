@@ -408,8 +408,8 @@ mod tests {
             low: Decimal::ONE,
             close: Decimal::ONE,
             volume: 1,
-            turnover: Decimal::ONE,
-            open_interest: Decimal::ZERO,
+            quote_volume: Decimal::ONE,
+            extras: std::collections::BTreeMap::new(),
         };
         // 没有任何 register_klines 消费者：无条件 sink 仍收到，且无摘除。
         assert_eq!(

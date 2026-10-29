@@ -18,7 +18,9 @@ pub mod watch_rule;
 
 pub use account::{Account, SecretCipher, ACCOUNT_CSV_HEADER, SECRET_PREFIX};
 pub use bar::{
-    Bar, RawTick, RawTickParseError, BAR_CSV_HEADER, RAW_TICK_COLUMNS, RAW_TICK_CSV_HEADER,
+    bar_csv_header, bar_extra_columns, Bar, BarParseError, ExtraKind, KlineExtra, RawTick,
+    RawTickParseError, BAR_CSV_COMMON_COLUMNS, BAR_CSV_COMMON_HEADER, RAW_TICK_COLUMNS,
+    RAW_TICK_CSV_HEADER,
 };
 pub use order::{Order, OrderStatus, OrderType, TimeInForce};
 pub use order_rule::{OrderRule, OrderRuleKey, PriceTier};

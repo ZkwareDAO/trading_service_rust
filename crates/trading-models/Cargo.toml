@@ -9,6 +9,8 @@ license.workspace = true
 store-core = { path = "../store-core" }
 serde = { workspace = true }
 rust_decimal = { workspace = true }
+# KlineExtra::Num 经 serde_json arbitrary_precision 序列化为精确 JSON 数字（不经 f64）。
+serde_json = { workspace = true }
 # 账户凭证本地加密（AES-256-GCM）；密钥文件的 0600 落盘由服务层负责。
 aes-gcm = { workspace = true }
 anyhow = { workspace = true }
@@ -16,4 +18,3 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 csv = { workspace = true }
-serde_json = { workspace = true }

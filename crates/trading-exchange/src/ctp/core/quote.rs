@@ -20,6 +20,8 @@ impl QuoteLevel {
 pub struct TickSnapshot {
     /// 合约代码。
     pub instrument: String,
+    /// 真实交易所代码（SHFE/DCE/CZCE/CFFEX/INE/GFEX，取自柜台 ExchangeID；venue 仍是 ctp）。
+    pub exchange_id: String,
     /// 最新价。
     pub last_price: f64,
     /// 买一~买五（index 0 = 买一）。
@@ -112,6 +114,7 @@ mod tests {
     fn tick(bid: f64, ask: f64) -> TickSnapshot {
         TickSnapshot {
             instrument: "rb2611".into(),
+            exchange_id: "SHFE".into(),
             last_price: 3800.0,
             bids: [
                 level(bid, 10),

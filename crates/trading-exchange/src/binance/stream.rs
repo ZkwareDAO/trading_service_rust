@@ -84,8 +84,8 @@ mod tests {
             low: Decimal::ONE,
             close: Decimal::ONE,
             volume,
-            turnover: Decimal::ONE,
-            open_interest: Decimal::ZERO,
+            quote_volume: Decimal::ONE,
+            extras: std::collections::BTreeMap::new(),
         }
     }
 

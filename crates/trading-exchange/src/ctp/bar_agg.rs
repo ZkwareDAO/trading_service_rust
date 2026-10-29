@@ -145,8 +145,12 @@ impl BarAggSink {
 }
 
 /// 把 CTP 行情快照字段映射为聚合输入（供 drain 调用；无 IO）。
+///
+/// `exchange_id` 为真实交易所代码（SHFE/DCE/…，取自 FFI ExchangeID），随聚合定稿进
+/// bar extras；其余量额为当日累计口径，差分在 candle 内完成。
 pub fn to_candle_tick(
     trading_day: u32,
+    exchange_id: impl Into<String>,
     update_ms: i64,
     price: Decimal,
     cum_volume: i64,
@@ -155,6 +159,7 @@ pub fn to_candle_tick(
 ) -> CandleTick {
     CandleTick {
         trading_day,
+        exchange_id: exchange_id.into(),
         update_ms,
         price,
         cum_volume,
@@ -182,6 +187,7 @@ mod tests {
     fn tick(day: u32, ms: i64, price: i64, vol: i64) -> CandleTick {
         CandleTick {
             trading_day: day,
+            exchange_id: "SHFE".into(),
             update_ms: ms,
             price: Decimal::from(price),
             cum_volume: vol,
@@ -358,6 +364,7 @@ mod tests {
     fn to_candle_tick_carries_fields() {
         let t = to_candle_tick(
             20261023,
+            "DCE",
             1,
             Decimal::from(3),
             4,
@@ -365,6 +372,7 @@ mod tests {
             Decimal::from(6),
         );
         assert_eq!(t.trading_day, 20261023);
+        assert_eq!(t.exchange_id, "DCE");
         assert_eq!(t.cum_volume, 4);
         assert_eq!(t.open_interest, Decimal::from(6));
     }

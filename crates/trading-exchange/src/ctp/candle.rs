@@ -12,19 +12,23 @@
 //! 本类型**不挂钟、不 IO、不 await**：桶归属与定稿完全是输入 tick 的纯函数，
 //! 因此无需注入 Clock 即可确定性单测。
 
+use std::collections::BTreeMap;
+
 use rust_decimal::Decimal;
 
-use crate::market::{Kline, KlineInterval};
+use crate::market::{Kline, KlineExtra, KlineInterval};
 
 /// 一分钟的毫秒数（测试构造 1m 桶/边界用；生产周期来自 `KlineInterval::duration_ms()`）。
 #[cfg(test)]
 const MINUTE_MS: i64 = 60_000;
 
 /// 聚合器输入：一笔已映射好的 tick（B4 由 FFI 快照转换）。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CandleTick {
     /// 归属交易日（YYYYMMDD；CTP TradingDay，夜盘已归次日）。
     pub trading_day: u32,
+    /// 真实交易所代码（SHFE/DCE/…，取自 FFI ExchangeID；venue 仍是 ctp）。
+    pub exchange_id: String,
     /// 交易所时间（ActionDay+UpdateTime+UpdateMillisec 合成的 UTC 毫秒）。
     pub update_ms: i64,
     /// 最新价。
@@ -58,6 +62,8 @@ fn turnover_delta(curr: Decimal, base: Decimal) -> Decimal {
 /// 一根尚未定稿的桶内中间状态。
 struct OpenCandle {
     trading_day: u32,
+    /// 真实交易所代码（同合约所有 tick 一致，首笔带定，定稿进 extras）。
+    exchange_id: String,
     start_ms: i64,
     /// 桶周期（定稿 end_ms/`Kline.interval` 都由它派生，不写死 1 分钟）。
     interval: KlineInterval,
@@ -75,9 +81,9 @@ struct OpenCandle {
     last_cum_turnover: Decimal,
     /// 桶内成交量（累计量差分，非负）。
     volume: i64,
-    /// 桶内成交额（差分，非负）。
-    turnover: Decimal,
-    /// 桶末持仓量（每笔覆盖）。
+    /// 桶内成交额（差分，非负；定稿即公共 quote_volume）。
+    quote_volume: Decimal,
+    /// 桶末持仓量（每笔覆盖；定稿进 extras.open_interest）。
     open_interest: Decimal,
 }
 
@@ -92,6 +98,7 @@ impl OpenCandle {
     ) -> Self {
         Self {
             trading_day: t.trading_day,
+            exchange_id: t.exchange_id.clone(),
             start_ms,
             interval,
             open: t.price,
@@ -103,7 +110,7 @@ impl OpenCandle {
             last_cum_volume: t.cum_volume,
             last_cum_turnover: t.cum_turnover,
             volume: volume_delta(t.cum_volume, base_volume),
-            turnover: turnover_delta(t.cum_turnover, base_turnover),
+            quote_volume: turnover_delta(t.cum_turnover, base_turnover),
             open_interest: t.open_interest,
         }
     }
@@ -114,14 +121,26 @@ impl OpenCandle {
         self.high = self.high.max(t.price);
         self.low = self.low.min(t.price);
         self.volume = volume_delta(t.cum_volume, self.base_volume);
-        self.turnover = turnover_delta(t.cum_turnover, self.base_turnover);
+        self.quote_volume = turnover_delta(t.cum_turnover, self.base_turnover);
         self.open_interest = t.open_interest;
         self.last_cum_volume = t.cum_volume;
         self.last_cum_turnover = t.cum_turnover;
     }
 
     /// 定稿为不可变 [`Kline`]（结束时间为半开区间 [start, start+interval)）。
+    ///
+    /// CTP 专有指标经 extras 平铺：`exchange_id`（Str，真实交易所）与
+    /// `open_interest`（Num，周期末持仓量）；成交额并入公共 `quote_volume`。
     fn finalize(&self, venue: &str, symbol: &str) -> Kline {
+        let mut extras = BTreeMap::new();
+        extras.insert(
+            "exchange_id".to_string(),
+            KlineExtra::Str(self.exchange_id.clone()),
+        );
+        extras.insert(
+            "open_interest".to_string(),
+            KlineExtra::Num(self.open_interest),
+        );
         Kline {
             venue: venue.to_string(),
             symbol: symbol.to_string(),
@@ -134,8 +153,8 @@ impl OpenCandle {
             low: self.low,
             close: self.close,
             volume: self.volume,
-            turnover: self.turnover,
-            open_interest: self.open_interest,
+            quote_volume: self.quote_volume,
+            extras,
         }
     }
 }
@@ -282,14 +301,60 @@ mod tests {
     }
 
     fn tick(day: u32, ms: i64, price: i64, vol: i64, turnover: i64, oi: i64) -> CandleTick {
+        tick_ex("SHFE", day, ms, price, vol, turnover, oi)
+    }
+
+    /// 可指定真实交易所代码（SHFE/DCE/…）的 tick 构造。
+    fn tick_ex(
+        exchange_id: &str,
+        day: u32,
+        ms: i64,
+        price: i64,
+        vol: i64,
+        turnover: i64,
+        oi: i64,
+    ) -> CandleTick {
         CandleTick {
             trading_day: day,
+            exchange_id: exchange_id.into(),
             update_ms: ms,
             price: Decimal::from(price),
             cum_volume: vol,
             cum_turnover: Decimal::from(turnover),
             open_interest: Decimal::from(oi),
         }
+    }
+
+    /// 读定稿 bar extras 里的周期末持仓量（Num/Int 统一按数值口径）。
+    fn bar_oi(b: &Kline) -> Decimal {
+        b.extras
+            .get("open_interest")
+            .and_then(KlineExtra::as_decimal)
+            .unwrap()
+    }
+
+    // 真实交易所代码随 tick 透传进定稿 bar extras（SHFE 上期 / DCE 大商两类合约）。
+    #[test]
+    fn finalized_bar_carries_native_exchange_id_extra() {
+        use crate::market::KlineExtra;
+        // SHFE 铜：定稿 bar.extras.exchange_id = "SHFE"。
+        let mut shfe = CandleAggregator::new("ctp", "cu2512", KlineInterval::M1);
+        shfe.on_tick(&tick_ex("SHFE", 20261023, 600_000, 100, 10, 1000, 5));
+        let bar = shfe.finalize_if_due(660_000).expect("SHFE 定稿");
+        assert_eq!(
+            bar.extras.get("exchange_id"),
+            Some(&KlineExtra::Str("SHFE".into()))
+        );
+
+        // DCE 豆粕：不同 exchange_id 也如实进 extras（venue 仍是 ctp）。
+        let mut dce = CandleAggregator::new("ctp", "m2512", KlineInterval::M1);
+        dce.on_tick(&tick_ex("DCE", 20261023, 600_000, 3000, 10, 1000, 5));
+        let bar = dce.finalize_if_due(660_000).expect("DCE 定稿");
+        assert_eq!(bar.venue, "ctp");
+        assert_eq!(
+            bar.extras.get("exchange_id"),
+            Some(&KlineExtra::Str("DCE".into()))
+        );
     }
 
     // 同一分钟两笔：不开新 bar，OHLC 在桶内累积。
@@ -316,8 +381,8 @@ mod tests {
         assert_eq!(bar.close, dec(110));
         // 量 = 桶末累计 15 − 首笔基线 10 = 5；额 = 1600−1000 = 600；持仓取桶末 7。
         assert_eq!(bar.volume, 5);
-        assert_eq!(bar.turnover, dec(600));
-        assert_eq!(bar.open_interest, dec(7));
+        assert_eq!(bar.quote_volume, dec(600));
+        assert_eq!(bar_oi(&bar), dec(7));
     }
 
     // 跨分钟：第二分钟首笔触发上一分钟定稿，量为分钟末累计差分。
@@ -335,14 +400,14 @@ mod tests {
         assert_eq!(finished.end_ms, 660_000);
         // 上一分钟量 = 15 − 10 = 5（不是累计 15）。
         assert_eq!(finished.volume, 5);
-        assert_eq!(finished.turnover, dec(60));
+        assert_eq!(finished.quote_volume, dec(60));
         assert_eq!(finished.close, dec(3801));
-        assert_eq!(finished.open_interest, dec(2));
+        assert_eq!(bar_oi(&finished), dec(2));
         // 当前新桶再 flush：基线=上桶末累计 15，量 = 17−15 = 2。
         let cur = agg.flush().expect("新桶");
         assert_eq!(cur.start_ms, 660_000);
         assert_eq!(cur.volume, 2);
-        assert_eq!(cur.turnover, dec(40));
+        assert_eq!(cur.quote_volume, dec(40));
     }
 
     // 夜盘归次日：TradingDay 由柜台给次日，21:00 与 21:01 同交易日，分钟桶正常翻转。
@@ -359,8 +424,8 @@ mod tests {
         assert_eq!(night.trading_day, 20261027);
         assert_eq!(night.start_ms, 75_600_000);
         assert_eq!(night.volume, 8);
-        assert_eq!(night.turnover, dec(90));
-        assert_eq!(night.open_interest, dec(11));
+        assert_eq!(night.quote_volume, dec(90));
+        assert_eq!(bar_oi(&night), dec(11));
     }
 
     // 跨交易日：累计量归零，新交易日首桶基线重置，不出现负量，定稿旧桶不被污染。
@@ -380,7 +445,7 @@ mod tests {
         let cur = agg.flush().expect("新交易日桶");
         assert_eq!(cur.trading_day, 20261024);
         assert_eq!(cur.volume, 3);
-        assert_eq!(cur.turnover, dec(6));
+        assert_eq!(cur.quote_volume, dec(6));
     }
 
     // 同桶累计量回退（乱序/重发）：差分钳到 0，不产生负成交量。
@@ -391,7 +456,7 @@ mod tests {
         agg.on_tick(&tick(20261023, 620_000, 3801, 90, 900, 1));
         let bar = agg.flush().unwrap();
         assert_eq!(bar.volume, 0);
-        assert_eq!(bar.turnover, dec(0));
+        assert_eq!(bar.quote_volume, dec(0));
     }
 
     // 最低价在下跌中更新。
@@ -478,13 +543,13 @@ mod tests {
         assert_eq!(b22.low, dec(1000));
         assert_eq!(b22.close, dec(1000));
         assert_eq!(b22.volume, 0);
-        assert_eq!(b22.open_interest, dec(1));
+        assert_eq!(bar_oi(b22), dec(1));
 
         // 23 桶：单笔 1010，量 = 60−30 = 30，持仓 2。
         let b23 = &finished[1];
         assert_eq!(b23.open, dec(1010));
         assert_eq!(b23.volume, 30);
-        assert_eq!(b23.open_interest, dec(2));
+        assert_eq!(bar_oi(b23), dec(2));
 
         // 27 桶：O=1030（t3），H=1030，L=C=1025（t4），量 = 90−60 = 30，持仓取桶末 4。
         let b27 = &finished[2];
@@ -493,7 +558,7 @@ mod tests {
         assert_eq!(b27.low, dec(1025));
         assert_eq!(b27.close, dec(1025));
         assert_eq!(b27.volume, 30);
-        assert_eq!(b27.open_interest, dec(4));
+        assert_eq!(bar_oi(b27), dec(4));
 
         // 缺口空分钟 24/25/26/28 绝不出 bar。
         assert!(finished
@@ -505,7 +570,7 @@ mod tests {
         assert_eq!(b29.start_ms, m(29, 0));
         assert_eq!(b29.open, dec(1050));
         assert_eq!(b29.volume, 10);
-        assert_eq!(b29.open_interest, dec(5));
+        assert_eq!(bar_oi(&b29), dec(5));
 
         // 总量守恒：0+30+30+10 = 70 = 末累计 100 − 首观测点基线 30。
         let total: i64 = finished.iter().map(|b| b.volume).sum::<i64>() + b29.volume;
@@ -526,11 +591,11 @@ mod tests {
             .on_tick(&tick(DAY, m(27, 5), 1030, 80, 800_000, 3))
             .expect("23 桶定稿");
         // 23 桶首笔基线为其自身累计额，故差分 0。
-        assert_eq!(b23.turnover, dec(0));
+        assert_eq!(b23.quote_volume, dec(0));
         // 27 桶再来一笔累计额 900_000，flush 收口：额 = 900_000 − 600_000 = 300_000。
         agg.on_tick(&tick(DAY, m(27, 58), 1025, 90, 900_000, 4));
         let b27 = agg.flush().expect("27 桶");
-        assert_eq!(b27.turnover, dec(300_000));
+        assert_eq!(b27.quote_volume, dec(300_000));
     }
 
     // 跨桶首笔累计量回退（乱序/重发导致比上一桶末累计还小）：新桶差分钳 0，不为负。
@@ -548,7 +613,7 @@ mod tests {
                                     // 新桶基线=100，本笔 90 回退 → 钳 0，绝不出现负成交量。
         let cur = agg.flush().expect("新桶");
         assert_eq!(cur.volume, 0);
-        assert_eq!(cur.turnover, dec(0));
+        assert_eq!(cur.quote_volume, dec(0));
     }
 
     // ===== 墙钟到点定稿（不再等下一周期首笔 tick）=====
@@ -573,8 +638,8 @@ mod tests {
         assert_eq!(bar.low, dec(100));
         assert_eq!(bar.close, dec(110));
         assert_eq!(bar.volume, 5);
-        assert_eq!(bar.turnover, dec(600));
-        assert_eq!(bar.open_interest, dec(2));
+        assert_eq!(bar.quote_volume, dec(600));
+        assert_eq!(bar_oi(&bar), dec(2));
     }
 
     // 空窗（从无 tick 的合约/分钟）无聚合器桶 → 不产棒；take 语义下同拍/再拍不重复出。

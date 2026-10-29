@@ -9,7 +9,7 @@
 //!
 //! 解析裸数组的纯函数与旧实现一致（2026 WS 迁移：合约走 `/market/ws`，返回裸数组）。
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str::FromStr;
 
 use async_trait::async_trait;
@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use trading_core::quote::{QuoteTable, QuoteUpdate};
 use trading_models::{Instrument, MarketKind, Venue};
 
-use crate::market::{Kline, KlineInterval, PriceBasis, PriceTick};
+use crate::market::{Kline, KlineExtra, KlineInterval, PriceBasis, PriceTick};
 use crate::market_hub::SubsPlan;
 use crate::market_ws::{ChannelPlan, FeedMessage, WsMarketFeed};
 use crate::port::QuoteObserver;
@@ -207,6 +207,18 @@ fn parse_kline_frame(text: &str) -> Option<Kline> {
     // 成交量/额为字符串小数；Kline.volume 为 i64，截断取整（计划二可扩展为小数量）。
     use rust_decimal::prelude::ToPrimitive;
     let volume = dec("v").trunc().to_i64().unwrap_or(0);
+    // 币安专有指标（公共 12 字段之外）：n=成交笔数(Int)，V/Q=主动买入基础量/计价额(Num)。
+    // 缺省口径与各 dec 字段一致（n 缺省 0、V/Q 缺省 0），坏帧不致丢整根定稿 bar。
+    let mut extras: BTreeMap<String, KlineExtra> = BTreeMap::new();
+    extras.insert(
+        "trade_num".to_string(),
+        KlineExtra::Int(k.get("n").and_then(|v| v.as_i64()).unwrap_or(0)),
+    );
+    extras.insert("active_buy_volume".to_string(), KlineExtra::Num(dec("V")));
+    extras.insert(
+        "active_buy_quote_volume".to_string(),
+        KlineExtra::Num(dec("Q")),
+    );
     let bar = Kline {
         venue: VENUE.to_string(),
         symbol,
@@ -219,8 +231,8 @@ fn parse_kline_frame(text: &str) -> Option<Kline> {
         low: dec("l"),
         close: dec("c"),
         volume,
-        turnover: dec("q"),
-        open_interest: Decimal::ZERO,
+        quote_volume: dec("q"),
+        extras,
     };
     // 仅收盘定稿帧打 debug（成形中帧已在上方 return，不产生噪音）；引用已构造的 bar，
     // 不重复解析帧字段。
@@ -233,7 +245,7 @@ fn parse_kline_frame(text: &str) -> Option<Kline> {
         low = %bar.low,
         close = %bar.close,
         volume = bar.volume,
-        turnover = %bar.turnover,
+        quote_volume = %bar.quote_volume,
         "binance 1m K线定稿帧（k.x=true）"
     );
     Some(bar)
@@ -396,9 +408,10 @@ mod tests {
           "t":60000,"T":120000,"i":"1m","o":"100","h":"110","l":"99","c":"105",
           "v":"3.5","q":"360.0","x":false}}"#;
         assert!(feed.decode(forming).bars.is_empty());
+        // 含币安成交笔数 n 与主动买入 V/Q；x=true 定稿。
         let final_frame = r#"{"e":"kline","E":1,"s":"BTCUSDT","k":{
           "t":60000,"T":120000,"i":"1m","o":"100","h":"111","l":"99","c":"108",
-          "v":"4","q":"432.0","x":true}}"#;
+          "v":"4","q":"432.0","n":1280,"V":"2.5","Q":"270.0","x":true}}"#;
         let bars = feed.decode(final_frame).bars;
         assert_eq!(bars.len(), 1);
         let b = &bars[0];
@@ -409,7 +422,25 @@ mod tests {
         assert_eq!(b.close, dec("108"));
         assert_eq!(b.high, dec("111"));
         assert_eq!(b.volume, 4);
-        assert_eq!(b.turnover, dec("432.0"));
+        // 8) q → 公共 quote_volume（原 turnover 更名）。
+        assert_eq!(b.quote_volume, dec("432.0"));
+        // 9/10/11) n/V/Q → 币安 3 个 extras；无 open_interest/exchange_id。
+        assert_eq!(b.extras.get("trade_num"), Some(&KlineExtra::Int(1280)));
+        assert_eq!(
+            b.extras
+                .get("active_buy_volume")
+                .and_then(|v| v.as_decimal()),
+            Some(dec("2.5"))
+        );
+        assert_eq!(
+            b.extras
+                .get("active_buy_quote_volume")
+                .and_then(|v| v.as_decimal()),
+            Some(dec("270.0"))
+        );
+        assert_eq!(b.extras.len(), 3);
+        assert!(!b.extras.contains_key("open_interest"));
+        assert!(!b.extras.contains_key("exchange_id"));
     }
 
     #[test]

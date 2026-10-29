@@ -12,10 +12,13 @@
 //! 持久化行模型在 trading-models（[`trading_models::Bar`] 与原始 tick `RawTick`），
 //! 由 trading-store 的 KlineRepo 写 CSV。
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rust_decimal::Decimal;
 use trading_models::{MarketKind, Venue};
+
+pub use trading_models::KlineExtra;
 
 use crate::port::{InterestKey, MarketInterest};
 
@@ -82,6 +85,10 @@ pub struct PriceTick {
 ///
 /// 成交量为**周期内增量**（CTP 由相邻周期末累计量差分得到，绝不直接抄累计量）；
 /// `trading_day` 为 YYYYMMDD，**夜盘归下一交易日**（由 CTP 适配层归桶后给值）。
+///
+/// 12 个公共强类型字段四所一致；各所差异指标放 [`Self::extras`]（CTP:
+/// exchange_id/open_interest；币安: trade_num/active_buy_volume/active_buy_quote_volume），
+/// 新增交易所只加本所映射 + 本所 extras 键，公共结构不动。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kline {
     /// 交易所标识（binance / deribit / hyperliquid / ctp）。
@@ -106,10 +113,11 @@ pub struct Kline {
     pub close: Decimal,
     /// 周期内成交量（增量）。
     pub volume: i64,
-    /// 周期内成交额（增量）。
-    pub turnover: Decimal,
-    /// 周期末总持仓量。
-    pub open_interest: Decimal,
+    /// 周期内成交额（增量，计价货币口径；CTP=Turnover、币安=q）。
+    pub quote_volume: Decimal,
+    /// 各所扩展字段（CTP: exchange_id/open_interest；币安: trade_num/active_buy_*；
+    /// deribit/hyperliquid 为空）。
+    pub extras: BTreeMap<String, KlineExtra>,
 }
 
 /// 期望订阅来源：交易所侧每 500ms 调一次 [`Self::symbols`] 得到当前想要的合约。
