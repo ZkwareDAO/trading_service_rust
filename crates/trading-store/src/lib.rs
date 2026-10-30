@@ -25,7 +25,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use store_core::{Model, PersistHandle, PersistOptions, Store, StoreError, Table};
-use trading_core::kline::{BarTable, DominantTable, KlineRegistry, LastVolumeTable, TickTable};
+use trading_core::kline::{
+    BarTable, DominantTable, GapRegistry, KlineRegistry, LastVolumeTable, TickTable,
+};
 use trading_core::order_rule::OrderRuleTable;
 use trading_core::quote::QuoteTable;
 use trading_models::{Account, Order, Position, WatchRule};
@@ -234,6 +236,15 @@ impl TradingStore {
         self.memory
             .get_or_init(MemoryTables::new)
             .kline_registry
+            .clone()
+    }
+
+    /// K线：待回补缺口去重集合（进程单例，纯内存不落盘）。
+    /// GapGuard 三检测点登记（仅三家），P4 后台 REST 回补消费。
+    pub fn gap_registry(&self) -> Arc<GapRegistry> {
+        self.memory
+            .get_or_init(MemoryTables::new)
+            .gap_registry
             .clone()
     }
 

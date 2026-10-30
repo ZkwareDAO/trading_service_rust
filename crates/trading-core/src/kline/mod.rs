@@ -13,12 +13,17 @@
 
 mod bar;
 mod dominant;
+mod gap;
 mod registry;
 mod source;
 mod tick;
 
-pub use bar::BarTable;
+pub use bar::{BarTable, DirtyBar, SeriesKey, SeriesStarts};
 pub use dominant::{DominantEntry, DominantTable, LastVolumeTable};
+pub use gap::{
+    coalesce_starts, detect_tail_gap, scan_gaps, stall_gap, GapRange, GapRegistry, GapSeries,
+    PendingGap,
+};
 pub use registry::{KlineKey, KlineRegistry};
 pub use source::RegistrySource;
 pub use tick::TickTable;

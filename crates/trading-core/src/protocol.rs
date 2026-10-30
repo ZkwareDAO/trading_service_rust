@@ -143,6 +143,17 @@ pub struct SouthCommand {
     /// K线周期；缺省/仅支持 "1m"。
     #[serde(default)]
     pub interval: Option<String>,
+
+    // —— get_klines 专用（其余命令忽略；全部可选）——
+    /// 历史 K线查询起点（UTC 毫秒，含）；缺省=取最近 N 根。
+    #[serde(default)]
+    pub start_time: Option<i64>,
+    /// 历史 K线查询终点（UTC 毫秒，不含）；缺省=开放。
+    #[serde(default)]
+    pub end_time: Option<i64>,
+    /// 返回根数上限；缺省/0 用服务默认（300），超过服务硬上限（1500）截断。
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// K线周期统一归一：空/1m/1min/1minute → "1m"；其余 None（本期仅支持 1m）。
@@ -759,6 +770,32 @@ mod tests {
         assert_eq!(normalize_kline_interval(Some("")), Some("1m"));
         assert_eq!(normalize_kline_interval(Some("1M")), Some("1m"));
         assert_eq!(normalize_kline_interval(Some("5m")), None);
+    }
+
+    #[test]
+    fn get_klines_command_parses_optional_window_and_limit() {
+        // 显式带区间与 limit：三字段原样解析（校验/归一在服务层）。
+        let raw = r#"{"option":"get_klines","exchange":"binance","symbol":"BTCUSDT",
+                       "interval":"1m","start_time":1729000000000,
+                       "end_time":1729003600000,"limit":500}"#;
+        let cmd: SouthCommand = serde_json::from_str(raw).unwrap();
+        assert_eq!(cmd.option_kind(), "get_klines");
+        assert_eq!(cmd.exchange.as_deref(), Some("binance"));
+        assert_eq!(cmd.symbol.as_deref(), Some("BTCUSDT"));
+        assert_eq!(cmd.start_time, Some(1_729_000_000_000));
+        assert_eq!(cmd.end_time, Some(1_729_003_600_000));
+        assert_eq!(cmd.limit, Some(500));
+    }
+
+    #[test]
+    fn get_klines_command_defaults_window_and_limit_absent() {
+        // 旧报文/不带窗口：三字段缺省 None，向后兼容（取最近 N 由服务层补默认）。
+        let cmd: SouthCommand =
+            serde_json::from_str(r#"{"option":"get_klines","exchange":"ctp","symbol":"cu2512"}"#)
+                .unwrap();
+        assert_eq!(cmd.start_time, None);
+        assert_eq!(cmd.end_time, None);
+        assert_eq!(cmd.limit, None);
     }
 
     #[test]

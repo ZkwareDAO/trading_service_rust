@@ -13,7 +13,9 @@
 
 use std::sync::Arc;
 
-use trading_core::kline::{BarTable, DominantTable, KlineRegistry, LastVolumeTable, TickTable};
+use trading_core::kline::{
+    BarTable, DominantTable, GapRegistry, KlineRegistry, LastVolumeTable, TickTable,
+};
 use trading_core::order_rule::OrderRuleTable;
 use trading_core::quote::QuoteTable;
 
@@ -38,6 +40,8 @@ pub struct MemoryTables {
     pub bar_table: Arc<BarTable>,
     /// K线：客户端订阅登记表（引用计数、断连清理）。
     pub kline_registry: Arc<KlineRegistry>,
+    /// K线：待回补缺口去重集合（仅三家；P3 三检测点登记，P4 消费，纯内存不落盘）。
+    pub gap_registry: Arc<GapRegistry>,
 }
 
 impl MemoryTables {
@@ -52,6 +56,7 @@ impl MemoryTables {
             ctp_dominants: Arc::new(DominantTable::new()),
             bar_table: Arc::new(BarTable::new()),
             kline_registry: Arc::new(KlineRegistry::new()),
+            gap_registry: Arc::new(GapRegistry::new()),
         }
     }
 }
@@ -124,6 +129,16 @@ mod tests {
         assert!(Arc::ptr_eq(&mem.ctp_dominants, &store.ctp_dominants()));
         assert!(Arc::ptr_eq(&mem.bar_table, &store.bar_table()));
         assert!(Arc::ptr_eq(&mem.kline_registry, &store.kline_registry()));
+        assert!(Arc::ptr_eq(&mem.gap_registry, &store.gap_registry()));
+    }
+
+    #[test]
+    fn store_returns_same_gap_registry_every_call() {
+        let store = open_store();
+        assert!(
+            Arc::ptr_eq(&store.gap_registry(), &store.gap_registry()),
+            "缺口集合必须是进程内单例"
+        );
     }
 
     #[test]

@@ -21,6 +21,8 @@ thiserror = { workspace = true }
 # accounts 模块：account.csv 解析（csv）与 anyhow 结果/上下文。
 csv = { workspace = true }
 anyhow = { workspace = true }
+# read_range 跨交易日目录枚举：UTC 日历日归属与日界加减。
+chrono = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
@@ -29,7 +31,6 @@ tokio = { version = "1", features = ["rt", "time"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-chrono = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
