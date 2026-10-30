@@ -122,6 +122,7 @@ v6.7.13 `error.xml`：
 | `CTP_MOCK_AUTO_TICK` | 非空/非 0：订阅后自动游走行情 | 关 |
 | `CTP_MOCK_AUTO_INTERVAL_MS` | 自动行情间隔 | 500 |
 | `CTP_MOCK_PRESET` | 非空/非 0：构造时预置主测合约规格（rb2612/cu2611/au2612/ag2701/ru2612/i2701 真实交易所+乘数）并播 rb2612 今2/昨3 多仓，解决宿主冷启动“合约预热先于下单、行情兴趣集为空”两个时序缺口 | 关 |
+| `CTP_MOCK_LOG` | 日志级别（`error/warn/info/debug/trace/off`）；设置后安装 stderr logger。联调排查 tick 用 `CTP_MOCK_LOG=debug`，逐 tick 推送走 target `ctp_mock_core::tick`；未设置则完全静默（若宿主自装 `log` 后端则交由宿主） | 不安装（静默） |
 
 协议：一行一个 JSON 请求，一行一个 JSON 应答 `{"ok":true,...}` /
 `{"ok":false,"error":...}`。用 `ctp-mock-ctl td|md <cmd>` 驱动，或直接发 JSON。
@@ -150,6 +151,62 @@ ctp-mock-ctl md login-reject 64
 同进程（不跨 dlopen）另有进程内句柄（按构造 flow_path 取实例）：
 `ctpmock_td::ffi::td_api::control_for(flow)` /
 `ctpmock_md::ffi::md_api::control_for(flow)`，供 L2 直接注入。
+
+## 历史 tick 文件回放（模拟实时行情前置）
+
+除自动游走/脚本精确推价外，行情替身可从**仓库外的历史采集文件**读逐笔 tick，
+按真实前置的回调结构 `CThostFtdcDepthMarketDataField` 推送——**数据值取历史文件，
+帧上 `TradingDay/ActionDay/UpdateTime/UpdateMillisec` 一律盖成推送当下的北京时间**，
+对外等同「此刻在线的真实前置」，只是行情来自历史；播完默认循环。
+
+**配置走 ctp-mock 目录下的配置文件（不用环境变量）**：复制模板
+
+```bash
+cp third_party/ctp-mock/ctp-mock.example.toml third_party/ctp-mock/ctp-mock.toml
+```
+
+`.so` 被服务 dlopen、CWD 不可控，发现顺序：从 cwd 逐级向上找 `./ctp-mock.toml`
+与 `./third_party/ctp-mock/ctp-mock.toml`，再回落到 `third_party/ctp-mock/ctp-mock.toml`。
+找不到/`enabled=false` 时回放静默关闭，自动游走/脚本行为不变。实配 `ctp-mock.toml`
+不入库（见 `.gitignore`）。
+
+数据目录按 `{data_root}/Tick/YYYYMM/YYYYMMDD/{合约}.csv` 索引，`date` 留空时自动选
+最新交易日目录；合约＝文件 stem，订阅某合约且命中索引才惰性启动回放（与自动游走互斥、
+回放优先）。配置项：`data_root`(支持 `~/`)、`speed`、`interval_ms`、`max_gap_ms`、
+`loop`、`instruments`(白名单，空＝全部)，语义见模板注释。
+
+源文件为 **15 列、带 UTF-8 BOM** 的采集格式（与服务自身落盘的 33 列 RawTick 不同），
+盘口是一列 Python 字面量 `quotes`（恒 1 档），表头：
+
+```text
+exchange,symbol,open,high,low,price,cum_volume,cum_amount,last_volume,last_amount,\
+trade_type,cum_position,quotes,created_at,type
+```
+
+其中 `quotes` 形如 `"[{'bid_p': 108000.0, 'bid_v': 3, 'ask_p': 109000.0, 'ask_v': 3}]"`，
+`created_at` 为带时区北京时间、小数秒位数可变（如 `2026-10-08 08:59:00.500000+08:00`）。
+
+字段映射到 SimNow 回调（源中没有的列保持柜台默认 0/空，不伪造）：
+
+| 回调字段 | 源列 / 取值 |
+| --- | --- |
+| `InstrumentID` / `ExchangeID` | `symbol` / `exchange` |
+| `LastPrice` / `OpenPrice` / `HighestPrice` / `LowestPrice` | `price` / `open` / `high` / `low` |
+| `Volume`(i32) / `Turnover` / `OpenInterest` | `cum_volume`(饱和转 i32) / `cum_amount` / `cum_position` |
+| `BidPrice1`/`BidVolume1`、`AskPrice1`/`AskVolume1` | `quotes` 首档 `bid_p/bid_v`、`ask_p/ask_v` |
+| 缺侧（`quotes=[]` 或价 ≤ 0） | 该侧价发 `DBL_MAX`、量 0（服务端归一为 0，与真实前置一致） |
+| `TradingDay`/`ActionDay`/`UpdateTime`/`UpdateMillisec` | **推送当下**北京日/时分秒/毫秒 |
+| 2~5 档、昨结/昨收/今收/结算价/涨跌停/均价/虚实度等 | 源无此列，保持 0/空 |
+
+`trade_type`/`type`/`last_volume`/`last_amount` 在深度行情结构里无对应字段，忽略。
+逐行流式读取（不整载入），坏行跳过计数。**`1m`（13 列 K线）本次不接行情回调。**
+
+运行期可经控制面重读配置/停某合约回放：
+
+```bash
+ctp-mock-ctl md replay-reload        # 重读 ctp-mock.toml、重建索引、按订阅重启回放
+ctp-mock-ctl md replay-stop CU2706   # 停止某合约回放
+```
 
 ## 真实进程黑盒联调（trading-service）
 

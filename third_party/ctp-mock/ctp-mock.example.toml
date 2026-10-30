@@ -1,0 +1,30 @@
+# ctp-mock 行情前置（libctpmock_md.so）历史 tick 回放配置。
+#
+# 用法：复制为同目录 ctp-mock.toml（实配不入库，见 .gitignore），按需修改。
+# .so 被服务 dlopen、CWD 不可控：发现顺序为「cwd 逐级向上找 ./ctp-mock.toml
+# 与 ./third_party/ctp-mock/ctp-mock.toml」，再回落到本目录的 ctp-mock.toml。
+# 找不到配置时回放静默关闭，保持既有自动游走/脚本行情行为不变。
+#
+# 数据语义：数据值取历史文件，但帧上 TradingDay/ActionDay/UpdateTime/UpdateMillisec
+# 一律盖成「推送当下」的北京时间，对外等同此刻在线的真实前置；播完默认循环。
+
+[tick_replay]
+# 总开关。
+enabled = true
+# 历史数据根目录：支持 ~/ 展开；相对路径相对本配置文件所在目录解析。
+data_root = "~/ctp_data"
+# 数据种类：目前仅实现 "Tick"（15 列逐笔）。"1m" 是 13 列 K线，不经行情回调回放。
+kind = "Tick"
+# 指定交易日目录 YYYYMMDD；留空＝自动选 data_root/Tick 下最新交易日目录。
+date = ""
+# 按相邻 created_at 差值回放的倍速（>0）。如 10.0 表示用 1/10 时间快放。
+speed = 1.0
+# >0：忽略文件时间戳，按固定毫秒间隔推送；0：按 created_at 相邻差 / speed。
+interval_ms = 0
+# 相邻 tick 等待上限（毫秒）：默认 300000（5 分钟），如实复现文件里分钟级
+# （含小节/午休）的自然 tick 间隔。CTP 无行情回补接口，分钟级不连续照实回放即可。
+max_gap_ms = 300000
+# 播完是否从头循环（历史文件需循环以持续模拟实时前置）。
+loop = true
+# 合约白名单：留空＝对所有“已订阅且索引到文件”的合约回放；列出则只回放这些。
+instruments = []

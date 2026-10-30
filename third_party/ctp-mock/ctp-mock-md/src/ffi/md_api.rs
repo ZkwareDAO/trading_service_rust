@@ -157,6 +157,11 @@ unsafe extern "C" fn md_release(this: *mut MdApiType) {
 unsafe extern "C" fn md_init(this: *mut MdApiType) {
     let api = unsafe { state(this) };
     api.front.start();
+    // 启动时发现并加载历史 tick 回放配置（无 ctp-mock.toml ＝静默不启用）。
+    // 配置损坏只记录、不影响 Init：订阅侧会回落到既有的自动游走/脚本行为。
+    if let Err(e) = api.front.discover_replay() {
+        eprintln!("ctp-mock md tick_replay 配置加载失败，已忽略: {e}");
+    }
 }
 
 unsafe extern "C" fn md_join(_this: *mut MdApiType) -> c_int {
@@ -183,9 +188,13 @@ unsafe extern "C" fn md_subscribe_market_data(
     let api = unsafe { state(this) };
     let syms = read_instruments(pp_instrument, count);
     let code = api.front.subscribe(&syms);
-    // 服务启动即全天行情：订阅生效后对订阅集自动游走（确定性、LastPrice>0）。
-    if auto_enabled() {
-        for s in &syms {
+    for s in &syms {
+        // 历史 tick 回放优先：配置命中该合约则由文件回放接管，不再自动游走。
+        if api.front.ensure_replay_for(s) {
+            continue;
+        }
+        // 未配置回放：保持既有行为，订阅生效后对订阅集自动游走（确定性、LastPrice>0）。
+        if auto_enabled() {
             let base = fixture_base(s);
             api.front.start_auto(s, base, auto_interval_ms());
         }

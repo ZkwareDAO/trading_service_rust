@@ -7,3 +7,5 @@ ctl_td_flow_*
 ctl_md_flow_*
 *_flow_e2e_*
 *_flow_
+# 本地实际回放配置（模板入库为 ctp-mock.example.toml，实配不入库）
+/ctp-mock.toml

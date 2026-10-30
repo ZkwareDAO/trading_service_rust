@@ -51,7 +51,7 @@ cancel-error <0|24|25|26>\n  seed-position <inst> <long|short> <total> [--today 
 ledger\n  disconnect <reason, e.g. 0x1001>\n  reconnect\n  ping\n\n\
 MD:\n  tick <inst> --last P --bid P --ask P\n  auto <inst> [--base P] [--interval-ms N]\n  \
 auto-stop <inst>\n  missing-bid <inst> --last P --ask P\n  missing-ask <inst> --last P --bid P\n  \
-login-reject <code>\n  disconnect <reason>\n  reconnect\n  ping"
+login-reject <code>\n  replay-reload\n  replay-stop <inst>\n  disconnect <reason>\n  reconnect\n  ping"
     );
     std::process::exit(2);
 }
@@ -158,6 +158,11 @@ fn build_md(cmd: &str, rest: &[String]) -> Result<serde_json::Value, String> {
         "login-reject" => {
             let code: i32 = parse_code(rest.first().ok_or("login-reject 需要 code")?)?;
             serde_json::json!({"cmd":"login-reject","code":code})
+        }
+        "replay-reload" => serde_json::json!({"cmd":"replay-reload"}),
+        "replay-stop" => {
+            let inst = rest.first().ok_or("replay-stop 需要合约")?;
+            serde_json::json!({"cmd":"replay-stop","instrument":inst})
         }
         "disconnect" => {
             let code = parse_reason(rest.first().map(|s| s.as_str()).unwrap_or("0x1001"))?;

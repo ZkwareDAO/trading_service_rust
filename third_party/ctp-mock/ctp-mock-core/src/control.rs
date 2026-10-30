@@ -83,6 +83,12 @@ pub enum MdCommand {
         reason: i32,
     },
     Reconnect,
+    /// 重新读取已发现的 ctp-mock.toml、重建索引并按当前订阅（重）启历史回放。
+    ReplayReload,
+    /// 停止某合约的历史 tick 回放。
+    ReplayStop {
+        instrument: String,
+    },
     Ping,
 }
 
@@ -407,6 +413,14 @@ pub fn apply_md(front: &Arc<MockMdFront>, cmd: &MdCommand) -> Response {
             front.reconnect();
             Response::ok()
         }
+        MdCommand::ReplayReload => match front.reload_replay() {
+            Ok(n) => Response::data(serde_json::json!({ "restarted": n }).to_string()),
+            Err(e) => Response::err(e),
+        },
+        MdCommand::ReplayStop { instrument } => {
+            front.stop_replay(instrument);
+            Response::ok()
+        }
     }
 }
 
@@ -563,6 +577,74 @@ mod runtime_tests {
             .ok
         );
         assert!(apply_md(&front, &MdCommand::Ping).ok);
+    }
+
+    #[test]
+    fn replay_commands_dispatch_and_round_trip() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+
+        // JSON 往返。
+        let line = serde_json::to_string(&MdCommand::ReplayReload).unwrap();
+        assert_eq!(line, r#"{"cmd":"replay-reload"}"#);
+        assert_eq!(
+            serde_json::from_str::<MdCommand>(&line).unwrap(),
+            MdCommand::ReplayReload
+        );
+        let stop = MdCommand::ReplayStop {
+            instrument: "CU2706".into(),
+        };
+        let line = serde_json::to_string(&stop).unwrap();
+        assert!(line.contains("replay-stop"));
+        assert_eq!(serde_json::from_str::<MdCommand>(&line).unwrap(), stop);
+
+        // 未加载配置：reload 回错；stop 始终 ok。
+        let front = Arc::new(MockMdFront::new("20261015"));
+        assert!(!apply_md(&front, &MdCommand::ReplayReload).ok);
+        assert!(
+            apply_md(
+                &front,
+                &MdCommand::ReplayStop {
+                    instrument: "X".into()
+                }
+            )
+            .ok
+        );
+
+        // 最小数据树 + 配置：订阅后 reload 重启命中任务，应答 ok。
+        let dir = std::env::temp_dir().join(format!(
+            "ctpmock-ctrl-replay-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let day_dir = dir.join("Tick/202610/20261008");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let header = "\u{feff}exchange,symbol,open,high,low,price,cum_volume,cum_amount,last_volume,last_amount,trade_type,cum_position,quotes,created_at,type";
+        let row = "SHFE,CU2706,1.0,2.0,1.0,500.0,1,5.0,1,5.0,7,9,\"[{'bid_p': 499.0, 'bid_v': 1, 'ask_p': 501.0, 'ask_v': 2}]\",2026-10-08 09:00:00+08:00,14\n";
+        let mut f = std::fs::File::create(day_dir.join("CU2706.csv")).unwrap();
+        writeln!(f, "{header}").unwrap();
+        write!(f, "{row}").unwrap();
+        let cfg = dir.join("ctp-mock.toml");
+        std::fs::write(
+            &cfg,
+            "[tick_replay]\nenabled = true\ndata_root = \".\"\ninterval_ms = 1\nloop = false\n",
+        )
+        .unwrap();
+        front.load_replay_config_file(&cfg).unwrap();
+        front.subscribe(&["CU2706".to_string()]);
+        assert!(apply_md(&front, &MdCommand::ReplayReload).ok);
+        assert!(
+            apply_md(
+                &front,
+                &MdCommand::ReplayStop {
+                    instrument: "CU2706".into()
+                }
+            )
+            .ok
+        );
+        front.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

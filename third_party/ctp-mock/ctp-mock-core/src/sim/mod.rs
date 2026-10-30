@@ -7,6 +7,7 @@ pub mod front;
 pub mod ledger;
 pub mod market;
 pub mod md_front;
+pub mod replay;
 pub mod rules;
 pub mod script;
 pub mod session;

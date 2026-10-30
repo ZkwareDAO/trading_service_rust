@@ -8,6 +8,7 @@
 
 pub mod control;
 pub mod fields;
+pub mod logging;
 pub mod sim;
 
 /// 模拟器语义版本（同时作为 GetApiVersion 的伪装基线）。
