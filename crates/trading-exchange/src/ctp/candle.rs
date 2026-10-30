@@ -5,6 +5,10 @@
 //!   （柜台已把 21:00 后的夜盘算入下一交易日），本状态机不重复实现夜盘日历；
 //! - **成交量必须差分**：CTP 给的是当日累计量，bar.volume = 本桶末累计量 −
 //!   上一桶末累计量；累计额同理；持仓量取桶末值；
+//! - **零成交快照不参与 OHLC**：CTP 每 ~500ms 推快照，无成交时累计量不变、最新价
+//!   停留在上一笔成交价。只有累计量严格增加的 tick 才算真实成交并进入 OHLC；
+//!   整分钟零成交仍出一根 `volume=0` 的延续价 bar（OHLC = 上一根定稿 close，
+//!   当日首桶无延续价时取本桶最新快照价），保证出棒连续、下游契约不变；
 //! - 跨交易日累计量归零 → 重置差分基线；同桶内累计量回退（乱序/重发）差分钳到 0；
 //! - 每个合约一个 [`CandleAggregator`]（由 `bar_agg.rs` 按 symbol 各持一份），
 //!   换月即换实例，互不影响。
@@ -67,10 +71,15 @@ struct OpenCandle {
     start_ms: i64,
     /// 桶周期（定稿 end_ms/`Kline.interval` 都由它派生，不写死 1 分钟）。
     interval: KlineInterval,
-    open: Decimal,
-    high: Decimal,
-    low: Decimal,
-    close: Decimal,
+    /// 本桶内是否已有真实成交（OHLC 是否已初始化）。
+    has_trade: bool,
+    /// 桶内首个成交价；未成交前为 `None`，避免零成交快照污染 OHLC。
+    open: Option<Decimal>,
+    high: Option<Decimal>,
+    low: Option<Decimal>,
+    close: Option<Decimal>,
+    /// 本桶最新快照价（成交/快照 tick 都会刷新；零成交桶兜底延续价用）。
+    last_price: Decimal,
     /// 本桶起点的累计量基线（= 上一桶最后一笔 tick 的累计量；跨日重置为首笔值）。
     base_volume: i64,
     /// 本桶起点的累计额基线。
@@ -89,22 +98,32 @@ struct OpenCandle {
 
 impl OpenCandle {
     /// 用新桶的第一笔 tick 建立中间状态；首笔自身相对基线的差分计入桶量。
+    /// `is_trade` 为 false 时（零成交快照）不初始化 OHLC，仅记录最新价。
     fn first(
         t: &CandleTick,
         start_ms: i64,
         interval: KlineInterval,
         base_volume: i64,
         base_turnover: Decimal,
+        is_trade: bool,
     ) -> Self {
+        // 只有成交 tick 才初始化 OHLC；纯快照桶等待首个成交或定稿时取延续价。
+        let (open, high, low, close) = if is_trade {
+            (Some(t.price), Some(t.price), Some(t.price), Some(t.price))
+        } else {
+            (None, None, None, None)
+        };
         Self {
             trading_day: t.trading_day,
             exchange_id: t.exchange_id.clone(),
             start_ms,
             interval,
-            open: t.price,
-            high: t.price,
-            low: t.price,
-            close: t.price,
+            has_trade: is_trade,
+            open,
+            high,
+            low,
+            close,
+            last_price: t.price,
             base_volume,
             base_turnover,
             last_cum_volume: t.cum_volume,
@@ -115,11 +134,24 @@ impl OpenCandle {
         }
     }
 
-    /// 同桶内追加一笔：更新 OHLC/持仓量，并以「当前累计 − 桶基线」重算桶内差分。
-    fn fold(&mut self, t: &CandleTick) {
-        self.close = t.price;
-        self.high = self.high.max(t.price);
-        self.low = self.low.min(t.price);
+    /// 同桶内追加一笔：仅真实成交更新 OHLC；任何 tick 都刷新持仓/量额差分与最新价。
+    fn fold(&mut self, t: &CandleTick, is_trade: bool) {
+        self.last_price = t.price;
+        if is_trade {
+            if self.has_trade {
+                // 已有成交：扩展 high/low、close 前移，open 保持不变。
+                self.high = Some(self.high.unwrap_or(t.price).max(t.price));
+                self.low = Some(self.low.unwrap_or(t.price).min(t.price));
+                self.close = Some(t.price);
+            } else {
+                // 本桶首个成交：OHLC 四值一次性初始化为成交价。
+                self.open = Some(t.price);
+                self.high = Some(t.price);
+                self.low = Some(t.price);
+                self.close = Some(t.price);
+                self.has_trade = true;
+            }
+        }
         self.volume = volume_delta(t.cum_volume, self.base_volume);
         self.quote_volume = turnover_delta(t.cum_turnover, self.base_turnover);
         self.open_interest = t.open_interest;
@@ -129,9 +161,12 @@ impl OpenCandle {
 
     /// 定稿为不可变 [`Kline`]（结束时间为半开区间 [start, start+interval)）。
     ///
+    /// 零成交桶按方案 B 出延续价：`prev_close`（同一交易日上一根定稿 close）优先，
+    /// 当日首桶无延续价时退化为本桶最新快照价；此时量/额已天然为 0。
+    ///
     /// CTP 专有指标经 extras 平铺：`exchange_id`（Str，真实交易所）与
     /// `open_interest`（Num，周期末持仓量）；成交额并入公共 `quote_volume`。
-    fn finalize(&self, venue: &str, symbol: &str) -> Kline {
+    fn finalize(&self, venue: &str, symbol: &str, prev_close: Option<Decimal>) -> Kline {
         let mut extras = BTreeMap::new();
         extras.insert(
             "exchange_id".to_string(),
@@ -141,6 +176,19 @@ impl OpenCandle {
             "open_interest".to_string(),
             KlineExtra::Num(self.open_interest),
         );
+        // 有成交：取成交 tick 构成的 OHLC（理论上均为 Some，兜底最新价）；
+        // 零成交：四值统一为延续价，保证出棒连续。
+        let (open, high, low, close) = if self.has_trade {
+            (
+                self.open.unwrap_or(self.last_price),
+                self.high.unwrap_or(self.last_price),
+                self.low.unwrap_or(self.last_price),
+                self.close.unwrap_or(self.last_price),
+            )
+        } else {
+            let carry = prev_close.unwrap_or(self.last_price);
+            (carry, carry, carry, carry)
+        };
         Kline {
             venue: venue.to_string(),
             symbol: symbol.to_string(),
@@ -148,10 +196,10 @@ impl OpenCandle {
             trading_day: self.trading_day,
             start_ms: self.start_ms,
             end_ms: self.start_ms + self.interval.duration_ms(),
-            open: self.open,
-            high: self.high,
-            low: self.low,
-            close: self.close,
+            open,
+            high,
+            low,
+            close,
             volume: self.volume,
             quote_volume: self.quote_volume,
             extras,
@@ -172,8 +220,12 @@ pub struct CandleAggregator {
     last_finalized: Option<(u32, i64)>,
     /// 最近一笔已并入 tick 的差分基线 `(交易日, 当日累计量, 当日累计额)`。**独立于在途桶
     /// 存活**：墙钟 take 走桶后仍保留，使同日下一桶（含跨空档首笔）正确差分、量守恒；
-    /// 交易日变化时按本笔重置。`None` = 尚无 tick。
+    /// 交易日变化时按本笔重置。`None` = 尚无 tick。该元组同时是「成交判定」基线：
+    /// 当日累计量严格增加才算真实成交。
     baseline: Option<(u32, i64, Decimal)>,
+    /// 最近一根已定稿 bar 的 `(交易日, 收盘价)`：零成交桶的延续价来源。
+    /// 跨交易日后不再沿用（定稿时按交易日过滤）。
+    last_close: Option<(u32, Decimal)>,
 }
 
 impl CandleAggregator {
@@ -189,6 +241,7 @@ impl CandleAggregator {
             open: None,
             last_finalized: None,
             baseline: None,
+            last_close: None,
         }
     }
 
@@ -201,6 +254,18 @@ impl CandleAggregator {
     /// 记录某桶已定稿（事件时间墙钟 / poll 拍墙钟 / flush 收口都经此，防重复出棒）。
     fn mark_finalized(&mut self, trading_day: u32, start: i64) {
         self.last_finalized = Some((trading_day, start));
+    }
+
+    /// 本笔是否为真实成交：以「上一笔 tick 的当日累计量」差分判定。
+    ///
+    /// 无成交快照的累计量不变（价格停留在上一笔成交价），故只有累计量严格增加才是
+    /// 成交并进入 OHLC。跨交易日累计量归零/重置，基线按日失效：当日首笔观测到非零
+    /// 累计量即视为成交（否则新交易日首根 bar 会丢失 OHLC）。
+    fn is_trade(&self, t: &CandleTick) -> bool {
+        match self.baseline {
+            Some((day, vol, _)) if day == t.trading_day => t.cum_volume > vol,
+            _ => t.cum_volume > 0,
+        }
     }
 
     /// 丢弃 tick 的统一 debug 日志（迟到 / 乱序两路共用），不改动任何状态。
@@ -242,12 +307,14 @@ impl CandleAggregator {
             return finished;
         }
         // 3) 同桶 fold；否则（首笔/墙钟已收口/跨日，在途必为空）开新桶。
+        //    成交判定先于折叠：以本笔之前的累计量为基线（跨日自动失效）。
+        let is_trade = self.is_trade(t);
         match self.open.take() {
             Some(mut c) if c.trading_day == t.trading_day && c.start_ms == start => {
-                c.fold(t);
+                c.fold(t, is_trade);
                 self.open = Some(c);
             }
-            _ => self.open = Some(self.open_candle(t, start)),
+            _ => self.open = Some(self.open_candle(t, start, is_trade)),
         }
         // 推进外层差分基线（独立于在途桶存活，墙钟 take 不清它）。
         self.baseline = Some((t.trading_day, t.cum_volume, t.cum_turnover));
@@ -256,20 +323,35 @@ impl CandleAggregator {
 
     /// 开新桶并定差分基线：同交易日接上一笔累计量（该笔可能属于已被墙钟 take 的旧桶，
     /// 故基线存聚合器外层而非桶内）；跨交易日或当日首笔则累计归零、基线取本笔。
-    fn open_candle(&self, t: &CandleTick, start: i64) -> OpenCandle {
+    fn open_candle(&self, t: &CandleTick, start: i64, is_trade: bool) -> OpenCandle {
         let (base_volume, base_turnover) = match self.baseline {
             Some((day, vol, ref turn)) if day == t.trading_day => (vol, *turn),
             _ => (t.cum_volume, t.cum_turnover),
         };
-        OpenCandle::first(t, start, self.interval, base_volume, base_turnover)
+        OpenCandle::first(
+            t,
+            start,
+            self.interval,
+            base_volume,
+            base_turnover,
+            is_trade,
+        )
     }
 
     /// `take` 出在途桶，登记定稿点并定稿为 [`Kline`]；无桶返回 `None`。
-    /// 只动 `open`/`last_finalized`，**不清外层 `baseline`**，跨空档下一桶据此续算差分。
+    /// 只动 `open`/`last_finalized`/`last_close`，**不清外层 `baseline`**，
+    /// 跨空档下一桶据此续算差分。
     fn take_and_finalize(&mut self) -> Option<Kline> {
         self.open.take().map(|c| {
             self.mark_finalized(c.trading_day, c.start_ms);
-            c.finalize(&self.venue, &self.symbol)
+            // 延续价仅在同一交易日内有效（跨日收盘不能作为次日零成交桶的 OHLC）。
+            let prev_close = match self.last_close {
+                Some((day, close)) if day == c.trading_day => Some(close),
+                _ => None,
+            };
+            let bar = c.finalize(&self.venue, &self.symbol, prev_close);
+            self.last_close = Some((c.trading_day, bar.close));
+            bar
         })
     }
 
@@ -459,13 +541,13 @@ mod tests {
         assert_eq!(bar.quote_volume, dec(0));
     }
 
-    // 最低价在下跌中更新。
+    // 最低价在下跌中更新（累计量递增 = 真实成交，OHLC 才会被采纳）。
     #[test]
     fn high_low_track_extremes() {
         let mut agg = CandleAggregator::new("ctp", "cu2512", KlineInterval::M1);
-        agg.on_tick(&tick(20261023, 600_000, 100, 0, 0, 0));
-        agg.on_tick(&tick(20261023, 605_000, 99, 0, 0, 0));
-        agg.on_tick(&tick(20261023, 610_000, 101, 0, 0, 0));
+        agg.on_tick(&tick(20261023, 600_000, 100, 10, 0, 0));
+        agg.on_tick(&tick(20261023, 605_000, 99, 11, 0, 0));
+        agg.on_tick(&tick(20261023, 610_000, 101, 12, 0, 0));
         let bar = agg.flush().unwrap();
         assert_eq!(bar.low, dec(99));
         assert_eq!(bar.high, dec(101));
@@ -773,5 +855,217 @@ mod tests {
         assert_eq!(b.start_ms, 900_000);
         // 量守恒：基线 10→20，乱序笔 15（更小，乱序）不计入 → 10:05 量 10。
         assert_eq!(b.volume, 10);
+    }
+
+    // ===== 零成交快照不参与 OHLC（方案 B：延续价出棒）=====
+
+    /// 分钟/秒 → 当日毫秒（与 update_ms 同坐标系）。
+    fn m_of(mm: i64, sec: i64) -> i64 {
+        mm * 60_000 + sec * 1_000
+    }
+
+    // 上一分钟已有成交（建立累计量基线）后，新桶首笔零成交快照不得提前钉住 open；
+    // 只有首个真实成交 tick 才初始化 OHLC。
+    #[test]
+    fn snapshot_before_first_trade_does_not_set_open() {
+        const DAY: u32 = 20261030;
+        let mut agg = CandleAggregator::new("ctp", "ag2706", KlineInterval::M1);
+        // 09:00:59 真实成交（累计 47，价 14835）：建立基线。
+        agg.on_tick(&tick(DAY, m_of(540, 59), 14835, 47, 0, 1));
+        // 09:01:00 零成交快照：触发 09:00 桶边界定稿，但自身不得计入新桶 OHLC。
+        let boundary = agg
+            .on_tick(&tick(DAY, m_of(541, 0), 14840, 47, 0, 1))
+            .expect("09:00 桶边界定稿");
+        assert_eq!(boundary.start_ms, m_of(540, 0));
+        // 09:01:05 真实成交：累计 48、价 14850。
+        assert!(agg
+            .on_tick(&tick(DAY, m_of(541, 5), 14850, 48, 0, 2))
+            .is_none());
+
+        let bar = agg.flush().expect("09:01 桶");
+        assert_eq!(bar.start_ms, m_of(541, 0));
+        assert_eq!(bar.open, dec(14850));
+        assert_eq!(bar.high, dec(14850));
+        assert_eq!(bar.low, dec(14850));
+        assert_eq!(bar.close, dec(14850));
+    }
+
+    // 成交流之间夹入偏离快照价：high/low 只由真实成交 tick 决定。
+    #[test]
+    fn snapshot_prices_never_enter_high_low() {
+        const DAY: u32 = 20261030;
+        let mut agg = CandleAggregator::new("ctp", "ag2706", KlineInterval::M1);
+        // 上一分钟成交建立基线（累计 100）。
+        agg.on_tick(&tick(DAY, m_of(540, 59), 1000, 100, 0, 1));
+        // 首笔成交 1010（累计 110）：初始化 OHLC。
+        agg.on_tick(&tick(DAY, m_of(541, 5), 1010, 110, 0, 2));
+        // 快照尖峰 1050（累计不变）：不得进入 high。
+        agg.on_tick(&tick(DAY, m_of(541, 10), 1050, 110, 0, 3));
+        // 快照下探 990（累计不变）：不得进入 low。
+        agg.on_tick(&tick(DAY, m_of(541, 40), 990, 110, 0, 4));
+        // 再成交 1005（累计 120）：更新 low/close。
+        agg.on_tick(&tick(DAY, m_of(541, 50), 1005, 120, 0, 5));
+
+        let bar = agg.flush().expect("09:01 桶");
+        assert_eq!(bar.open, dec(1010));
+        assert_eq!(bar.high, dec(1010));
+        assert_eq!(bar.low, dec(1005));
+        assert_eq!(bar.close, dec(1005));
+        // 量仍按累计差分：120 − 100 = 20（快照不贡献量）。
+        assert_eq!(bar.volume, 20);
+    }
+
+    // 整分钟零成交：仍出一根 volume=0 的 bar，OHLC 取上一根已定稿 bar 的收盘延续价。
+    #[test]
+    fn zero_trade_bucket_emits_carry_over_bar() {
+        const DAY: u32 = 20261030;
+        let mut agg = CandleAggregator::new("ctp", "ag2706", KlineInterval::M1);
+        // 09:00 桶有成交：close 1000，墙钟定稿。
+        agg.on_tick(&tick(DAY, m_of(540, 50), 1000, 100, 0, 1));
+        let b0 = agg.finalize_if_due(m_of(541, 0)).expect("09:00 定稿");
+        assert_eq!(b0.close, dec(1000));
+
+        // 09:01 整分钟仅快照（累计保持 100、价格波动）。
+        agg.on_tick(&tick(DAY, m_of(541, 10), 1003, 100, 0, 2));
+        agg.on_tick(&tick(DAY, m_of(541, 40), 1005, 100, 0, 3));
+        let b1 = agg.finalize_if_due(m_of(542, 0)).expect("09:01 定稿");
+
+        assert_eq!(b1.volume, 0);
+        assert_eq!(b1.quote_volume, dec(0));
+        assert_eq!(b1.open, dec(1000));
+        assert_eq!(b1.high, dec(1000));
+        assert_eq!(b1.low, dec(1000));
+        assert_eq!(b1.close, dec(1000));
+        // 持仓仍取桶末快照值。
+        assert_eq!(bar_oi(&b1), dec(3));
+    }
+
+    // 当日首桶纯快照（无上一根 close）：退化为该桶最新快照价。
+    #[test]
+    fn zero_trade_first_bucket_falls_back_to_last_price() {
+        const DAY: u32 = 20261030;
+        let mut agg = CandleAggregator::new("ctp", "ag2706", KlineInterval::M1);
+        // 累计量为 0（当日尚无成交），两笔快照。
+        agg.on_tick(&tick(DAY, m_of(541, 10), 14800, 0, 0, 1));
+        agg.on_tick(&tick(DAY, m_of(541, 40), 14810, 0, 0, 2));
+
+        let bar = agg.flush().expect("首桶");
+        assert_eq!(bar.volume, 0);
+        assert_eq!(bar.open, dec(14810));
+        assert_eq!(bar.high, dec(14810));
+        assert_eq!(bar.low, dec(14810));
+        assert_eq!(bar.close, dec(14810));
+    }
+
+    // 回归：稀疏成交下墙钟 sweep 仍按时收口零成交桶，且下一根成交桶正常续接。
+    #[test]
+    fn sparse_trades_still_finalize_on_wallclock() {
+        const DAY: u32 = 20261030;
+        let mut agg = CandleAggregator::new("ctp", "ag2706", KlineInterval::M1);
+        // 09:00 成交 1000（累计 100）→ 墙钟定稿。
+        agg.on_tick(&tick(DAY, m_of(540, 59), 1000, 100, 0, 1));
+        let b0 = agg.finalize_if_due(m_of(541, 0)).expect("09:00 定稿");
+        assert_eq!(b0.close, dec(1000));
+
+        // 09:01 仅快照 → 墙钟到点仍出延续价 bar。
+        agg.on_tick(&tick(DAY, m_of(541, 10), 1004, 100, 0, 2));
+        let b1 = agg.finalize_if_due(m_of(542, 0)).expect("09:01 定稿");
+        assert_eq!(b1.start_ms, m_of(541, 0));
+        assert_eq!(b1.close, dec(1000));
+        assert_eq!(b1.volume, 0);
+
+        // 09:02 成交 1012（累计 105）：新桶首笔即成交，open=1012，量 5。
+        agg.on_tick(&tick(DAY, m_of(542, 5), 1012, 105, 0, 3));
+        let b2 = agg.flush().expect("09:02 桶");
+        assert_eq!(b2.open, dec(1012));
+        assert_eq!(b2.close, dec(1012));
+        assert_eq!(b2.volume, 5);
+    }
+
+    // 跨交易日累计量归零（50000 → 0）：零量首笔按快照处理，不误判为成交；
+    // 随后累计量转正的 tick 才初始化 OHLC，且量差分不为负。
+    #[test]
+    fn cross_day_cum_reset_not_treated_as_trade() {
+        const D1: u32 = 20261029;
+        const D2: u32 = 20261030;
+        let mut agg = CandleAggregator::new("ctp", "ag2706", KlineInterval::M1);
+        // 前一日 14:59 成交，累计 50000；墙钟定稿。
+        agg.on_tick(&tick(D1, m_of(899, 0), 70000, 50_000, 0, 100));
+        let d1 = agg.finalize_if_due(m_of(900, 0)).expect("前日定稿");
+        assert_eq!(d1.trading_day, D1);
+
+        // 次日 09:00:00 累计归零的快照：不得把 70010 钉成 open。
+        assert!(agg
+            .on_tick(&tick(D2, m_of(540, 0), 70010, 0, 0, 101))
+            .is_none());
+        // 次日 09:00:05 首笔成交（累计 3）：初始化 OHLC。
+        assert!(agg
+            .on_tick(&tick(D2, m_of(540, 5), 70020, 3, 0, 102))
+            .is_none());
+
+        let bar = agg.flush().expect("次日桶");
+        assert_eq!(bar.trading_day, D2);
+        assert_eq!(bar.open, dec(70020));
+        assert_eq!(bar.high, dec(70020));
+        assert_eq!(bar.low, dec(70020));
+        assert_eq!(bar.close, dec(70020));
+        // 量 = 3 − 次日基线 0 = 3，绝不为负。
+        assert_eq!(bar.volume, 3);
+    }
+
+    // 跨交易日 + 整分钟零成交：不得沿用上一交易日收盘价，必须退化为本桶最新快照价。
+    #[test]
+    fn cross_day_zero_trade_bucket_uses_snapshot_not_prev_day_close() {
+        const D1: u32 = 20261029;
+        const D2: u32 = 20261030;
+        let mut agg = CandleAggregator::new("ctp", "ag2706", KlineInterval::M1);
+        // 前一日 14:59 成交，收盘 70000；墙钟定稿后 last_close=(D1, 70000)。
+        agg.on_tick(&tick(D1, m_of(899, 0), 70000, 50_000, 0, 100));
+        let d1 = agg.finalize_if_due(m_of(900, 0)).expect("前日定稿");
+        assert_eq!(d1.close, dec(70000));
+
+        // 次日 09:00 整分钟仅零成交快照（累计归零），价格 70010 → 70020。
+        agg.on_tick(&tick(D2, m_of(540, 10), 70010, 0, 0, 101));
+        agg.on_tick(&tick(D2, m_of(540, 40), 70020, 0, 0, 102));
+        let bar = agg.finalize_if_due(m_of(541, 0)).expect("次日零成交桶");
+
+        assert_eq!(bar.trading_day, D2);
+        assert_eq!(bar.volume, 0);
+        assert_eq!(bar.quote_volume, dec(0));
+        // 关键：跨日不延续 D1 的 70000，退化为本桶最新快照价 70020。
+        assert_eq!(bar.open, dec(70020));
+        assert_eq!(bar.high, dec(70020));
+        assert_eq!(bar.low, dec(70020));
+        assert_eq!(bar.close, dec(70020));
+        assert_eq!(bar_oi(&bar), dec(102));
+    }
+
+    // 连续多个整分钟零成交：每根都延续同一价格（延续链），不得被桶内快照价改写。
+    #[test]
+    fn consecutive_zero_trade_buckets_chain_prior_close() {
+        const DAY: u32 = 20261030;
+        let mut agg = CandleAggregator::new("ctp", "ag2706", KlineInterval::M1);
+        // 09:00 成交 close=1000，墙钟定稿。
+        agg.on_tick(&tick(DAY, m_of(540, 50), 1000, 100, 0, 1));
+        let b0 = agg.finalize_if_due(m_of(541, 0)).expect("09:00 定稿");
+        assert_eq!(b0.close, dec(1000));
+
+        // 09:01 仅快照（价 1003）：出延续价 bar，close 仍为 1000。
+        agg.on_tick(&tick(DAY, m_of(541, 10), 1003, 100, 0, 2));
+        let b1 = agg.finalize_if_due(m_of(542, 0)).expect("09:01 定稿");
+        assert_eq!(b1.start_ms, m_of(541, 0));
+        assert_eq!(b1.volume, 0);
+        assert_eq!(b1.close, dec(1000));
+
+        // 09:02 仍仅快照（价 1007）：应继续延续 1000（链式），而不是改写为 1007。
+        agg.on_tick(&tick(DAY, m_of(542, 10), 1007, 100, 0, 3));
+        let b2 = agg.finalize_if_due(m_of(543, 0)).expect("09:02 定稿");
+        assert_eq!(b2.start_ms, m_of(542, 0));
+        assert_eq!(b2.volume, 0);
+        assert_eq!(b2.quote_volume, dec(0));
+        assert_eq!(b2.open, dec(1000));
+        assert_eq!(b2.high, dec(1000));
+        assert_eq!(b2.low, dec(1000));
+        assert_eq!(b2.close, dec(1000));
     }
 }

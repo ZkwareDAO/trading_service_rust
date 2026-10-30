@@ -5,12 +5,23 @@
 ## 开发环境
 
 - Rust 1.80+（见 `rust-toolchain.toml`）
-- 构建与测试：
 
-```bash
-cargo build --workspace
-cargo test --workspace
-```
+常用命令（来源：workspace `Cargo.toml`、`crates/trading-service/Cargo.toml`、`scripts/`）：
+
+| 命令 | 说明 |
+| --- | --- |
+| `cargo build --workspace` | 构建全部 crate（默认 feature） |
+| `cargo build -p trading-service --features ctp` | 构建含 CTP 期货适配的服务 |
+| `cargo test --workspace` | 默认测试集（**不含** `ctp` feature 代码） |
+| `cargo test -p trading-exchange --features ctp ctp` | CTP 适配层单测 |
+| `cargo test -p trading-service --features ctp` | 含 CTP feature 的服务测试 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 全目标 lint（含测试代码） |
+| `cargo fmt --all -- --check` | 格式检查 |
+| `scripts/build-ctp-mock.sh` | 构建 CTP 模拟器 `.so` 与 `ctp-mock-ctl`（联调 / 历史 tick 回放） |
+
+> `ctp` 不是默认 feature：`cargo test --workspace` 不会编译 CTP 适配代码。改动
+> `crates/trading-exchange/src/ctp/**` 或 `trading-service` 的 CTP 路径时，必须额外跑带
+> `--features ctp` 的测试。
 
 ## 提交规范
 
@@ -29,9 +40,9 @@ type 取值：`feat` / `fix` / `refactor` / `docs` / `test` / `chore` / `perf` /
 1. 从 `main` 拉出 feature 分支；
 2. 实现 + 测试——**每个 PR 必须包含完整、逻辑清晰的测试代码**，方便 reviewer 审核；
 3. 提交前自查：
-   - `cargo clippy --workspace -- -D warnings` 零警告
-   - `cargo fmt --check` 通过
-   - `cargo test --workspace` 全绿
+   - `cargo clippy --workspace --all-targets -- -D warnings` 零警告
+   - `cargo fmt --all -- --check` 通过
+   - `cargo test --workspace` 全绿；涉及 CTP 时补 `--features ctp`
 4. PR 描述写清：动机、方案要点、测试方式。
 
 ## 代码约定（摘自项目原则）

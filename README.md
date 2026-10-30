@@ -238,10 +238,16 @@ sudo ./deploy/deploy.sh      # 构建并安装到 /opt/trading_service_rust，�
 ## 测试
 
 ```bash
+# 默认测试集（不含 ctp feature）
 cargo test --workspace
-cargo clippy --workspace -- -D warnings
-cargo fmt --check
+# CTP 适配不在默认 feature 中，需显式开启
+cargo test -p trading-exchange --features ctp ctp
+cargo test -p trading-service --features ctp
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
+
+CTP 联调 / 历史 tick 回放需先构建模拟器：`scripts/build-ctp-mock.sh`。
 
 ## 贡献
 
