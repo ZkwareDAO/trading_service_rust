@@ -56,6 +56,15 @@ pub async fn app_with_accounts(csv_body: &str) -> TestApp {
         rule_refresh_interval: Duration::from_secs(3600),
         position_debounce: Duration::from_millis(100),
         position_reconcile_interval: Duration::from_secs(3600),
+        kline_retain_bars: 1440,
+        kline_retain_age: Duration::from_secs(24 * 60 * 60),
+        kline_history_limits: crate::kline_history::HistoryLimits::new(
+            crate::kline_history::DEFAULT_HISTORY_LIMIT,
+            crate::kline_history::MAX_HISTORY_LIMIT,
+        )
+        .unwrap(),
+        kline_gap_scan_interval: Duration::from_secs(300),
+        kline_stall_threshold: Duration::from_secs(180),
         endpoints,
         // 测试默认不配置任何通知通道（五 URL 全空，静默跳过）。
         channels: crate::notify::ChannelUrls::new(

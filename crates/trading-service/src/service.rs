@@ -568,6 +568,7 @@ pub async fn dispatch(state: AppState, strategy: String, cmd: SouthCommand) {
         "cancel_order" | "cancel" => cancel_order(state, strategy, cmd).await,
         "get_positions" => get_positions(state, strategy, cmd).await,
         "get_order" => get_order(state, strategy, cmd).await,
+        "get_klines" => get_klines(state, strategy, cmd).await,
         "create_rule" | "create_watch_rule" => create_rule(state, strategy, cmd).await,
         "subscribe_kline" | "subscribe_klines" => subscribe_kline(state, strategy, cmd).await,
         "unsubscribe_kline" | "unsubscribe_klines" => unsubscribe_kline(state, strategy, cmd).await,
@@ -1079,6 +1080,67 @@ async fn get_positions(state: AppState, strategy: String, cmd: SouthCommand) {
     send_value(&state, &strategy, &frame).await;
 }
 
+/// get_klines：只读本地（内存保留窗 + 归档 CSV），应答自定义 `kline_history` 帧。
+/// 不调交易所（三家现场回补是后续 P4）；非法参数/未知所回 error，无数据回空数组。
+async fn get_klines(state: AppState, strategy: String, cmd: SouthCommand) {
+    // 复用 K线命令公共校验（exchange 必填且四所白名单、interval 仅 1m）。
+    if let Some(err) = validate_kline(&cmd) {
+        let ev = ClientEvent::error(err, Some(strategy.clone()));
+        return send_event(&state, &strategy, &ev).await;
+    }
+    let exchange = cmd.exchange().unwrap_or_default().to_string();
+    let Some(symbol) = cmd.instrument() else {
+        let ev = ClientEvent::error(
+            "get_klines 需要 symbol（或 instrument）".to_string(),
+            Some(strategy.clone()),
+        );
+        return send_event(&state, &strategy, &ev).await;
+    };
+    // 区间非法（start≥end）：回 error。
+    if let (Some(s), Some(e)) = (cmd.start_time, cmd.end_time) {
+        if s >= e {
+            let ev = ClientEvent::error(
+                format!("get_klines 非法区间：start_time({s}) 必须 < end_time({e})"),
+                Some(strategy.clone()),
+            );
+            return send_event(&state, &strategy, &ev).await;
+        }
+    }
+
+    let page = match state
+        .kline
+        .history(&exchange, symbol, cmd.start_time, cmd.end_time, cmd.limit)
+        .await
+    {
+        Ok(page) => page,
+        Err(e) => {
+            // 冷读 IO 异常等：WS 不细分错误码，回 error 帧。
+            let ev = ClientEvent::error(format!("get_klines 失败：{e}"), Some(strategy.clone()));
+            return send_event(&state, &strategy, &ev).await;
+        }
+    };
+
+    let klines: Vec<serde_json::Value> = page
+        .bars
+        .iter()
+        .map(crate::kline_history::bar_to_kline_event)
+        .map(|k| serde_json::to_value(k).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let frame = serde_json::json!({
+        "type": "kline_history",
+        "status": "OK",
+        "exchange": exchange,
+        "symbol": symbol,
+        "interval": crate::kline::KLINE_INTERVAL,
+        // 回带本次实际生效查询键（无 req_id 的应答归属依据）；空结果且无区间时为 null。
+        "start_time": page.eff_start,
+        "end_time": page.eff_end,
+        "has_more": page.has_more,
+        "klines": klines,
+    });
+    send_value(&state, &strategy, &frame).await;
+}
+
 async fn reject(
     state: &AppState,
     strategy: &str,
@@ -1461,6 +1523,173 @@ mod tests {
             .unwrap();
         let msg = ws.next().await.unwrap().unwrap();
         serde_json::from_str(msg.to_text().unwrap()).unwrap()
+    }
+
+    // ---- get_klines：南向 WS 本地历史取数（热读/空/翻页/错误）----
+
+    /// 发一条 get_klines 命令（body 为 exchange 之后的 JSON 片段）并读回一帧。
+    async fn send_get_klines(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        body: &str,
+    ) -> serde_json::Value {
+        use futures_util::{SinkExt, StreamExt};
+        let cmd = format!(r#"{{"option":"get_klines",{body}}}"#);
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(cmd.into()))
+            .await
+            .unwrap();
+        let msg = ws.next().await.unwrap().unwrap();
+        serde_json::from_str(msg.to_text().unwrap()).unwrap()
+    }
+
+    /// 往内存 BarTable 灌入最近 n 根（结束于当前分钟）binance BTCUSDT bar，返回各 start。
+    fn seed_recent_bars(state: &crate::state::AppState, n: i64) -> Vec<i64> {
+        use chrono::TimeZone;
+        use trading_models::Bar;
+        let now_min = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let mut starts = Vec::new();
+        for i in 0..n {
+            let start = now_min - (n - 1 - i) * 60_000;
+            let day: u32 = chrono::Utc
+                .timestamp_millis_opt(start)
+                .single()
+                .unwrap()
+                .format("%Y%m%d")
+                .to_string()
+                .parse()
+                .unwrap();
+            let mut b = Bar::new("binance", "BTCUSDT", day, start, start + 60_000);
+            b.close = rust_decimal::Decimal::from(100 + i);
+            state.store.bar_table().upsert(b);
+            starts.push(start);
+        }
+        starts
+    }
+
+    #[tokio::test]
+    async fn get_klines_explicit_window_returns_frame_and_keys() {
+        let app = crate::api::test_support::app_with_accounts("").await;
+        let url = crate::api::test_support::serve_south_ws(&app.state).await;
+        let starts = seed_recent_bars(&app.state, 3);
+        let mut ws = connect_south(&url, "s1").await;
+
+        let v = send_get_klines(
+            &mut ws,
+            &format!(
+                r#""exchange":"binance","symbol":"BTCUSDT","start_time":{},"end_time":{}"#,
+                starts[0],
+                starts[2] + 60_000
+            ),
+        )
+        .await;
+
+        assert_eq!(v["type"], "kline_history");
+        assert_eq!(v["status"], "OK");
+        assert_eq!(v["exchange"], "binance");
+        assert_eq!(v["symbol"], "BTCUSDT");
+        assert_eq!(v["interval"], "1m");
+        assert_eq!(v["start_time"], starts[0]);
+        assert_eq!(v["end_time"], starts[2] + 60_000);
+        assert_eq!(v["has_more"], false);
+        assert_eq!(v["klines"].as_array().unwrap().len(), 3);
+        // 元素与实时推送同形（venue/start/flatten 公共字段）。
+        assert_eq!(v["klines"][0]["venue"], "binance");
+        assert_eq!(v["klines"][0]["start_time"], starts[0]);
+        assert_eq!(v["klines"][0]["close"], 100);
+    }
+
+    #[tokio::test]
+    async fn get_klines_no_data_returns_empty_list_not_error() {
+        let app = crate::api::test_support::app_with_accounts("").await;
+        let url = crate::api::test_support::serve_south_ws(&app.state).await;
+        let mut ws = connect_south(&url, "s1").await;
+
+        let v = send_get_klines(&mut ws, r#""exchange":"binance","symbol":"ETHUSDT""#).await;
+        assert_eq!(v["type"], "kline_history");
+        assert_eq!(v["status"], "OK");
+        assert_eq!(v["klines"].as_array().unwrap().len(), 0);
+        assert_eq!(v["has_more"], false);
+    }
+
+    #[tokio::test]
+    async fn get_klines_limit_has_more_and_pagination_no_overlap() {
+        let app = crate::api::test_support::app_with_accounts("").await;
+        let url = crate::api::test_support::serve_south_ws(&app.state).await;
+        let starts = seed_recent_bars(&app.state, 5);
+        let mut ws = connect_south(&url, "s1").await;
+
+        // 宽窗 + limit=2 → 最早 2 根、has_more=true。
+        let v1 = send_get_klines(
+            &mut ws,
+            &format!(
+                r#""exchange":"binance","symbol":"BTCUSDT","start_time":{},"end_time":{},"limit":2"#,
+                starts[0],
+                starts[4] + 60_000
+            ),
+        )
+        .await;
+        assert_eq!(v1["klines"].as_array().unwrap().len(), 2);
+        assert_eq!(v1["klines"][0]["start_time"], starts[0]);
+        assert_eq!(v1["klines"][1]["start_time"], starts[1]);
+        assert_eq!(v1["has_more"], true);
+
+        // 翻页：起点用上一页最后一根 start + step（左闭右开，无重叠）。
+        let v2 = send_get_klines(
+            &mut ws,
+            &format!(
+                r#""exchange":"binance","symbol":"BTCUSDT","start_time":{},"end_time":{},"limit":2"#,
+                starts[2],
+                starts[4] + 60_000
+            ),
+        )
+        .await;
+        assert_eq!(v2["klines"][0]["start_time"], starts[2]);
+        assert_eq!(v2["klines"][1]["start_time"], starts[3]);
+    }
+
+    #[tokio::test]
+    async fn get_klines_recent_default_returns_last_n_with_effective_keys() {
+        let app = crate::api::test_support::app_with_accounts("").await;
+        let url = crate::api::test_support::serve_south_ws(&app.state).await;
+        let starts = seed_recent_bars(&app.state, 3);
+        let mut ws = connect_south(&url, "s1").await;
+
+        // 不给区间：取最近 N（默认 300，3 根全回），eff 键回填首/末根 start。
+        let v = send_get_klines(&mut ws, r#""exchange":"binance","symbol":"BTCUSDT""#).await;
+        assert_eq!(v["klines"].as_array().unwrap().len(), 3);
+        assert_eq!(v["start_time"], starts[0]);
+        assert_eq!(v["end_time"], starts[2]);
+        assert_eq!(v["has_more"], false);
+    }
+
+    #[tokio::test]
+    async fn get_klines_rejects_bad_params_with_error_frame() {
+        let app = crate::api::test_support::app_with_accounts("").await;
+        let url = crate::api::test_support::serve_south_ws(&app.state).await;
+        seed_recent_bars(&app.state, 1);
+        let mut ws = connect_south(&url, "s1").await;
+
+        // 未知所。
+        let v = send_get_klines(&mut ws, r#""exchange":"x","symbol":"BTCUSDT""#).await;
+        assert_eq!(v["type"], "error");
+        // 缺 symbol。
+        let v = send_get_klines(&mut ws, r#""exchange":"binance""#).await;
+        assert_eq!(v["type"], "error");
+        // 周期非 1m。
+        let v = send_get_klines(
+            &mut ws,
+            r#""exchange":"binance","symbol":"BTCUSDT","interval":"5m""#,
+        )
+        .await;
+        assert_eq!(v["type"], "error");
+        // start≥end。
+        let v = send_get_klines(
+            &mut ws,
+            r#""exchange":"binance","symbol":"BTCUSDT","start_time":100,"end_time":100"#,
+        )
+        .await;
+        assert_eq!(v["type"], "error");
     }
 
     /// 在本地仓位表插入一条指定账户/标的/方向/合约形状的仓位，返回其本地 id。

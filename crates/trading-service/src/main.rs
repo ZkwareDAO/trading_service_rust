@@ -14,6 +14,9 @@ mod event;
 mod hub;
 mod interest;
 mod kline;
+mod kline_backfill;
+mod kline_gap;
+mod kline_history;
 mod notify;
 mod order_query;
 mod position_query;
@@ -188,6 +191,11 @@ async fn main() -> anyhow::Result<()> {
         rule_refresh_interval: cfg.rule_refresh_interval,
         position_debounce: cfg.position_debounce,
         position_reconcile_interval: cfg.position_reconcile_interval,
+        kline_retain_bars: cfg.kline_retain_bars,
+        kline_retain_age: cfg.kline_retain_age,
+        kline_history_limits: cfg.kline_history_limits,
+        kline_gap_scan_interval: cfg.kline_gap_scan_interval,
+        kline_stall_threshold: cfg.kline_stall_threshold,
         endpoints,
         channels: notify::ChannelUrls::new(
             cfg.notify_open_url,
@@ -307,6 +315,12 @@ async fn main() -> anyhow::Result<()> {
     // CTP 合约规格每日刷新（仅启用 ctp 时）：拉全量 → 落盘 + latest → 重灌合约目录。
     #[cfg(feature = "ctp")]
     let south_app = south_app.route("/admin/ctp/refresh-specs", post(admin::refresh_ctp_specs));
+
+    // K线历史手动补区间（仅 binance/deribit/hyperliquid；统一 code/message/data 信封）。
+    let south_app = south_app.route(
+        "/admin/klines/backfill",
+        post(api::handlers::klines_backfill::backfill),
+    );
 
     let south_app = south_app
         // REST API（/health 与 /api/v1/*，与南向 WS 同端口）。

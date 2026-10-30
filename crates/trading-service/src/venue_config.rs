@@ -10,6 +10,7 @@
 //! ```
 
 use std::path::Path;
+use std::time::Duration;
 
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -23,6 +24,16 @@ pub const DEFAULT_OPEN_DRIFT_TICKS: i64 = 5;
 /// 默认 hyperliquid 市价滑点（5%）。
 pub const DEFAULT_HYPERLIQUID_SLIPPAGE: &str = "0.05";
 
+// —— K线历史回补缺省（[kline.backfill]）——
+/// 自动回补轮询周期缺省（5 分钟）。
+pub const DEFAULT_BACKFILL_INTERVAL: Duration = Duration::from_secs(300);
+/// 单页根数缺省。
+pub const DEFAULT_BACKFILL_PAGE_SIZE: usize = 1000;
+/// 同所分页请求间隔缺省（500ms）。
+pub const DEFAULT_BACKFILL_PAGE_DELAY: Duration = Duration::from_millis(500);
+/// 每所并发上限缺省。
+pub const DEFAULT_BACKFILL_CONCURRENCY: usize = 2;
+
 /// 加载后的全部 venue 配置（CtpConfig 含 String 非 Copy，整体退化为 Clone）。
 #[derive(Debug, Clone)]
 pub struct LoadedVenueConfigs {
@@ -32,10 +43,85 @@ pub struct LoadedVenueConfigs {
     pub hyperliquid: HyperliquidConfig,
     /// Binance：配置基线 K线标的（启动即订阅并全量落盘）。
     pub binance: BinanceVenueConfig,
+    /// K线相关配置（历史缺失自动回补/手动补区间）。
+    pub kline: KlineConfig,
     /// CTP：.so 路径/流目录基准（feature="ctp" 时由 registry 消费；生产模式
     /// 开关已下沉账户级 credentials）。
     #[cfg(feature = "ctp")]
     pub ctp: trading_exchange::ctp::CtpConfig,
+}
+
+/// K线配置段（当前仅历史回补）。
+#[derive(Debug, Clone)]
+pub struct KlineConfig {
+    /// 历史缺失自动回补参数。
+    pub backfill: KlineBackfillConfig,
+}
+
+/// `[kline.backfill]` 强类型配置（启动期解析+校验，非法 fail-fast）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KlineBackfillConfig {
+    /// 自动回补轮询周期；`Duration::ZERO`（interval="0"）= 关闭后台自动回补，
+    /// P5 管理面手动补仍可用。
+    pub interval: Duration,
+    /// 单次 REST 拉取的最大根数（三家按 1m，≤1000）。
+    pub page_size: usize,
+    /// 同所相邻两页请求间隔（限频节流；0=不 sleep）。
+    pub page_delay: Duration,
+    /// 单个交易所同时进行的回补任务上限。
+    pub concurrency: usize,
+}
+
+impl Default for KlineBackfillConfig {
+    fn default() -> Self {
+        Self {
+            interval: DEFAULT_BACKFILL_INTERVAL,
+            page_size: DEFAULT_BACKFILL_PAGE_SIZE,
+            page_delay: DEFAULT_BACKFILL_PAGE_DELAY,
+            concurrency: DEFAULT_BACKFILL_CONCURRENCY,
+        }
+    }
+}
+
+impl KlineBackfillConfig {
+    /// 把 TOML section（字符串时长）解析为强类型并校验；非法值返回错误（启动 fail-fast）。
+    fn from_section(s: &BackfillSection) -> anyhow::Result<Self> {
+        // interval：裸 "0" 合法（关后台）；其余必须是 >0 的带单位时长。
+        let interval = parse_optional_duration(&s.interval, DEFAULT_BACKFILL_INTERVAL, true)?;
+        // page_delay：裸 "0" 也合法（不节流），其余 ≥0 带单位；缺省 500ms。
+        let page_delay = parse_optional_duration(&s.page_delay, DEFAULT_BACKFILL_PAGE_DELAY, true)?;
+        let page_size = s.page_size.unwrap_or(DEFAULT_BACKFILL_PAGE_SIZE);
+        let concurrency = s.concurrency.unwrap_or(DEFAULT_BACKFILL_CONCURRENCY);
+        if page_size < 1 {
+            anyhow::bail!("[kline.backfill] page_size 必须 ≥1，实际 {page_size}");
+        }
+        if concurrency < 1 {
+            anyhow::bail!("[kline.backfill] concurrency 必须 ≥1，实际 {concurrency}");
+        }
+        Ok(Self {
+            interval,
+            page_size,
+            page_delay,
+            concurrency,
+        })
+    }
+}
+
+/// 解析可选时长字段：缺省取 `default`；裸 `"0"` 在 `allow_zero` 时映射为 ZERO；
+/// 其余交给 [`trading_core::timeutil::parse_duration`]（要求带单位且 >0）。
+fn parse_optional_duration(
+    raw: &Option<String>,
+    default: Duration,
+    allow_zero: bool,
+) -> anyhow::Result<Duration> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let raw = raw.trim();
+    if allow_zero && raw == "0" {
+        return Ok(Duration::ZERO);
+    }
+    trading_core::timeutil::parse_duration(raw)
 }
 
 /// Binance 配置段：当前仅承载配置基线 K线标的。
@@ -119,10 +205,33 @@ struct VenueFile {
     /// Binance 段（配置基线 K线标的；缺失＝无基线）。
     #[serde(default)]
     binance: BinanceSection,
+    /// K线段（历史回补）。
+    #[serde(default)]
+    kline: KlineSection,
     /// CTP 段（feature="ctp" 时由 registry 消费；缺失回退 vendored 缺省）。
     #[serde(default)]
     #[cfg(feature = "ctp")]
     ctp: CtpSection,
+}
+
+/// `[kline]` 段（当前仅含 backfill 子表）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+struct KlineSection {
+    #[serde(default)]
+    backfill: BackfillSection,
+}
+
+/// `[kline.backfill]` 原始 TOML（时长保持字符串，在 load() 中解析为 Duration）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+struct BackfillSection {
+    /// 自动回补轮询周期；"0"=关闭（缺省 5m）。
+    interval: Option<String>,
+    /// 单页根数（缺省 1000）。
+    page_size: Option<usize>,
+    /// 同所分页间隔（缺省 500ms；"0"=不节流）。
+    page_delay: Option<String>,
+    /// 每所并发上限（缺省 2）。
+    concurrency: Option<usize>,
 }
 
 /// binance 配置段：仅配置基线 K线标的；全部可选，缺省为空。
@@ -165,6 +274,9 @@ pub fn load(path: &Path) -> anyhow::Result<LoadedVenueConfigs> {
     };
     let parsed: VenueFile =
         toml::from_str(&text).map_err(|e| anyhow::anyhow!("解析 venue 配置 {path:?}: {e}"))?;
+    // 回补配置非法（坏时长/越界）在启动期 fail-fast。
+    let backfill = KlineBackfillConfig::from_section(&parsed.kline.backfill)
+        .map_err(|e| anyhow::anyhow!("解析 venue 配置 {path:?}: {e}"))?;
     Ok(LoadedVenueConfigs {
         deribit: PrepConfig {
             drift_ticks: parsed.deribit.open_drift_ticks,
@@ -176,6 +288,7 @@ pub fn load(path: &Path) -> anyhow::Result<LoadedVenueConfigs> {
         binance: BinanceVenueConfig {
             kline_symbols: parsed.binance.kline_symbols,
         },
+        kline: KlineConfig { backfill },
         #[cfg(feature = "ctp")]
         ctp: trading_exchange::ctp::from_values(
             parsed.ctp.trader_so,
@@ -207,6 +320,9 @@ pub fn default_configs() -> LoadedVenueConfigs {
             slippage: default_slippage(),
         },
         binance: BinanceVenueConfig::default(),
+        kline: KlineConfig {
+            backfill: KlineBackfillConfig::default(),
+        },
         #[cfg(feature = "ctp")]
         ctp: trading_exchange::ctp::from_values(
             None, None, None, None, None, None, None, None, None, None, None,
@@ -339,5 +455,67 @@ mod tests {
         let path = dir.path().join("venue.toml");
         std::fs::write(&path, "garbage =").unwrap();
         assert!(load(&path).is_err());
+    }
+
+    // ---- [kline.backfill] ----
+
+    #[test]
+    fn backfill_defaults_when_section_absent() {
+        let cfg = default_configs();
+        let b = cfg.kline.backfill;
+        assert_eq!(b.interval, std::time::Duration::from_secs(300));
+        assert_eq!(b.page_size, 1000);
+        assert_eq!(b.page_delay, std::time::Duration::from_millis(500));
+        assert_eq!(b.concurrency, 2);
+        // 文件缺失同样取默认。
+        let loaded = load(Path::new("/nonexistent/venue.toml")).unwrap();
+        assert_eq!(loaded.kline.backfill.interval, b.interval);
+    }
+
+    #[test]
+    fn parses_backfill_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("venue.toml");
+        std::fs::write(
+            &path,
+            "[kline.backfill]\ninterval = \"1m\"\npage_size = 250\n\
+             page_delay = \"20ms\"\nconcurrency = 4\n",
+        )
+        .unwrap();
+        let b = load(&path).unwrap().kline.backfill;
+        assert_eq!(b.interval, std::time::Duration::from_secs(60));
+        assert_eq!(b.page_size, 250);
+        assert_eq!(b.page_delay, std::time::Duration::from_millis(20));
+        assert_eq!(b.concurrency, 4);
+    }
+
+    #[test]
+    fn backfill_interval_zero_is_valid_and_disables_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("venue.toml");
+        std::fs::write(&path, "[kline.backfill]\ninterval = \"0\"\n").unwrap();
+        let b = load(&path).unwrap().kline.backfill;
+        assert_eq!(b.interval, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn backfill_invalid_values_fail_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        // page_size 必须 ≥1。
+        let p = dir.path().join("a.toml");
+        std::fs::write(&p, "[kline.backfill]\npage_size = 0\n").unwrap();
+        assert!(load(&p).is_err());
+        // concurrency 必须 ≥1。
+        let p = dir.path().join("b.toml");
+        std::fs::write(&p, "[kline.backfill]\nconcurrency = 0\n").unwrap();
+        assert!(load(&p).is_err());
+        // 非法时长。
+        let p = dir.path().join("c.toml");
+        std::fs::write(&p, "[kline.backfill]\ninterval = \"abc\"\n").unwrap();
+        assert!(load(&p).is_err());
+        // "0s" 非法（关后台只能写无单位的 "0"），避免与正时长口径混淆。
+        let p = dir.path().join("d.toml");
+        std::fs::write(&p, "[kline.backfill]\ninterval = \"0s\"\n").unwrap();
+        assert!(load(&p).is_err());
     }
 }

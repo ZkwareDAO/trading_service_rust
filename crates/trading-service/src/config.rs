@@ -63,6 +63,30 @@ pub struct Args {
     #[arg(long, default_value = "5s")]
     pub kline_flush_interval: String,
 
+    /// BarTable 每序列（venue×symbol）在内存保留的最近 bar 条数上限（1m，1440≈24h）。
+    #[arg(long, default_value = "1440")]
+    pub kline_retain_bars: String,
+
+    /// BarTable 每序列 bar 的内存保留时长（如 24h / 6h）；与条数上限取先到者。
+    #[arg(long, default_value = "24h")]
+    pub kline_retain_age: String,
+
+    /// get_klines 不传 limit 时缺省返回根数。
+    #[arg(long, default_value = "300")]
+    pub kline_history_default_limit: String,
+
+    /// get_klines 单次返回根数硬上限（请求超限截断到此值）。
+    #[arg(long, default_value = "1500")]
+    pub kline_history_max_limit: String,
+
+    /// 三家 K线缺口内部扫描周期（仅 binance/deribit/hyperliquid）；设 0 关闭周期扫描（实时尾检仍在）。
+    #[arg(long, default_value = "5m")]
+    pub kline_gap_scan_interval: String,
+
+    /// 三家静默停推阈值：now-末键 超过此时长即登记缺口（如 3m），必须 >0。
+    #[arg(long, default_value = "3m")]
+    pub kline_stall_threshold: String,
+
     /// 南向策略连接共享密钥文件（64 hex，0600，首启自动生成）。留空则用 <data-dir>/south.key。
     #[arg(long, default_value = "")]
     pub south_secret_file: String,
@@ -122,6 +146,16 @@ pub struct ServiceConfig {
     pub rule_scan_interval: Duration,
     /// K线 bar/tick 批量落 CSV 周期。
     pub kline_flush_interval: Duration,
+    /// BarTable 每序列内存保留 bar 条数上限。
+    pub kline_retain_bars: usize,
+    /// BarTable 每序列内存保留时长。
+    pub kline_retain_age: Duration,
+    /// get_klines 缺省/最大返回根数。
+    pub kline_history_limits: crate::kline_history::HistoryLimits,
+    /// 三家 K线缺口内部扫描周期（0=关闭周期扫描，实时尾检仍在）。
+    pub kline_gap_scan_interval: Duration,
+    /// 三家静默停推阈值（必须 >0）。
+    pub kline_stall_threshold: Duration,
     pub south_secret_file: String,
     pub south_dev_insecure: bool,
     /// 企业微信开仓成交通知 Webhook（空串=关闭）。
@@ -167,6 +201,14 @@ impl Args {
         .to_string_lossy()
         .into_owned();
         let exchanges = parse_exchange_endpoints(&args.exchanges)?;
+        let kline_retain_bars = parse_retain_bars(&args.kline_retain_bars)?;
+        let kline_retain_age = trading_core::timeutil::parse_duration(&args.kline_retain_age)?;
+        let history_limits = parse_history_limits(
+            Some(&args.kline_history_default_limit),
+            Some(&args.kline_history_max_limit),
+        )?;
+        let (kline_gap_scan_interval, kline_stall_threshold) =
+            parse_gap_timings(&args.kline_gap_scan_interval, &args.kline_stall_threshold)?;
         Ok(ServiceConfig {
             south_addr: args.south_addr,
             exchanges,
@@ -189,6 +231,11 @@ impl Args {
             kline_flush_interval: trading_core::timeutil::parse_duration(
                 &args.kline_flush_interval,
             )?,
+            kline_retain_bars,
+            kline_retain_age,
+            kline_history_limits: history_limits,
+            kline_gap_scan_interval,
+            kline_stall_threshold,
             south_secret_file,
             south_dev_insecure: args.south_dev_insecure,
             notify_open_url: args.notify_open_url.trim().to_string(),
@@ -200,6 +247,68 @@ impl Args {
             venue_config: args.venue_config.trim().to_string(),
         })
     }
+}
+
+/// 解析 `--kline-retain-bars`：trim 后的正整数（≥1）；0/负数/非整数 fail-fast。
+fn parse_retain_bars(raw: &str) -> anyhow::Result<usize> {
+    let raw = raw.trim();
+    let n: usize = raw
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--kline-retain-bars 应为正整数，收到 `{raw}`"))?;
+    if n == 0 {
+        anyhow::bail!("--kline-retain-bars 必须 ≥1，收到 0");
+    }
+    Ok(n)
+}
+
+/// 解析 get_klines 的缺省/最大返回根数（None→内置缺省）；要求两者 ≥1 且 default ≤ max。
+fn parse_history_limits(
+    default_raw: Option<&str>,
+    max_raw: Option<&str>,
+) -> anyhow::Result<crate::kline_history::HistoryLimits> {
+    use crate::kline_history::{HistoryLimits, DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT};
+    let parse = |raw: Option<&str>, builtin: usize, flag: &str| -> anyhow::Result<usize> {
+        match raw {
+            Some(s) => {
+                let n: usize = s
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("{flag} 应为正整数，收到 `{}`", s.trim()))?;
+                if n == 0 {
+                    anyhow::bail!("{flag} 必须 ≥1，收到 0");
+                }
+                Ok(n)
+            }
+            None => Ok(builtin),
+        }
+    };
+    let default_limit = parse(
+        default_raw,
+        DEFAULT_HISTORY_LIMIT,
+        "--kline-history-default-limit",
+    )?;
+    let max_limit = parse(max_raw, MAX_HISTORY_LIMIT, "--kline-history-max-limit")?;
+    HistoryLimits::new(default_limit, max_limit).ok_or_else(|| {
+        anyhow::anyhow!(
+            "get_klines 限额非法：default({default_limit}) 必须 ≤ max({max_limit}) 且均 ≥1"
+        )
+    })
+}
+
+/// 解析缺口检测两时长：扫描周期（允许裸 "0"＝关闭周期扫描）与静默阈值（必须 >0）。
+fn parse_gap_timings(scan_raw: &str, stall_raw: &str) -> anyhow::Result<(Duration, Duration)> {
+    // parse_duration 不接受裸 0；扫描周期 0 是“关闭周期扫描”的合法开关，单独归一。
+    let scan = if scan_raw.trim() == "0" {
+        Duration::ZERO
+    } else {
+        trading_core::timeutil::parse_duration(scan_raw)?
+    };
+    let stall = trading_core::timeutil::parse_duration(stall_raw)?;
+    // 静默阈值为 0 会把每根 bar 都判成“停推”，无意义；启动 fail-fast。
+    if stall.is_zero() {
+        anyhow::bail!("--kline-stall-threshold 必须 >0，收到 0");
+    }
+    Ok((scan, stall))
 }
 
 /// 解析 `--exchange name=http://host:port` 列表；WS 推导复用 [`ExchangeEndpoint::new`]。
@@ -249,5 +358,101 @@ mod tests {
             parse_exchange_endpoints(&["x=http://a".to_string(), "x=http://b".to_string()])
                 .is_err()
         ); // 重名
+    }
+
+    #[test]
+    fn kline_retention_args_default_to_1440_and_24h() {
+        // 不给 flag 时缺省 1440 条 / 24h；时长走统一 parse_duration。
+        let a = Args::try_parse_from(["svc"]).unwrap();
+        assert_eq!(a.kline_retain_bars, "1440");
+        assert_eq!(a.kline_retain_age, "24h");
+        assert_eq!(
+            trading_core::timeutil::parse_duration(&a.kline_retain_age).unwrap(),
+            Duration::from_secs(24 * 60 * 60)
+        );
+        // 显式 flag 覆盖缺省。
+        let a = Args::try_parse_from([
+            "svc",
+            "--kline-retain-bars",
+            "600",
+            "--kline-retain-age",
+            "6h",
+        ])
+        .unwrap();
+        assert_eq!(a.kline_retain_bars, "600");
+        assert_eq!(a.kline_retain_age, "6h");
+    }
+
+    #[test]
+    fn parse_retain_bars_accepts_positive_int_rejects_zero_and_garbage() {
+        assert_eq!(parse_retain_bars("1440").unwrap(), 1440);
+        assert_eq!(parse_retain_bars(" 100 ").unwrap(), 100);
+        assert!(parse_retain_bars("0").is_err(), "0 无意义需 fail-fast");
+        assert!(parse_retain_bars("-1").is_err());
+        assert!(parse_retain_bars("abc").is_err());
+    }
+
+    #[test]
+    fn invalid_retain_age_is_rejected() {
+        assert!(trading_core::timeutil::parse_duration("nope").is_err());
+    }
+
+    #[test]
+    fn history_limit_args_default_to_300_and_1500() {
+        let a = Args::try_parse_from(["svc"]).unwrap();
+        assert_eq!(a.kline_history_default_limit, "300");
+        assert_eq!(a.kline_history_max_limit, "1500");
+        let a = Args::try_parse_from([
+            "svc",
+            "--kline-history-default-limit",
+            "120",
+            "--kline-history-max-limit",
+            "600",
+        ])
+        .unwrap();
+        assert_eq!(a.kline_history_default_limit, "120");
+        assert_eq!(a.kline_history_max_limit, "600");
+    }
+
+    #[test]
+    fn parse_history_limits_validates_positive_and_ordering() {
+        let ok = parse_history_limits(Some("300"), Some("1500")).unwrap();
+        assert_eq!(ok.default_limit, 300);
+        assert_eq!(ok.max_limit, 1500);
+        // 缺省 → 内置 300/1500。
+        let d = parse_history_limits(None, None).unwrap();
+        assert_eq!((d.default_limit, d.max_limit), (300, 1500));
+        // 0 / 非正 / 非整数 fail-fast。
+        assert!(parse_history_limits(Some("0"), Some("1500")).is_err());
+        assert!(parse_history_limits(Some("abc"), Some("1500")).is_err());
+        assert!(
+            parse_history_limits(Some("1501"), Some("1500")).is_err(),
+            "default 不得大于 max"
+        );
+    }
+
+    #[test]
+    fn gap_timing_args_default_to_5m_scan_and_3m_stall() {
+        let a = Args::try_parse_from(["svc"]).unwrap();
+        assert_eq!(a.kline_gap_scan_interval, "5m");
+        assert_eq!(a.kline_stall_threshold, "3m");
+        let (scan, stall) =
+            parse_gap_timings(&a.kline_gap_scan_interval, &a.kline_stall_threshold).unwrap();
+        assert_eq!(scan, Duration::from_secs(300));
+        assert_eq!(stall, Duration::from_secs(180));
+    }
+
+    #[test]
+    fn gap_timings_allow_override_and_zero_scan_but_reject_zero_stall() {
+        // 显式覆盖正常。
+        let (scan, stall) = parse_gap_timings("1m", "2m").unwrap();
+        assert_eq!(scan, Duration::from_secs(60));
+        assert_eq!(stall, Duration::from_secs(120));
+        // 扫描周期允许 0（关闭周期扫描，实时尾检仍在）。
+        assert_eq!(parse_gap_timings("0", "3m").unwrap().0, Duration::ZERO);
+        // 静默阈值 0 / 非法串 fail-fast。
+        assert!(parse_gap_timings("5m", "0").is_err());
+        assert!(parse_gap_timings("nope", "3m").is_err());
+        assert!(parse_gap_timings("5m", "nope").is_err());
     }
 }

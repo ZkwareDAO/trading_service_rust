@@ -27,6 +27,17 @@ slippage = "0.05"
 # kline_symbols = ["BTCUSDT", "ETHUSDT"]
 kline_symbols = []
 
+# —— K线历史缺失自动回补（仅 binance/deribit/hyperliquid；CTP 无历史接口不生效）——
+[kline.backfill]
+# 自动回补轮询周期；"0" = 关闭后台自动回补（管理面手动补区间 POST /admin/klines/backfill 仍可用）。
+interval = "5m"
+# 单次 REST 拉取分页根数（三家按 1m，建议 ≤1000）。
+page_size = 1000
+# 同一交易所相邻两页请求间隔（节流，避免触发限频）；"0"=不 sleep。
+page_delay = "500ms"
+# 单个交易所同时进行的回补任务上限。
+concurrency = 2
+
 # ---- CTP 国内期货（feature="ctp" 编译时生效）----
 [ctp]
 # 柜台交易/行情 API 动态库路径；缺省用仓库内 vendored v6.7.13 linux64。
@@ -47,3 +58,10 @@ md_pass_is_authcode = false
 # （买开=ask+n、卖开=bid−n；平仓不漂移，取 best bid/ask）。缺省/注释=用内置默认 1，0=纯对手价。
 # 规则引擎与手动 API 共用；仅作用于 SHFE（非 SHFE 市价维持原生 AnyPrice+IOC）。
 shfe_market_drift_ticks = 1
+# 冷启动预设主力（品种:合约），用于盘中重启/未到 15:00 收盘选举窗口时，
+# 品种订阅（cu）立即只推该合约；当日收盘选举对该品种跳过，次日由真实成交量接管。
+# E2E 验证用：cu 当前最近月合约。
+preset_dominants = ["cu:cu2611"]
+# 配置基线 K线品种：服务启动即默认采集这些品种（展开为全部在交易合约），
+# 与南向客户端运行时订阅取并集；客户端退订不会移除这里配置的品种。
+kline_products = ["cu"]

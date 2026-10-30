@@ -2,6 +2,7 @@
 
 pub mod accounts;
 pub mod exchange_positions;
+pub mod klines_backfill;
 pub mod lists;
 pub mod orders;
 pub mod rule_writes;

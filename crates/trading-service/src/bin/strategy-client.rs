@@ -220,6 +220,10 @@ fn build_command(args: &Args) -> anyhow::Result<SouthCommand> {
         // K线订阅为独立 WS 客户端用法，本 CLI 暂不下发，保持缺省。
         symbols: Vec::new(),
         interval: None,
+        // get_klines 历史取数同样不走本 CLI，保持缺省（由 WS 客户端直接发）。
+        start_time: None,
+        end_time: None,
+        limit: None,
     };
     match opt.as_str() {
         "place_order" | "place" => {

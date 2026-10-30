@@ -22,7 +22,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use trading_core::kline::{BarTable, KlineRegistry, RegistrySource, TickTable};
+use trading_core::kline::{
+    detect_tail_gap, BarTable, GapRegistry, KlineRegistry, RegistrySource, SeriesKey, TickTable,
+};
 use trading_core::protocol::{ClientEvent, KlineEvent};
 use trading_exchange::market::{
     BarSink, DesiredSource, Kline as StreamKline, MarketDataStream, SubscriptionGuard,
@@ -31,8 +33,46 @@ use trading_exchange::registry::ExchangeRegistry;
 use trading_models::{Bar, InstrumentType};
 use trading_store::{KlineFlushReport, KlineRepo, TradingStore};
 
+use crate::kline_gap::{gap_supported_venue, GapScanConfig, GapScanner};
+use crate::kline_history::{merge_and_window, HistoryLimits, HistoryPage, HistoryQuery};
+
 /// 本期唯一 K线周期标识（南向协议 / 登记表 / CSV 目录同口径）。
 pub const KLINE_INTERVAL: &str = "1m";
+/// 1m K线桶步长（毫秒）。
+pub const KLINE_STEP_MS: i64 = 60_000;
+
+/// 定稿 bar 未落盘（dirty）积压的告警阈值：超过即认为 CSV 落盘可能持续故障。
+/// flush 失败期 dirty 豁免裁剪、只增不减，此告警**不丢数据**，只提示内存持续增长。
+const BAR_BACKLOG_WARN_THRESHOLD: usize = 100_000;
+
+/// 积压边沿判定：只在「正常→超阈」告警一次、回落到阈值内报一次恢复，避免每拍刷屏。
+/// 返回 `(新告警态, 是否刚越阈, 是否刚恢复)`。纯函数便于单测。
+fn backlog_edge(was_over: bool, pending: usize, threshold: usize) -> (bool, bool, bool) {
+    let now_over = pending > threshold;
+    (now_over, now_over && !was_over, was_over && !now_over)
+}
+
+/// 当前 UTC 墙钟（毫秒）；历史取数懒加载窗口锚点、缺口周期扫描生产时钟。
+pub(crate) fn now_utc_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// 在阻塞线程池读归档 CSV（同步文件 IO 不占 tokio worker，仿 admin::refresh-specs）。
+async fn read_csv_blocking(
+    repo: &KlineRepo,
+    venue: &str,
+    symbol: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> anyhow::Result<trading_store::kline::ReadBars> {
+    let repo = repo.clone();
+    let venue = venue.to_string();
+    let symbol = symbol.to_string();
+    let join =
+        tokio::task::spawn_blocking(move || repo.read_range(&venue, &symbol, start_ms, end_ms))
+            .await?;
+    join.map_err(anyhow::Error::from)
+}
 
 /// 一个 K线订阅作用域：交易所 × 标的类别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +171,8 @@ fn venue_itype(venue: &str) -> InstrumentType {
 ///
 /// 公共字段直搬；各所专有指标（CTP exchange_id/open_interest、币安 trade_num/…）
 /// 整包透传 [`Bar::extras`]，本映射 venue-neutral、不为具体所写特例。
-fn bar_from_kline(k: &StreamKline) -> Bar {
+/// `pub(crate)`：实时落盘 sink 与历史回补（[`crate::kline_backfill`]）共用同一映射。
+pub(crate) fn bar_from_kline(k: &StreamKline) -> Bar {
     Bar {
         exchange: k.venue.clone(),
         symbol: k.symbol.clone(),
@@ -431,8 +472,14 @@ impl KlineBatcher {
 
 /// 仅负责**持久化**的 sink：把定稿 bar append 进待刷盘 BarTable（每根只由此处写一次）。
 /// 纯内存、同步廉价。WS 路径与 CTP 无条件全量持久化共用。
+///
+/// 顺带承担缺口**实时尾部检测**（检测点 1，仅三家）：`upsert` 返回写入前旧末键，与本来棒
+/// start 比对，跳分钟即把缺口登记进 [`GapRegistry`]。无 IO/await、分钟级触发，满足 on_bar
+/// 同步契约；CTP 在白名单外，只落盘不检测。
 struct PersistenceBarSink {
     bars: Arc<BarTable>,
+    /// 缺口去重登记集合（store 收口；与扫描线程共享同一进程单例）。
+    gaps: Arc<GapRegistry>,
 }
 
 impl BarSink for PersistenceBarSink {
@@ -446,7 +493,25 @@ impl BarSink for PersistenceBarSink {
             volume = bar.volume,
             "定稿 bar 入待刷盘窗口（无条件全量落盘）"
         );
-        self.bars.push(bar_from_kline(bar));
+        // upsert 在同一把序列锁内返回写入前旧末键，尾检无竞态；四家 bar 一律落盘。
+        let prev_start = self.bars.upsert(bar_from_kline(bar));
+        if gap_supported_venue(&bar.venue) {
+            if let Some(gap) = detect_tail_gap(prev_start, bar.start_ms, KLINE_STEP_MS) {
+                let added = self
+                    .gaps
+                    .record(&bar.venue, &bar.symbol, &gap, KLINE_STEP_MS);
+                if added > 0 {
+                    tracing::warn!(
+                        venue = %bar.venue,
+                        symbol = %bar.symbol,
+                        gap_start = gap.start,
+                        gap_end = gap.end,
+                        missing = added,
+                        "定稿 bar 尾检发现缺口（已登记待回补集合）"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -525,36 +590,68 @@ pub struct KlineService {
     batcher: KlineBatcher,
     /// 配置基线订阅（venue+itype → 基线合约；只贡献线订阅并集，不做南向推送）。
     baselines: Arc<Vec<BaselineKlines>>,
+    /// 南向 get_klines 历史取数的根数限制（缺省/硬上限）。
+    history_limits: crate::kline_history::HistoryLimits,
+    /// K线缺口去重登记集合（store 收口；尾检与扫描线程共享，仅三家）。
+    gaps: Arc<GapRegistry>,
+    /// 缺口周期扫描器（检测点 2 内部扫描 + 检测点 3 静默停推）。
+    gap_scanner: GapScanner,
+    /// 缺口检测参数（步长/静默阈值/扫描周期；scan_interval=0 表示不起扫描线程）。
+    gap_cfg: GapScanConfig,
+    /// 历史缺失自动回补配置（interval=0 表示不起后台 worker；手动补仍可用）。
+    backfill_cfg: crate::kline_backfill::BackfillRuntimeConfig,
+    /// P5 手动回补互斥：true=已有一次手动补区间在跑，拒绝并发（40901）。
+    /// 自动 worker 不经此锁（它用 GapRegistry 的 per-series inflight 去重）。
+    manual_busy: Arc<AtomicBool>,
     /// 慢/不可达连接丢弃的 bar 帧总数（观测）。
     dropped: Arc<AtomicU64>,
+    /// bar dirty 积压是否正处于超阈告警态（边沿去抖：仅越阈/恢复各报一次）。
+    bar_backlog_alarmed: AtomicBool,
     /// 每个作用域一个 subscribe_klines 凭证（与进程同寿；drop 即整体退订）。
     guards: Mutex<Vec<SubscriptionGuard>>,
     /// 后台 CSV 刷盘线程句柄（start 后才有）；优雅停机 join 以保证最后一刷落盘。
     flush_task: Mutex<Option<thread::JoinHandle<()>>>,
     /// 后台批量推送线程句柄（start 后才有）；优雅停机 join 以保证最后一拍缓冲推出。
     push_task: Mutex<Option<thread::JoinHandle<()>>>,
+    /// 后台缺口扫描线程句柄（start 后、且 scan_interval>0 才有）；优雅停机 join 收口。
+    gap_task: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl KlineService {
-    /// 从 TradingStore 取齐五表/repo 句柄构造，注入南向推送端口与配置基线
+    /// 从 TradingStore 取齐五表/repo 句柄构造，注入南向推送端口、配置基线与历史取数限额
     /// （内部全是进程单例）。基线只驱动线订阅/落盘，不写入客户端订阅登记表。
     pub fn new(
         store: Arc<TradingStore>,
         pusher: Arc<dyn KlinePusher>,
         baselines: Vec<BaselineKlines>,
+        history_limits: HistoryLimits,
+        gap_cfg: GapScanConfig,
+        backfill_cfg: crate::kline_backfill::BackfillRuntimeConfig,
     ) -> Self {
+        let bars = store.bar_table();
+        let gaps = store.gap_registry();
+        let gap_scanner = GapScanner::new(Arc::clone(&bars), Arc::clone(&gaps), gap_cfg);
         Self {
             registry: store.kline_registry(),
-            bars: store.bar_table(),
+            bars,
             ticks: store.ctp_ticks(),
             repo: store.kline_repo(),
             pusher,
             batcher: KlineBatcher::default(),
             baselines: Arc::new(baselines),
+            history_limits,
+            gaps,
+            gap_scanner,
+            gap_cfg,
+            backfill_cfg,
             dropped: Arc::new(AtomicU64::new(0)),
+            bar_backlog_alarmed: AtomicBool::new(false),
+            // P5 手动回补互斥：true 表示已有一次手动补区间在跑，拒绝并发（40901）。
+            manual_busy: Arc::new(AtomicBool::new(false)),
             guards: Mutex::new(Vec::new()),
             flush_task: Mutex::new(None),
             push_task: Mutex::new(None),
+            gap_task: Mutex::new(None),
         }
     }
 
@@ -566,8 +663,10 @@ impl KlineService {
     /// 安全（句柄只 take/join 一次）；返回 Err 仅表示某线程曾 panic（已记录）。
     pub fn join_flush(&self) -> thread::Result<()> {
         // 逐个 take 释放锁再 join，不持锁等待线程。
-        // 先 join 推送线程：保证停机前入缓冲的最后一批 bar 已发出，再收口刷盘线程。
+        // 先 join 推送线程：保证停机前入缓冲的最后一批 bar 已发出；再收口缺口扫描线程，
+        // 最后 join 刷盘线程（缺口/实时 bar 都已登记，停机补扫/补落盘后进程才退出）。
         join_take(&self.push_task)?;
+        join_take(&self.gap_task)?;
         join_take(&self.flush_task)
     }
 
@@ -614,6 +713,7 @@ impl KlineService {
     fn persistence_sink_inner(&self) -> PersistenceBarSink {
         PersistenceBarSink {
             bars: Arc::clone(&self.bars),
+            gaps: Arc::clone(&self.gaps),
         }
     }
 
@@ -721,6 +821,29 @@ impl KlineService {
         self.send_frames(frames);
     }
 
+    /// 检查 bar dirty 积压并做边沿告警：越阈打一次 error，回落打一次恢复 info。
+    /// 由刷盘线程每拍调用；数据不丢，仅可观测。
+    fn check_bar_backlog(&self) {
+        self.check_bar_backlog_at(BAR_BACKLOG_WARN_THRESHOLD);
+    }
+
+    /// 阈值可注入版本（测试用小阈值验证边沿状态翻转；日志副作用同生产）。
+    fn check_bar_backlog_at(&self, threshold: usize) {
+        let pending = self.bars.pending_dirty();
+        let was = self.bar_backlog_alarmed.load(Ordering::Relaxed);
+        let (now, raised, cleared) = backlog_edge(was, pending, threshold);
+        self.bar_backlog_alarmed.store(now, Ordering::Relaxed);
+        if raised {
+            tracing::error!(
+                pending,
+                threshold,
+                "定稿 bar 未落盘积压超阈：CSV 落盘可能持续故障，内存将持续增长（dirty 不丢、不裁剪），请检查磁盘/权限"
+            );
+        } else if cleared {
+            tracing::info!(pending, "定稿 bar 未落盘积压已回落至阈值内（落盘恢复）");
+        }
+    }
+
     /// 立即各刷一批 bar/tick 到 CSV（同步；测试与停机兜底用）。
     /// IO 失败时 KlineRepo 已把整批放回窗口队首下轮重试（不丢数据，可能重复），
     /// 这里仅记日志、该类计数按 0 处理，绝不向 flush 线程传播 panic。
@@ -740,6 +863,79 @@ impl KlineService {
             }
         };
         FlushOutcome { bars, ticks }
+    }
+
+    /// 南向 `get_klines`：本地两级读（内存保留窗热读 + 归档 CSV 冷读），重启冷启动先
+    /// 懒加载 [`BarTable::restore`]。全程只读本地、不调交易所（三家现场回补是后续 P4）。
+    pub async fn history(
+        &self,
+        venue: &str,
+        symbol: &str,
+        start: Option<i64>,
+        end: Option<i64>,
+        limit: Option<usize>,
+    ) -> anyhow::Result<HistoryPage> {
+        self.history_at(venue, symbol, start, end, limit, now_utc_ms())
+            .await
+    }
+
+    /// 可注入 `now_ms` 的历史取数编排（测试确定性；生产走墙钟 [`Self::history`]）。
+    async fn history_at(
+        &self,
+        venue: &str,
+        symbol: &str,
+        start: Option<i64>,
+        end: Option<i64>,
+        limit: Option<usize>,
+        now_ms: i64,
+    ) -> anyhow::Result<HistoryPage> {
+        let q = HistoryQuery {
+            venue: venue.to_string(),
+            symbol: symbol.to_string(),
+            start,
+            end,
+            limit: self.history_limits.normalize(limit),
+        };
+        let key = SeriesKey::new(venue, symbol);
+
+        // 1) 冷启动懒加载：表内无该序列 → 读近一个保留窗 CSV 预热（restore 不置 dirty、不重写盘）。
+        if self.bars.span(&key).is_none() {
+            let age_ms = self.bars.retain_age().as_millis().min(i64::MAX as u128) as i64;
+            let from = now_ms.saturating_sub(age_ms);
+            let to = now_ms.saturating_add(KLINE_STEP_MS);
+            self.restore_window(&key, from, to).await?;
+        }
+
+        // 2) 冷读闸门：显式起点早于内存最旧键 → spawn_blocking 冷读该区间归档 CSV。
+        let mut cold = Vec::new();
+        if let (Some(s), Some((oldest, _))) = (start, self.bars.span(&key)) {
+            if s < oldest {
+                let e = end.unwrap_or_else(|| now_ms.saturating_add(KLINE_STEP_MS));
+                let got = read_csv_blocking(&self.repo, venue, symbol, s, e).await?;
+                if got.skipped > 0 {
+                    tracing::warn!(%venue, %symbol, skipped = got.skipped, "历史 CSV 冷读跳过坏行");
+                }
+                cold = got.bars;
+            }
+        }
+
+        // 3) 热读（保留窗）+ 纯函数合并开窗（热优先去重/升序/limit/has_more）。
+        let hot = self
+            .bars
+            .range(&key, start.unwrap_or(i64::MIN), end.unwrap_or(i64::MAX));
+        Ok(merge_and_window(hot, cold, &q))
+    }
+
+    /// spawn_blocking 读 `[from,to)` 归档 CSV 并 `restore` 进表（幂等、不置 dirty）。
+    async fn restore_window(&self, key: &SeriesKey, from: i64, to: i64) -> anyhow::Result<()> {
+        let got = read_csv_blocking(&self.repo, &key.venue, &key.symbol, from, to).await?;
+        for b in got.bars {
+            self.bars.restore(b);
+        }
+        if got.skipped > 0 {
+            tracing::warn!(?key, skipped = got.skipped, "懒加载预热 CSV 跳过坏行");
+        }
+        Ok(())
     }
 
     /// 启动：逐活跃作用域解析行情流并订阅（不支持的跳过），再 spawn 定时 flush。
@@ -774,7 +970,81 @@ impl KlineService {
             }
         }
         self.spawn_flush(flush_interval, Arc::clone(&stop));
-        self.spawn_push_ticker(stop);
+        // 缺口周期扫描（内部扫描 + 静默停推）。scan_interval=0 时不起线程，实时尾检仍在。
+        if self.gap_cfg.scan_interval_ms > 0 {
+            self.spawn_gap_scan(Arc::clone(&stop));
+        }
+        self.spawn_push_ticker(Arc::clone(&stop));
+        // 历史缺失自动 REST 回补（仅三家）。interval=0 关闭后台，但 P5 手动补仍可用。
+        if self.backfill_cfg.interval > Duration::ZERO {
+            self.spawn_backfill(Arc::clone(exchanges), Arc::clone(&stop));
+        }
+    }
+
+    /// 启动后台历史回补 tokio 任务（非 OS 线程，fire-and-forget）。
+    ///
+    /// 不保存句柄、停机也不 join：回补是尽力而为，任务只持有 store 单例句柄、靠 `stop`
+    /// 自退；与 flush 线程不同，它不承担「停机前最后一刷」责任（回补到的 bar 由 flush
+    /// 线程统一落 CSV），故无需在 join_flush 收口。
+    fn spawn_backfill(self: &Arc<Self>, exchanges: Arc<ExchangeRegistry>, stop: Arc<AtomicBool>) {
+        crate::kline_backfill::spawn_backfill_worker(
+            Arc::clone(&self.bars),
+            Arc::clone(&self.gaps),
+            exchanges,
+            self.backfill_cfg,
+            stop,
+        );
+    }
+
+    /// P5 管理面手动补区间：同一时刻仅允许一个手动回补（busy 返回
+    /// [`crate::kline_backfill::ManualError::Busy`]，由 handler 映射 40901）。
+    /// 自动 worker 不经此锁（它用 GapRegistry 的 per-series inflight 去重）。
+    pub async fn manual_backfill(
+        self: &Arc<Self>,
+        exchanges: &Arc<ExchangeRegistry>,
+        venue: &str,
+        symbol: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<crate::kline_backfill::BackfillResult, crate::kline_backfill::ManualError> {
+        // compare_exchange 抢锁：false→true 成功进入；已在跑则 conflict。
+        if self
+            .manual_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(crate::kline_backfill::ManualError::Busy);
+        }
+        // 无论成功失败/早返回，guard 在 drop 时复位标志。
+        let _guard = crate::kline_backfill::ManualBusyGuard::new(Arc::clone(&self.manual_busy));
+        crate::kline_backfill::run_range(&self.bars, exchanges, venue, symbol, start_ms, end_ms)
+            .await
+            .map_err(crate::kline_backfill::ManualError::Backfill)
+    }
+
+    /// 独立 OS 线程按扫描周期跑一拍缺口检测（纯内存、不连网）；停机被打断后补扫一次。
+    fn spawn_gap_scan(self: &Arc<Self>, stop: Arc<AtomicBool>) {
+        let me = Arc::clone(self);
+        let interval = Duration::from_millis(self.gap_cfg.scan_interval_ms as u64);
+        let handle = thread::Builder::new()
+            .name("kline-gap".into())
+            .spawn(move || {
+                loop {
+                    interruptible_sleep(interval, &stop);
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // 纯内存扫描，异常只记日志、绝不向线程传播 panic（不影响 flush/push）。
+                    let added = me.gap_scanner.scan_tick();
+                    if added > 0 {
+                        tracing::debug!(added, "kline-gap 周期扫描新登记缺失分钟");
+                    }
+                }
+                // 停机前补扫一次（尽力；结果已在 store 收口集合，P4 消费）。
+                let _ = me.gap_scanner.scan_tick();
+            })
+            .expect("启动 kline-gap 线程失败");
+        *self.gap_task.lock().unwrap() = Some(handle);
     }
 
     /// 独立 OS 线程按 200ms 拍轮询：关闭超龄分钟桶并把已关帧发出（同步 `pusher.push`
@@ -827,14 +1097,8 @@ impl KlineService {
                     if dropped > 0 {
                         tracing::warn!(dropped, "kline_1m_batch 推送丢弃（连接不可达/在途积压）");
                     }
-                    // 刷盘窗口背压丢弃（flush 持续失败致 BarTable 积压超上限）。
-                    let bar_dropped = me.bars.take_dropped();
-                    if bar_dropped > 0 {
-                        tracing::error!(
-                            dropped = bar_dropped,
-                            "定稿 bar 因刷盘窗口积压超上限被丢弃（请检查 CSV 落盘/磁盘）"
-                        );
-                    }
+                    // bar dirty 积压超阈边沿告警（flush 持续故障时；不丢数据，只提示）。
+                    me.check_bar_backlog();
                     // CTP 原始 tick 刷盘窗口背压丢弃（仅 ctp 有写入，非 ctp 计数恒 0）。
                     let tick_dropped = me.ticks.take_dropped();
                     if tick_dropped > 0 {
@@ -1206,12 +1470,81 @@ mod tests {
         drop(pb);
     }
 
+    #[test]
+    fn check_bar_backlog_state_tracks_threshold_transitions() {
+        // 阈值取 2：写 3 根未确认 → 超阈置位；mark 清 dirty 后再查 → 复位。
+        let store = test_store();
+        let (svc, _p) = svc(store.clone());
+        svc.bars.upsert(crate_bar("ctp", "cu2512", 60_000));
+        svc.bars.upsert(crate_bar("ctp", "cu2512", 120_000));
+        svc.bars.upsert(crate_bar("ctp", "rb2611", 60_000));
+        svc.check_bar_backlog_at(2);
+        assert!(svc.bar_backlog_alarmed.load(Ordering::Relaxed));
+
+        // 仍超阈，状态保持（不重复告警由纯函数保证）。
+        svc.check_bar_backlog_at(2);
+        assert!(svc.bar_backlog_alarmed.load(Ordering::Relaxed));
+
+        // flush 成功确认后 dirty 归零，再查应复位。
+        let snap = svc.bars.snapshot_dirty();
+        svc.bars.mark_flushed(
+            &snap
+                .iter()
+                .map(|d| (d.key.clone(), d.start, d.gen))
+                .collect::<Vec<_>>(),
+        );
+        svc.check_bar_backlog_at(2);
+        assert!(!svc.bar_backlog_alarmed.load(Ordering::Relaxed));
+    }
+
+    /// 测试辅助：造一根最简 bar（pending_dirty/backlog 测试用）。
+    fn crate_bar(venue: &str, symbol: &str, start: i64) -> Bar {
+        Bar::new(venue, symbol, 20261024, start, start + KLINE_STEP_MS)
+    }
+
+    #[test]
+    fn backlog_edge_fires_only_on_transitions() {
+        const T: usize = 10;
+        // 正常→超阈：告警一次。
+        assert_eq!(backlog_edge(false, 11, T), (true, true, false));
+        // 仍超阈：不重复告警。
+        assert_eq!(backlog_edge(true, 12, T), (true, false, false));
+        // 回落到阈值内（含恰好等于阈值）：恢复一次。
+        assert_eq!(backlog_edge(true, 10, T), (false, false, true));
+        // 正常态持续：无事件。
+        assert_eq!(backlog_edge(false, 5, T), (false, false, false));
+        // 恰好等于阈值不算超阈。
+        assert_eq!(backlog_edge(false, T, T), (false, false, false));
+    }
+
+    /// 测试用缺省历史取数限额。
+    fn default_limits() -> HistoryLimits {
+        HistoryLimits::new(
+            crate::kline_history::DEFAULT_HISTORY_LIMIT,
+            crate::kline_history::MAX_HISTORY_LIMIT,
+        )
+        .unwrap()
+    }
+
+    /// 测试用缺口扫描参数：1m 步长、3min 静默阈值；scan=0（单测默认不起后台线程）。
+    fn test_gap_cfg() -> GapScanConfig {
+        GapScanConfig::new(KLINE_STEP_MS, 3 * KLINE_STEP_MS, 0).unwrap()
+    }
+
+    /// 测试用回补配置：关闭后台 worker（interval=0），避免单测无意起异步任务。
+    fn test_backfill_cfg() -> crate::kline_backfill::BackfillRuntimeConfig {
+        crate::kline_backfill::BackfillRuntimeConfig::disabled()
+    }
+
     fn svc(store: Arc<TradingStore>) -> (Arc<KlineService>, Arc<RecPusher>) {
         let pusher = Arc::new(RecPusher::default());
         let s = Arc::new(KlineService::new(
             store,
             Arc::clone(&pusher) as Arc<dyn KlinePusher>,
             Vec::new(),
+            default_limits(),
+            test_gap_cfg(),
+            test_backfill_cfg(),
         ));
         (s, pusher)
     }
@@ -1226,8 +1559,175 @@ mod tests {
             store,
             Arc::clone(&pusher) as Arc<dyn KlinePusher>,
             baselines,
+            default_limits(),
+            test_gap_cfg(),
+            test_backfill_cfg(),
         ));
         (s, pusher)
+    }
+
+    /// 在保留目录上开一个 store（目录由调用方持有，供冷读 CSV 测试）。
+    fn svc_in_dir(dir: &std::path::Path) -> (Arc<TradingStore>, Arc<KlineService>, KlineRepo) {
+        let (store, _persist) =
+            TradingStore::open(dir, Arc::new(store_core::SystemClock), None).unwrap();
+        let store = Arc::new(store);
+        let repo = store.kline_repo();
+        let pusher = Arc::new(RecPusher::default());
+        let svc = Arc::new(KlineService::new(
+            Arc::clone(&store),
+            pusher as Arc<dyn KlinePusher>,
+            Vec::new(),
+            default_limits(),
+            test_gap_cfg(),
+            test_backfill_cfg(),
+        ));
+        (store, svc, repo)
+    }
+
+    /// 真实 UTC 时刻（毫秒）。
+    fn utc_ms(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+        use chrono::TimeZone;
+        chrono::Utc
+            .with_ymd_and_hms(y, m, d, h, min, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    /// 造一根 trading_day 与 start 的 UTC 自然日一致的 bar（WS 所口径，冷读按日枚举目录）。
+    fn real_bar(venue: &str, symbol: &str, y: i32, m: u32, d: u32, h: u32, min: u32) -> Bar {
+        use chrono::TimeZone;
+        let start = utc_ms(y, m, d, h, min);
+        let day: u32 = chrono::Utc
+            .timestamp_millis_opt(start)
+            .single()
+            .unwrap()
+            .format("%Y%m%d")
+            .to_string()
+            .parse()
+            .unwrap();
+        let mut b = Bar::new(venue, symbol, day, start, start + KLINE_STEP_MS);
+        b.close = rust_decimal::Decimal::from(100);
+        b.volume = min as i64;
+        b
+    }
+
+    #[tokio::test]
+    async fn history_hot_window_served_without_disk_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, svc, _repo) = svc_in_dir(dir.path());
+        let b = real_bar("ctp", "cu2512", 2026, 10, 29, 11, 59);
+        let start = b.start_time;
+        // 直接写内存表（不落盘）：span 存在、区间在保留窗 → 纯热读返回。
+        store.bar_table().upsert(b);
+
+        let page = svc
+            .history_at(
+                "ctp",
+                "cu2512",
+                Some(start),
+                Some(start + KLINE_STEP_MS),
+                None,
+                utc_ms(2026, 10, 29, 12, 0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.bars.len(), 1);
+        assert_eq!(page.bars[0].start_time, start);
+        assert!(!page.has_more);
+    }
+
+    #[tokio::test]
+    async fn history_cold_read_merges_archived_csv_with_hot_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _svc, repo) = svc_in_dir(dir.path());
+        // 三根相邻分钟 bar 落 CSV（flush 非破坏，bar 仍在表）。
+        for (h, min) in [(11, 58), (11, 59), (12, 0)] {
+            store
+                .bar_table()
+                .upsert(real_bar("ctp", "cu2512", 2026, 10, 29, h, min));
+        }
+        repo.flush_bars(&store.bar_table()).unwrap();
+
+        // 全新 store（同目录、空内存）：冷启动 restore + 显式旧区间触发冷读，去重合并。
+        let (store2, svc2, _) = svc_in_dir(dir.path());
+        assert_eq!(
+            store2
+                .bar_table()
+                .coverage(&SeriesKey::new("ctp", "cu2512")),
+            0
+        );
+        let page = svc2
+            .history_at(
+                "ctp",
+                "cu2512",
+                Some(0),
+                Some(i64::MAX),
+                None,
+                utc_ms(2026, 10, 29, 12, 0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.bars.iter().map(|b| b.start_time).collect::<Vec<_>>(),
+            vec![
+                utc_ms(2026, 10, 29, 11, 58),
+                utc_ms(2026, 10, 29, 11, 59),
+                utc_ms(2026, 10, 29, 12, 0)
+            ]
+        );
+        // restore 预热绝不置 dirty（不会重写盘）。
+        assert!(store2.bar_table().snapshot_dirty().is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_lazy_restore_populates_table_without_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _svc, repo) = svc_in_dir(dir.path());
+        let mut b = real_bar("binance", "BTCUSDT", 2026, 10, 29, 11, 59);
+        b.close = rust_decimal::Decimal::from(108);
+        let start = b.start_time;
+        store.bar_table().upsert(b);
+        repo.flush_bars(&store.bar_table()).unwrap();
+
+        // 全新空表 + 近窗 CSV：无区间取最近 → 懒加载 restore 后命中。
+        let (store2, svc2, _) = svc_in_dir(dir.path());
+        let page = svc2
+            .history_at(
+                "binance",
+                "BTCUSDT",
+                None,
+                None,
+                Some(10),
+                utc_ms(2026, 10, 29, 12, 0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.bars.len(), 1);
+        assert_eq!(page.bars[0].close, rust_decimal::Decimal::from(108));
+        assert_eq!(page.eff_start, Some(start));
+        assert_eq!(page.eff_end, Some(start));
+        // 表已预热但不置 dirty。
+        assert!(store2.bar_table().snapshot_dirty().is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_unknown_symbol_returns_empty_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, svc, _repo) = svc_in_dir(dir.path());
+        let page = svc
+            .history_at(
+                "ctp",
+                "ag9999",
+                Some(0),
+                Some(i64::MAX),
+                None,
+                utc_ms(2026, 10, 29, 12, 0),
+            )
+            .await
+            .unwrap();
+        assert!(page.bars.is_empty());
+        assert!(!page.has_more);
     }
 
     #[test]
@@ -1264,7 +1764,11 @@ mod tests {
             .persistence_sink()
             .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
 
-        let pending = store.bar_table().snapshot();
+        let pending = store.bar_table().range(
+            &trading_core::kline::SeriesKey::new("ctp", "cu2512"),
+            0,
+            i64::MAX,
+        );
         assert_eq!(pending.len(), 1);
         let b = &pending[0];
         assert_eq!(b.exchange, "ctp");
@@ -1487,7 +1991,11 @@ mod tests {
 
         assert_eq!(report.bars.rows, 1);
         assert_eq!(report.ticks.rows, 1);
-        assert!(store.bar_table().is_empty());
+        // 非破坏式 flush：bar 本体仍在内存可读，但 dirty 已清（下轮不重写）。
+        let bar_key = trading_core::kline::SeriesKey::new("ctp", "cu2512");
+        assert_eq!(store.bar_table().coverage(&bar_key), 1);
+        assert!(store.bar_table().snapshot_dirty().is_empty());
+        // tick 仍是 drain WAL：写成功即清空。
         assert!(store.ctp_ticks().is_empty());
         assert!(dir
             .path()
@@ -1563,7 +2071,7 @@ mod tests {
         );
         assert!(pusher.frames("other").is_empty());
         // 推送 sink 不碰待刷盘窗口。
-        assert_eq!(store.bar_table().len(), 0);
+        assert!(store.bar_table().snapshot_dirty().is_empty());
         assert_eq!(service.dropped_count(), 0);
     }
 
@@ -1589,7 +2097,7 @@ mod tests {
         assert_eq!(service.dropped_count(), 1);
         assert_eq!(pusher.total(), 1);
         assert_eq!(pusher.symbols("alive"), vec!["cu2512".to_string()]);
-        assert_eq!(store.bar_table().len(), 0);
+        assert!(store.bar_table().snapshot_dirty().is_empty());
     }
 
     #[test]
@@ -1615,7 +2123,7 @@ mod tests {
             vec![("kline_1m_batch".to_string(), vec!["cu2512".to_string()])]
         );
         // 但 BarTable 不被 push sink 写入。
-        assert_eq!(store.bar_table().len(), 0);
+        assert!(store.bar_table().snapshot_dirty().is_empty());
     }
 
     #[test]
@@ -1629,14 +2137,29 @@ mod tests {
             .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
 
         // 仅落待刷盘窗口一次，不触发任何南向推送。
-        assert_eq!(store.bar_table().len(), 1);
+        let k_cu2512 = trading_core::kline::SeriesKey::new("ctp", "cu2512");
+        assert_eq!(store.bar_table().coverage(&k_cu2512), 1);
+        assert_eq!(store.bar_table().snapshot_dirty().len(), 1);
         assert_eq!(pusher.total(), 0);
 
-        // 另一根 bar 再落一条（每根仅 append 一次）。
+        // 另一序列的 bar 再落一条（每根仅 append 一次）。
         service
             .persistence_sink()
             .on_bar(&kline("ctp", "cu2511", 20261024, 60_000));
-        assert_eq!(store.bar_table().len(), 2);
+        assert_eq!(store.bar_table().series_count(), 2);
+        assert_eq!(
+            store
+                .bar_table()
+                .coverage(&trading_core::kline::SeriesKey::new("ctp", "cu2511")),
+            1
+        );
+
+        // 同序列同分钟再来一根：去重覆盖，不增条数，但仍是一根待写 dirty。
+        service
+            .persistence_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
+        assert_eq!(store.bar_table().coverage(&k_cu2512), 1);
+        assert_eq!(store.bar_table().snapshot_dirty().len(), 2);
     }
 
     #[test]
@@ -1676,9 +2199,72 @@ mod tests {
 
         // join 必须正常返回（线程看到 stop 后 break + 最后一刷），不挂死。
         assert!(service.join_flush().is_ok());
-        // join 的 happens-before：返回时最后一次 flush_once 已完成，BarTable 已被清空。
-        assert!(store.bar_table().is_empty());
+        // join 的 happens-before：返回时最后一次 flush_once 已完成，bar dirty 已确认清空
+        //（非破坏式：bar 本体仍保留为可读缓存）。
+        assert!(store.bar_table().snapshot_dirty().is_empty());
+        assert_eq!(
+            store
+                .bar_table()
+                .coverage(&trading_core::kline::SeriesKey::new("ctp", "cu2512")),
+            1
+        );
         // 再次 join 安全（句柄只 join 一次）。
+        assert!(service.join_flush().is_ok());
+    }
+
+    #[test]
+    fn spawned_gap_scan_thread_registers_internal_gap_and_joins() {
+        use std::sync::atomic::AtomicBool;
+        // 极短扫描周期；静默阈值保持正常（3min），避免真实墙钟下把“老测试数据”误判为停推。
+        let cfg = GapScanConfig::new(KLINE_STEP_MS, 3 * KLINE_STEP_MS, 20).unwrap();
+        let store = test_store();
+        let pusher = Arc::new(RecPusher::default());
+        let service = Arc::new(KlineService::new(
+            Arc::clone(&store),
+            pusher as Arc<dyn KlinePusher>,
+            Vec::new(),
+            default_limits(),
+            cfg,
+            test_backfill_cfg(),
+        ));
+        // 数据锚定在“当下”：now-2min 与 now（连续无静默），中间缺 now-1min（内部缺口）。
+        let now = now_utc_ms();
+        let floor = now - now.rem_euclid(KLINE_STEP_MS);
+        service
+            .bars
+            .upsert(crate_bar("binance", "BTCUSDT", floor - 2 * KLINE_STEP_MS));
+        service.bars.upsert(crate_bar("binance", "BTCUSDT", floor));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        service.spawn_gap_scan(Arc::clone(&stop));
+        // 等扫描线程至少拍一次（轮询，避免睡死）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while store.gap_registry().is_empty() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::SeqCst);
+
+        // join 正常收口；内部缺口（floor-1min）被周期扫描登记。
+        assert!(service.join_flush().is_ok());
+        let got: Vec<i64> = store
+            .gap_registry()
+            .snapshot()
+            .iter()
+            .map(|g| g.start)
+            .collect();
+        assert!(
+            got.contains(&(floor - KLINE_STEP_MS)),
+            "周期扫描应登记缺失分钟 {got:?}"
+        );
+        assert!(service.join_flush().is_ok()); // 重复 join 安全
+    }
+
+    #[test]
+    fn zero_scan_interval_does_not_require_gap_thread_join() {
+        // scan=0（默认测试 cfg）：不 spawn gap 线程，join 仍是安全 no-op，不影响 flush/push。
+        let store = test_store();
+        let (service, _p) = svc(store);
+        assert!(service.gap_task.lock().unwrap().is_none());
         assert!(service.join_flush().is_ok());
     }
 
@@ -1848,5 +2434,87 @@ mod tests {
         service.poll_push();
         assert_eq!(pusher.total(), 2);
         assert_eq!(service.dropped_count(), 0);
+    }
+
+    // ---- 缺口检测点 1：持久化 sink 实时尾检（仅三家） --------------------
+
+    #[test]
+    fn persistence_sink_tail_detects_gap_for_supported_venue() {
+        let store = test_store();
+        let (svc, _pusher) = svc(store.clone());
+        let sink = svc.persistence_sink();
+
+        // Arrange：先到第 0 分钟。
+        sink.on_bar(&kline("binance", "BTCUSDT", 20261029, 0));
+        assert!(svc.gaps.is_empty());
+
+        // Act：第 3 分钟才到（中间缺 1、2 分钟）。
+        sink.on_bar(&kline("binance", "BTCUSDT", 20261029, 180_000));
+
+        // Assert：缺口逐分钟登记，且 bar 已正常落表。
+        let got: Vec<(String, i64)> = svc
+            .gaps
+            .snapshot()
+            .iter()
+            .map(|g| (g.symbol.clone(), g.start))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("BTCUSDT".to_string(), 60_000),
+                ("BTCUSDT".to_string(), 120_000)
+            ]
+        );
+        assert_eq!(
+            svc.bars
+                .range(&SeriesKey::new("binance", "BTCUSDT"), 0, i64::MAX)
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn persistence_sink_adjacent_minutes_register_no_gap() {
+        let store = test_store();
+        let (svc, _pusher) = svc(store.clone());
+        let sink = svc.persistence_sink();
+
+        sink.on_bar(&kline("binance", "BTCUSDT", 20261029, 60_000));
+        sink.on_bar(&kline("binance", "BTCUSDT", 20261029, 120_000));
+        assert!(svc.gaps.is_empty());
+    }
+
+    #[test]
+    fn persistence_sink_skips_gap_detection_for_ctp_but_still_persists() {
+        let store = test_store();
+        let (svc, _pusher) = svc(store.clone());
+        let sink = svc.persistence_sink();
+
+        // CTP 即便分钟大跳也不登记缺口（午休/夜盘空分钟合法）。
+        sink.on_bar(&kline("ctp", "cu2512", 20261029, 0));
+        sink.on_bar(&kline("ctp", "cu2512", 20261029, 600_000));
+
+        assert!(svc.gaps.is_empty());
+        // 但 bar 仍无条件落表（四家统一持久化）。
+        assert_eq!(
+            svc.bars
+                .range(&SeriesKey::new("ctp", "cu2512"), 0, i64::MAX)
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn persistence_sink_tail_gap_is_idempotent_on_duplicate_signal() {
+        let store = test_store();
+        let (svc, _pusher) = svc(store.clone());
+        let sink = svc.persistence_sink();
+
+        sink.on_bar(&kline("hyperliquid", "BTC", 20261029, 0));
+        sink.on_bar(&kline("hyperliquid", "BTC", 20261029, 120_000));
+        assert_eq!(svc.gaps.len(), 1); // 缺第 1 分钟
+                                       // 同分钟定稿帧重复/修正：upsert 旧末键为 120_000，不再造缺口。
+        sink.on_bar(&kline("hyperliquid", "BTC", 20261029, 120_000));
+        assert_eq!(svc.gaps.len(), 1);
     }
 }

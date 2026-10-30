@@ -50,6 +50,16 @@ pub struct AssemblyDeps {
     pub position_debounce: Duration,
     /// 仓位定时全量对账周期。
     pub position_reconcile_interval: Duration,
+    /// BarTable 每序列内存保留 bar 条数上限（缺省 1440）。
+    pub kline_retain_bars: usize,
+    /// BarTable 每序列内存保留时长（缺省 24h）。
+    pub kline_retain_age: Duration,
+    /// get_klines 历史取数缺省/最大返回根数（缺省 300/1500）。
+    pub kline_history_limits: crate::kline_history::HistoryLimits,
+    /// 三家 K线缺口内部扫描周期（0=关闭周期扫描，实时尾检仍在）。
+    pub kline_gap_scan_interval: Duration,
+    /// 三家静默停推阈值（必须 >0）。
+    pub kline_stall_threshold: Duration,
     /// 本地模拟所静态端点覆盖。
     pub endpoints: VenueEndpoints,
     /// 企业微信四通道 Webhook 对照表（空串=未配置）。
@@ -92,10 +102,20 @@ impl AppState {
             rule_refresh_interval,
             position_debounce,
             position_reconcile_interval,
+            kline_retain_bars,
+            kline_retain_age,
+            kline_history_limits,
+            kline_gap_scan_interval,
+            kline_stall_threshold,
             endpoints,
             channels,
             venue,
         } = deps;
+
+        // K线单表保留窗在任何 bar 到达前按 CLI/config 收紧（缺省 1440 条 / 24h）。
+        store
+            .bar_table()
+            .set_retention(kline_retain_bars, kline_retain_age);
 
         // —— 数据句柄全部来自 store（进程内单例）——
         let orders = store.order_repo().expect("order repo after recover");
@@ -133,10 +153,22 @@ impl AppState {
             hub.clone(),
             tokio::runtime::Handle::current(),
         ));
+        // 缺口检测参数（步长取服务内 1m 常量；扫描周期允许 0=关闭周期扫描）。
+        // stall>0、scan≥0 已由 config::parse_gap_timings 启动校验，此处 expect 仅表达该不变式。
+        let to_ms = |d: Duration| d.as_millis().min(i64::MAX as u128) as i64;
+        let gap_cfg = crate::kline_gap::GapScanConfig::new(
+            crate::kline::KLINE_STEP_MS,
+            to_ms(kline_stall_threshold),
+            to_ms(kline_gap_scan_interval),
+        )
+        .expect("缺口检测参数已由 parse_gap_timings 校验为合法");
         let kline = Arc::new(crate::kline::KlineService::new(
             Arc::clone(&store),
             kline_pusher,
             crate::venue_config::kline_baselines(&venue),
+            kline_history_limits,
+            gap_cfg,
+            crate::kline_backfill::BackfillRuntimeConfig::from(&venue.kline.backfill),
         ));
 
         let provider_deps = ProviderDeps {
@@ -170,6 +202,11 @@ impl AppState {
             // K线：无条件全量持久化 sink（定稿即落 CSV，绕过 symbol/主力路由）。
             // 交易所无关：四家 provider 各自在行情流单例创建时注册到自己的引擎/聚合器。
             persist_bar_sink: Some(kline.persistence_sink()),
+            // K线历史回补分页/节流：读 venue.toml [kline.backfill]。
+            hist_fetch: trading_exchange::provider::HistoricalFetchConfig {
+                page_size: venue.kline.backfill.page_size,
+                page_delay: venue.kline.backfill.page_delay,
+            },
         };
         let exchanges = Arc::new(ExchangeRegistry::builtin(provider_deps));
         // 启动自检（fail-fast）：汇总各 provider 自描述的仓位档案装入引擎并校验，
