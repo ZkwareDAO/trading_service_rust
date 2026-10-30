@@ -238,6 +238,97 @@ pub trait MarketDataStream: Send + Sync {
     ) -> anyhow::Result<SubscriptionGuard>;
 }
 
+/// 历史 K线 REST 拉取能力（仅 binance/deribit/hyperliquid 三家 7×24 连续撮合所实现；
+/// CTP 无公开历史接口，[`crate::provider::VenueProvider::market_history`] 默认返回 `None`）。
+///
+/// 用于 P4 缺口自动回补 / P5 管理面手动补区间。实现约定：
+/// - 只返回**已收盘** bar；区间为半开 `[start_ms, end_ms)`（均为 UTC 毫秒）；
+/// - 结果按 `start_ms` 升序，并在实现内按区间再过滤一次，杜绝端点越界；
+/// - HTTP 非 2xx / 响应结构不符 / 解析失败一律以 `Err` 返回（不静默丢根）。
+///
+/// 回补到的 bar **只**写入内存 `BarTable` 并随后续 CSV flush 落盘，**绝不**进入实时
+/// fanout/南向推送（该约束在 service 编排层保证，trait 本身只负责取数）。
+#[async_trait::async_trait]
+pub trait HistoricalKlines: Send + Sync {
+    /// 拉取 `[start_ms, end_ms)` 内给定周期的已收盘 K线，按 `start_ms` 升序返回。
+    async fn fetch_klines(
+        &self,
+        symbol: &str,
+        interval: KlineInterval,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> anyhow::Result<Vec<Kline>>;
+}
+
+/// 把请求的半开根数区间 `[start_ms, end_ms)` 按 `page_size` 根/页切成一组连续、不重叠、
+/// 首尾贴合的半开窗口 `(win_start, win_end)`（均 UTC 毫秒）。纯函数、零 IO，三家分页共用。
+///
+/// `step_ms<=0`、`page_size==0`、或 `end_ms<=start_ms` 返回空；最后一页为不足整页的余数。
+pub(crate) fn page_windows(
+    start_ms: i64,
+    end_ms: i64,
+    step_ms: i64,
+    page_size: usize,
+) -> Vec<(i64, i64)> {
+    if step_ms <= 0 || page_size == 0 || end_ms <= start_ms {
+        return Vec::new();
+    }
+    let page_span = step_ms.saturating_mul(page_size as i64);
+    let mut out = Vec::new();
+    let mut cur = start_ms;
+    while cur < end_ms {
+        let win_end = cur.saturating_add(page_span).min(end_ms);
+        out.push((cur, win_end));
+        cur = win_end;
+    }
+    out
+}
+
+/// 三家历史回补共用的分页收集内核：本地按 [`page_windows`] 切出确定窗口，逐窗调用注入的
+/// `fetch_window(win_start, win_end)` 取数，相邻窗之间 sleep `page_delay` 节流。
+///
+/// 取数完成后统一：按请求半开区间 `[start_ms,end_ms)` 再过滤一次（杜绝端点越界）、
+/// 按 `start_ms` 升序、同 `start_ms` 去重（保留先到者）。窗口由本地**有限生成**，故不存在
+/// 无限分页；**空窗不停止**——缺口回补的区间内可能夹着交易所无 K线的时段（未上市/停牌/
+/// 已下架），早窗为空不代表更晚窗口也为空，提前 break 会错误丢弃后续真实数据。
+/// `fetch_window` 返回 `Err` 立即向上传播（不静默丢根）。
+pub(crate) async fn collect_pages<F, Fut>(
+    start_ms: i64,
+    end_ms: i64,
+    step_ms: i64,
+    page_size: usize,
+    page_delay: std::time::Duration,
+    mut fetch_window: F,
+) -> anyhow::Result<Vec<Kline>>
+where
+    F: FnMut(i64, i64) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<Kline>>>,
+{
+    let windows = page_windows(start_ms, end_ms, step_ms, page_size);
+    let mut bars: Vec<Kline> = Vec::new();
+    for (idx, (ws, we)) in windows.iter().enumerate() {
+        if idx > 0 && page_delay > std::time::Duration::ZERO {
+            tokio::time::sleep(page_delay).await;
+        }
+        let page = fetch_window(*ws, *we).await?;
+        // 空窗不停止：早窗为空（未上市/停牌/已下架）时更晚窗口仍可能有数据，
+        // 窗口数由 page_windows 有限给出，不会无限拉取。
+        bars.extend(page);
+    }
+    // 只保留「已收盘」桶（收盘时刻 start+step 已到）：REST 端点在 endTime 覆盖当前分钟时
+    // 会返回成形中 K线（不像 WS 有收盘标志），历史回补绝不能把它当定稿写入。
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    // 区间收口（半开 [start,end)）+ 已收盘过滤 + 升序 + 按 start_ms 去重。
+    bars.retain(|k| {
+        k.start_ms >= start_ms
+            && k.start_ms < end_ms
+            && k.start_ms.saturating_add(step_ms) <= now_ms
+    });
+    bars.sort_by_key(|k| k.start_ms);
+    bars.dedup_by(|a, b| a.start_ms == b.start_ms);
+    Ok(bars)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +392,147 @@ mod tests {
             KlineInterval::M1.duration_ms(),
             KlineInterval::M1.minutes() * 60_000
         );
+    }
+
+    // ---- page_windows（历史回补本地分页切窗纯函数） ---------------------
+
+    #[test]
+    fn page_windows_invalid_args_yield_empty() {
+        assert!(page_windows(10, 10, 1, 100).is_empty()); // start==end
+        assert!(page_windows(20, 10, 1, 100).is_empty()); // 反向
+        assert!(page_windows(0, 10, 0, 100).is_empty()); // step<=0
+        assert!(page_windows(0, 10, 1, 0).is_empty()); // page_size=0
+    }
+
+    #[test]
+    fn page_windows_single_window_covers_half_open_range() {
+        // 3 根分钟、page_size=10 → 单窗 [0,180_000)（exclusive 上界）。
+        assert_eq!(page_windows(0, 3 * 60_000, 60_000, 10), vec![(0, 180_000)]);
+    }
+
+    #[test]
+    fn page_windows_splits_into_full_then_partial_window() {
+        // 5 根、page_size=2 → 窗 [0,2step)、[2step,4step)、[4step,5step)。
+        let step = 60_000_i64;
+        assert_eq!(
+            page_windows(0, 5 * step, step, 2),
+            vec![(0, 2 * step), (2 * step, 4 * step), (4 * step, 5 * step)]
+        );
+    }
+
+    #[test]
+    fn page_windows_windows_are_contiguous_and_within_bounds() {
+        let step = 60_000_i64;
+        let (start, end) = (step, 10 * step + 1); // 非整窗整除的任意上界
+        let wins = page_windows(start, end, step, 3);
+        // 首尾贴合请求边界，相邻窗首尾相接、不重叠。
+        assert_eq!(wins.first().unwrap().0, start);
+        assert_eq!(wins.last().unwrap().1, end);
+        for pair in wins.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+            assert!(pair[0].0 < pair[0].1);
+        }
+    }
+
+    // ---- collect_pages（分页收集内核，闭包桩零网络） --------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::Duration as StdDuration;
+
+    /// 构造一根仅 start_ms 有意义的桩 K线（其余字段 collect_pages 不关心）。
+    fn bar_at(start_ms: i64) -> Kline {
+        Kline {
+            venue: "stub".into(),
+            symbol: "X".into(),
+            interval: KlineInterval::M1,
+            trading_day: 0,
+            start_ms,
+            end_ms: start_ms + KlineInterval::M1.duration_ms(),
+            open: Decimal::ZERO,
+            high: Decimal::ZERO,
+            low: Decimal::ZERO,
+            close: Decimal::ZERO,
+            volume: 0,
+            quote_volume: Decimal::ZERO,
+            extras: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_pages_filters_sorts_dedups_and_keeps_half_open_range() {
+        let step = KlineInterval::M1.duration_ms();
+        // page_size=1 → 三个窗 [0,step) [step,2step) [2step,3step)。
+        // 每窗回两根：窗起点（合法）与窗上界（越界，应被全局过滤剔除）。
+        let got = collect_pages(
+            0,
+            3 * step,
+            step,
+            1,
+            StdDuration::ZERO,
+            |ws, we| async move { Ok(vec![bar_at(ws), bar_at(we)]) },
+        )
+        .await
+        .unwrap();
+        let starts: Vec<i64> = got.iter().map(|k| k.start_ms).collect();
+        // 越界的 step/2step/3step：其中 step、2step 由下一页合法根去重保留，3step 被剔除。
+        assert_eq!(starts, vec![0, step, 2 * step]);
+    }
+
+    #[tokio::test]
+    async fn collect_pages_continues_through_empty_windows() {
+        let step = KlineInterval::M1.duration_ms();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let c = std::sync::Arc::clone(&calls);
+        // page_size=1 → 5 个窗。第 0/2/4 窗有数据、1/3 窗空（停牌/未上市/已下架）。
+        // 正确行为：不因空窗提前停止，5 个窗都请求，仍取回后续真实数据。
+        let got = collect_pages(0, 5 * step, step, 1, StdDuration::ZERO, move |ws, _we| {
+            c.fetch_add(1, AtomicOrdering::Relaxed);
+            let bar = if ws % (2 * step) == 0 {
+                vec![bar_at(ws)]
+            } else {
+                vec![]
+            };
+            async move { Ok(bar) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 5);
+        let starts: Vec<i64> = got.iter().map(|k| k.start_ms).collect();
+        assert_eq!(starts, vec![0, 2 * step, 4 * step]);
+    }
+
+    #[tokio::test]
+    async fn collect_pages_propagates_fetch_error() {
+        let step = KlineInterval::M1.duration_ms();
+        let err = collect_pages(0, step, step, 10, StdDuration::ZERO, |_ws, _we| async {
+            Err(anyhow::anyhow!("upstream 500"))
+        })
+        .await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn collect_pages_drops_the_still_open_current_minute() {
+        let step = KlineInterval::M1.duration_ms();
+        let now = chrono::Utc::now().timestamp_millis();
+        let current = now - now.rem_euclid(step); // 当前成形中分钟起点（未收盘）
+        let closed = current - step; // 上一分钟（已收盘）
+                                     // 请求区间覆盖两根；桩把两根都返回（模拟 REST 返回成形中 K线）。
+        let got = collect_pages(
+            closed,
+            current + step,
+            step,
+            10,
+            StdDuration::ZERO,
+            move |_ws, _we| {
+                let bars = vec![bar_at(closed), bar_at(current)];
+                async move { Ok(bars) }
+            },
+        )
+        .await
+        .unwrap();
+        let starts: Vec<i64> = got.iter().map(|k| k.start_ms).collect();
+        // 只保留已收盘的上一分钟；当前分钟尚未收盘，必须剔除。
+        assert_eq!(starts, vec![closed]);
     }
 }

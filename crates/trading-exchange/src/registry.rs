@@ -159,6 +159,15 @@ impl ExchangeRegistry {
         }
     }
 
+    /// 取某所的历史 K线回补能力；未注册或该所不支持（CTP/xili）返回 `None`。
+    /// 与 [`Self::market_stream`] 对称的纯路由。
+    pub fn market_history(
+        &self,
+        exchange: &str,
+    ) -> Option<Arc<dyn crate::market::HistoricalKlines>> {
+        self.provider(exchange)?.market_history()
+    }
+
     /// 启动各所的交易所级共享任务（规则同步/公共行情），逐所 fan-out。
     ///
     /// `active_exchanges` 是宿主从账户内存表去重出的交易所名；各 provider 自行判定
@@ -301,11 +310,27 @@ mod tests {
         async fn on_order_event(&self, _: &trading_core::protocol::OrderEvent, _: &str, _: &str) {}
     }
 
+    /// 最小历史 K线能力桩：只用于钉死 registry 的 market_history 路由（不联网）。
+    struct StubHistory;
+    #[async_trait::async_trait]
+    impl crate::market::HistoricalKlines for StubHistory {
+        async fn fetch_klines(
+            &self,
+            _symbol: &str,
+            _interval: crate::market::KlineInterval,
+            _start_ms: i64,
+            _end_ms: i64,
+        ) -> anyhow::Result<Vec<crate::market::Kline>> {
+            Ok(vec![])
+        }
+    }
+
     /// 可计数的假交易所 provider，用于钉死注册表的分派行为（开闭原则）。
     #[derive(Clone)]
     struct FakeProvider {
         names: Vec<&'static str>,
         support_account_stream: bool,
+        supports_history: bool,
         build_calls: Arc<AtomicUsize>,
         market_calls: Arc<AtomicUsize>,
         account_calls: Arc<AtomicUsize>,
@@ -316,6 +341,7 @@ mod tests {
             Self {
                 names: names.to_vec(),
                 support_account_stream: false,
+                supports_history: false,
                 build_calls: Arc::new(AtomicUsize::new(0)),
                 market_calls: Arc::new(AtomicUsize::new(0)),
                 account_calls: Arc::new(AtomicUsize::new(0)),
@@ -323,6 +349,10 @@ mod tests {
         }
         fn with_account_stream(mut self) -> Self {
             self.support_account_stream = true;
+            self
+        }
+        fn with_history(mut self) -> Self {
+            self.supports_history = true;
             self
         }
     }
@@ -359,6 +389,10 @@ mod tests {
                 self.market_calls.fetch_add(1, Ordering::Relaxed);
             }
         }
+        fn market_history(&self) -> Option<Arc<dyn crate::market::HistoricalKlines>> {
+            self.supports_history
+                .then(|| Arc::new(StubHistory) as Arc<_>)
+        }
     }
 
     fn registry_of(ps: Vec<Arc<dyn VenueProvider>>) -> ExchangeRegistry {
@@ -394,6 +428,19 @@ mod tests {
         assert!(reg.market_stream("xili", Some("futures")).is_err());
         // 未知所同样报错。
         assert!(reg.market_stream("nope", None).is_err());
+    }
+
+    #[test]
+    fn market_history_routes_only_to_supporting_provider() {
+        // 支持历史回补的所 → 取到能力；不支持（xili 类）与未知所 → None。
+        let bin = Arc::new(FakeProvider::new(&["binance"]).with_history());
+        let xili = Arc::new(FakeProvider::new(&["xili"]));
+        let reg = registry_of(vec![xili, bin]);
+
+        assert!(reg.market_history("binance").is_some());
+        assert!(reg.market_history("xili").is_none());
+        assert!(reg.market_history("ctp").is_none());
+        assert!(reg.market_history("nope").is_none());
     }
 
     #[test]

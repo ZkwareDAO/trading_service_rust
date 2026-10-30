@@ -9,6 +9,7 @@
 //! * [`user_stream`]：账户事件流连接器（经宿主端口取凭证/用户主体/回报订单事件）。
 
 pub mod client;
+pub mod historical;
 pub mod mapping;
 pub mod market;
 pub mod prep;

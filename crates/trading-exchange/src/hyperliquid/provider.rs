@@ -130,6 +130,16 @@ impl VenueProvider for HyperliquidProvider {
         Some(crate::PositionProfile::hyperliquid())
     }
 
+    /// Hyperliquid 历史 K线回补能力（POST /info candleSnapshot），无状态、取用即建。
+    fn market_history(&self) -> Option<Arc<dyn crate::market::HistoricalKlines>> {
+        let h = self.deps.hist_fetch;
+        Some(Arc::new(crate::hyperliquid::historical::HlHistorical::new(
+            self.deps.http.clone(),
+            h.page_size,
+            h.page_delay,
+        )))
+    }
+
     /// Hyperliquid 接口用裸币名（大小写敏感、不大写）。
     fn normalize_instrument(&self, _exchange: &str, instrument: &str) -> String {
         crate::hyperliquid::codec::to_native_coin(instrument.trim())

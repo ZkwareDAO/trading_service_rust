@@ -134,6 +134,19 @@ impl VenueProvider for BinanceProvider {
         Some(crate::PositionProfile::binance())
     }
 
+    /// Binance U 本位永续历史 K线回补能力（/fapi/v1/klines）。实现无状态、构造廉价
+    /// （仅 clone 共享 HTTP client + Copy 配置），故每次取用新建，无需 OnceLock 缓存。
+    fn market_history(&self) -> Option<Arc<dyn crate::market::HistoricalKlines>> {
+        let h = self.deps.hist_fetch;
+        Some(Arc::new(
+            crate::binance::historical::BinanceHistorical::new(
+                self.deps.http.clone(),
+                h.page_size,
+                h.page_delay,
+            ),
+        ))
+    }
+
     /// Binance 现货/合约标的一律大写（交易所原生口径）；宿主据此在写内存订单前归一。
     fn normalize_instrument(&self, _exchange: &str, instrument: &str) -> String {
         instrument.trim().to_ascii_uppercase()

@@ -11,6 +11,7 @@
 //! Deribit 适配器模块总览（接入与开平仓处理见各子模块）。
 
 pub mod account_consumer;
+pub mod historical;
 pub mod instant;
 pub mod mapping;
 pub mod market;

@@ -19,6 +19,7 @@
 pub(crate) mod account_consumer;
 pub(crate) mod codec;
 pub(crate) mod endpoint;
+pub(crate) mod historical;
 pub(crate) mod market;
 pub(crate) mod meta;
 pub(crate) mod pricing;

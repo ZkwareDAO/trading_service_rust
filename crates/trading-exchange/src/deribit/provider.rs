@@ -103,6 +103,18 @@ impl VenueProvider for DeribitProvider {
         Some(crate::PositionProfile::deribit())
     }
 
+    /// Deribit 历史 K线回补能力（v2 get_tradingview_chart_data），无状态、取用即建。
+    fn market_history(&self) -> Option<Arc<dyn crate::market::HistoricalKlines>> {
+        let h = self.deps.hist_fetch;
+        Some(Arc::new(
+            crate::deribit::historical::DeribitHistorical::new(
+                self.deps.http.clone(),
+                h.page_size,
+                h.page_delay,
+            ),
+        ))
+    }
+
     /// Deribit 合约名大小写混合，保持原样（仅 trim），不可大写。
     fn normalize_instrument(&self, _exchange: &str, instrument: &str) -> String {
         instrument.trim().to_string()

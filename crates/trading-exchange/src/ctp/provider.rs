@@ -450,6 +450,7 @@ mod tests {
             ctp_last_volumes: Arc::new(trading_core::kline::LastVolumeTable::new()),
             ctp_dominants: Arc::new(trading_core::kline::DominantTable::new()),
             persist_bar_sink: None,
+            hist_fetch: crate::provider::HistoricalFetchConfig::default_for_backfill(),
         }
     }
 

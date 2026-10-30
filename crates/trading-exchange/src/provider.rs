@@ -103,6 +103,35 @@ pub struct ProviderDeps {
     pub hyperliquid: HyperliquidConfig,
     /// 行情订阅兴趣供给（宿主读仓位∪规则）；None=不做动态订阅。
     pub market_interest: Option<Arc<dyn MarketInterest>>,
+    /// K线历史回补的分页大小与页间节流（仅 binance/deribit/hyperliquid 三家
+    /// `market_history` 使用；CTP 无历史接口）。交易所无关的统一缺省见
+    /// [`HistoricalFetchConfig::default_for_backfill`]。
+    pub hist_fetch: HistoricalFetchConfig,
+}
+
+/// K线历史 REST 拉取的分页/节流参数（进程一份，注入三家历史 K线实现）。
+#[derive(Debug, Clone, Copy)]
+pub struct HistoricalFetchConfig {
+    /// 单次 REST 拉取的最大根数（三家按 1m，建议 ≤1000）。
+    pub page_size: usize,
+    /// 同一交易所相邻两页请求之间的间隔（限频节流）。
+    pub page_delay: Duration,
+}
+
+impl HistoricalFetchConfig {
+    /// venue.toml `[kline.backfill]` 缺省：1000 根/页、500ms 页间隔。
+    pub fn default_for_backfill() -> Self {
+        Self {
+            page_size: 1000,
+            page_delay: Duration::from_millis(500),
+        }
+    }
+}
+
+impl Default for HistoricalFetchConfig {
+    fn default() -> Self {
+        Self::default_for_backfill()
+    }
 }
 
 /// 一家交易所的完整套件扩展点。注册表按 [`VenueProvider::matches`] 把请求路由给它。
@@ -190,4 +219,11 @@ pub trait VenueProvider: Send + Sync {
     /// 仅启动时调用一次；运行期热加载新增交易所的公共服务需重启（per-account
     /// 用户流不受此限，仍支持热增删）。
     fn spawn_market_services(&self, _active_exchanges: &[String]) {}
+
+    /// 该所的**历史 K线 REST 回补**能力；默认 [`None`] = 不支持（CTP/xili）。
+    /// binance/deribit/hyperliquid 覆盖为返回各自 `Arc<dyn HistoricalKlines>`。
+    /// 进程级单例语义（同 [`Self::build_market_stream`]），注册表据此路由回补请求。
+    fn market_history(&self) -> Option<Arc<dyn crate::market::HistoricalKlines>> {
+        None
+    }
 }
