@@ -232,6 +232,7 @@ impl CtpVenueConnector {
             position_dir: Arc::clone(&session.position_dir),
             leg_table: Arc::new(crate::ctp::leg_table::LegTable::new()),
             pending_terminal: Arc::new(crate::ctp::pending_terminal::PendingTerminalTable::new()),
+            shfe_close_priority: self.config.shfe_close_priority,
             tx,
             debouncer: Arc::new(Mutex::new(crate::reconcile::ReconcileDebouncer::new(
                 account_stream_millis(self.debounce),

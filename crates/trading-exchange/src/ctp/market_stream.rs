@@ -7,8 +7,9 @@
 //!   期望（品种经 [`InstrumentDir`] 展开为全部 is_trading 合约）」并集向柜台订阅；
 //! - [`Self::on_kline_tick`]：K线集 tick 喂入 [`BarAggSink`]，分钟翻转定稿后按注册表
 //!   路由（catch_unwind+计时摘除）；原始 tick/累计量写三表在同路径完成；
-//! - [`Self::elect_cycle`]：收盘选举纯内核（量最大/tiebreak/沿用前日/每日只更新一次），
-//!   由 [`Self::spawn_election`] 独立线程在日盘收盘后触发。
+//! - [`Self::elect_cycle`]：收盘选举纯内核（按配置指标取当日最大/tiebreak、
+//!   N 日连击确认、月份单向守卫、每日只处理一次），由 [`Self::spawn_election`]
+//!   独立线程在日盘收盘后触发。
 //!
 //! 全程 `std::sync::Mutex`（OS 线程，非 async）；锁内不调用外部 sink（先收集命中
 //! 列表，再在 [`market_hub::safe_notify`] 隔离下回调）。
@@ -19,12 +20,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rust_decimal::Decimal;
-use trading_core::kline::{DominantEntry, DominantTable, LastVolumeTable, TickTable};
+use trading_core::kline::{
+    DominantEntry, DominantTable, LastTickStat, LastTickStatTable, PendingCandidate, TickTable,
+};
 use trading_models::RawTick;
 
 use crate::ctp::bar_agg::BarAggSink;
 use crate::ctp::candle::CandleTick;
-use crate::ctp::dominant::{pick_dominant, product_prefix, ContractVolume};
+use crate::ctp::dominant::{
+    candidate_month_advances, contract_month, pick_dominant, product_prefix, ContractStat,
+    DominantMetric,
+};
 use crate::ctp::instrument_dir::InstrumentDir;
 use crate::market::{
     BarSink, DesiredSource, Kline, KlineInterval, MarketDataStream, SubscriptionGuard,
@@ -185,9 +191,9 @@ pub struct CtpMarketStream {
     router: Arc<BarRouter>,
     /// 多合约聚合器（router 为定稿下游）。
     bar_agg: Mutex<BarAggSink>,
-    /// 三表（drain 写入；聚合只读 dominant，选举读 last_volume、写 dominant）。
+    /// 三表（drain 写入；聚合只读 dominant，选举读 last_stats、写 dominant）。
     ticks: Arc<TickTable>,
-    last_volumes: Arc<LastVolumeTable>,
+    last_stats: Arc<LastTickStatTable>,
     dominants: Arc<DominantTable>,
     /// 合约目录（品种展开 / product 分组）。
     instrument_dir: Arc<InstrumentDir>,
@@ -199,7 +205,7 @@ pub struct CtpMarketStream {
 impl CtpMarketStream {
     pub fn new(
         ticks: Arc<TickTable>,
-        last_volumes: Arc<LastVolumeTable>,
+        last_stats: Arc<LastTickStatTable>,
         dominants: Arc<DominantTable>,
         instrument_dir: Arc<InstrumentDir>,
         kline_products: Vec<String>,
@@ -212,7 +218,7 @@ impl CtpMarketStream {
             router,
             bar_agg: Mutex::new(bar_agg),
             ticks,
-            last_volumes,
+            last_stats,
             dominants,
             instrument_dir,
             kline_products,
@@ -319,7 +325,15 @@ impl CtpMarketStream {
             bid_vol: depth.bid_vol,
             ask_vol: depth.ask_vol,
         });
-        self.last_volumes.put(symbol, tick.cum_volume);
+        // 选举原料：交易日 + 成交量 + 持仓量同口径覆盖（日过滤在 elect_cycle 内做）。
+        self.last_stats.put(
+            symbol,
+            LastTickStat {
+                trading_day: tick.trading_day,
+                cum_volume: tick.cum_volume,
+                open_interest: tick.open_interest,
+            },
+        );
         self.bar_agg.lock().unwrap().on_tick(symbol, tick);
     }
 
@@ -346,12 +360,33 @@ impl CtpMarketStream {
         self.bar_agg.lock().unwrap().sweep_finalized(now_ms)
     }
 
-    /// 收盘选举一轮：按合约所属 product（目录 product_id，缺失则剥尾数字）分组，
-    /// 量最大/tiebreak 选主力；该 product 当日已选（dominant.trading_day==day）则跳过
-    /// （每日只更新一次，盘中冻结）；当日无 tick 的 product 不产出（沿用旧值）。
-    pub fn elect_cycle(&self, trading_day: u32) -> usize {
-        let mut by_product: HashMap<String, Vec<ContractVolume>> = HashMap::new();
-        for (symbol, vol) in self.last_volumes.snapshot() {
+    /// 收盘选举一轮（每日每品种一次）。
+    ///
+    /// 1. 只取 `trading_day == 选举日` 的 stats（周末/节假日无数据 → 不产生选举，
+    ///    也不打断连击）；按目录 product_id（缺失则剥尾数字）分组，按 `criteria`
+    ///    选最大者（固定 tiebreak）；
+    /// 2. 该 product 当日已处理（`dominant.trading_day == trading_day`）则跳过，
+    ///    防止 60s 线程重复计数；
+    /// 3. 无当前主力（冷启动）→ 首次结果立即采纳；
+    /// 4. 当前主力继续胜出 → 清空 pending，刷新当日标记/指标；
+    /// 5. 换候选：月份必须严格前进；连击达到 `confirm_days` 才切换，否则记录
+    ///    `pending`（同一候选 streak+1，换候选重置为 1）。
+    ///
+    /// 返回值 = 本轮处理过的 product 数（测试/诊断用）。
+    pub fn elect_cycle(
+        &self,
+        trading_day: u32,
+        criteria: DominantMetric,
+        confirm_days: u32,
+    ) -> usize {
+        let confirm_days = confirm_days.max(1);
+        let reference_year = (trading_day / 10_000) as i32;
+        let mut by_product: HashMap<String, Vec<ContractStat>> = HashMap::new();
+        for (symbol, stat) in self.last_stats.snapshot() {
+            // 只认当日数据：持仓量不日清，陈旧值绝不参与选举。
+            if stat.trading_day != trading_day {
+                continue;
+            }
             let product = self
                 .instrument_dir
                 .get(&symbol)
@@ -359,44 +394,140 @@ impl CtpMarketStream {
                 .filter(|p| !p.is_empty())
                 .or_else(|| product_prefix(&symbol));
             if let Some(product) = product {
-                by_product.entry(product).or_default().push(ContractVolume {
+                by_product.entry(product).or_default().push(ContractStat {
                     symbol,
-                    cum_volume: vol,
+                    value: criteria.value(&stat),
                 });
             }
         }
-        let mut updated = 0;
-        for (product, vols) in by_product {
-            if let Some(cur) = self.dominants.get(&product) {
-                if cur.trading_day == trading_day {
-                    continue; // 当日冻结
-                }
+        let mut processed = 0;
+        for (product, stats) in by_product {
+            let current = self.dominants.get(&product);
+            if current
+                .as_ref()
+                .is_some_and(|e| e.trading_day == trading_day)
+            {
+                continue; // 当日已处理（盘中冻结）
             }
-            if let Some(symbol) = pick_dominant(&vols) {
-                let cum_volume = vols
-                    .iter()
-                    .find(|c| c.symbol == symbol)
-                    .map(|c| c.cum_volume)
-                    .unwrap_or(0);
-                self.dominants.put(
-                    &product,
-                    DominantEntry {
-                        symbol,
-                        trading_day,
-                        cum_volume,
-                    },
+            let Some(winner) = pick_dominant(&stats) else {
+                continue; // 当日无正指标：不产出、不改状态
+            };
+            let winner_value = stats
+                .iter()
+                .find(|c| c.symbol == winner)
+                .map(|c| c.value)
+                .unwrap_or_default();
+            let Some(cur) = current else {
+                // 冷启动：首次选举立即采纳，避免空等 N 天。
+                tracing::info!(
+                    product, symbol = %winner, trading_day,
+                    metric = criteria.as_str(), value = %winner_value,
+                    "CTP 主力冷启动：首次选举立即采纳"
                 );
-                updated += 1;
+                self.put_dominant(&product, winner, trading_day, winner_value, None);
+                processed += 1;
+                continue;
+            };
+            if cur.metric_value == Decimal::ZERO {
+                // 暂定预设（`preset_dominants` 写入 metric_value=0）：首轮真实选举
+                // 无条件覆盖，跳过月份守卫与确认天数——否则错误/过期预设会被
+                // 单向月份守卫永久锁死。覆盖后即进入正常语义。
+                tracing::info!(
+                    product, old = %cur.symbol, new = %winner, trading_day,
+                    metric = criteria.as_str(), value = %winner_value,
+                    "CTP 主力暂定预设被首轮真实选举覆盖"
+                );
+                self.put_dominant(&product, winner, trading_day, winner_value, None);
+                processed += 1;
+                continue;
             }
+            if winner == cur.symbol {
+                // 当前主力继续胜出：清空连击，刷新当日标记/指标。
+                self.put_dominant(&product, cur.symbol, trading_day, winner_value, None);
+                processed += 1;
+                continue;
+            }
+            // 月份单向守卫：候选不可解析 → WARN + fail-closed；未前进一律不切换。
+            if !candidate_month_advances(&cur.symbol, &winner, reference_year) {
+                if contract_month(&winner, reference_year).is_none() {
+                    tracing::warn!(
+                        product, candidate = %winner, current = %cur.symbol,
+                        "CTP 主力候选合约月份不可解析，保留当前主力（fail-closed）"
+                    );
+                } else {
+                    tracing::debug!(
+                        product, candidate = %winner, current = %cur.symbol,
+                        "CTP 主力候选月份未前进，保留当前主力"
+                    );
+                }
+                self.put_dominant(&product, cur.symbol, trading_day, cur.metric_value, None);
+                processed += 1;
+                continue;
+            }
+            // 连击：同一候选累加，换候选从 1 重新开始。
+            let streak = match &cur.pending {
+                Some(p) if p.symbol == winner => p.streak.saturating_add(1),
+                _ => 1,
+            };
+            if streak >= confirm_days {
+                tracing::info!(
+                    product, old = %cur.symbol, new = %winner, streak, confirm_days,
+                    trading_day, metric = criteria.as_str(),
+                    "CTP 主力切换确认"
+                );
+                self.put_dominant(&product, winner, trading_day, winner_value, None);
+            } else {
+                tracing::info!(
+                    product, candidate = %winner, current = %cur.symbol,
+                    streak, confirm_days, trading_day,
+                    "CTP 主力候选连击（未达确认天数）"
+                );
+                self.put_dominant(
+                    &product,
+                    cur.symbol,
+                    trading_day,
+                    cur.metric_value,
+                    Some(PendingCandidate {
+                        symbol: winner,
+                        streak,
+                    }),
+                );
+            }
+            processed += 1;
         }
-        updated
+        processed
+    }
+
+    /// 写主力表：统一构造 [`DominantEntry`]，避免状态机各分支重复结构体字面量。
+    fn put_dominant(
+        &self,
+        product: &str,
+        symbol: String,
+        trading_day: u32,
+        metric_value: Decimal,
+        pending: Option<PendingCandidate>,
+    ) {
+        self.dominants.put(
+            product,
+            DominantEntry {
+                symbol,
+                trading_day,
+                metric_value,
+                pending,
+            },
+        );
     }
 
     /// 起独立线程做收盘选举：每分钟检查北京 wall-clock 是否进入日盘收盘后窗口
-    /// （≥15:00），当天首次进入用当日累计量选一次（elect_cycle 内部按交易日防重）。
-    pub fn spawn_election(self: &Arc<Self>, stop: Arc<AtomicBool>) {
+    /// （≥15:00），当天首次进入按配置指标/确认天数选一次（elect_cycle 内部按交易日防重）。
+    pub fn spawn_election(
+        self: &Arc<Self>,
+        stop: Arc<AtomicBool>,
+        criteria: DominantMetric,
+        confirm_days: u32,
+    ) {
         let me = Arc::clone(self);
-        std::thread::Builder::new()
+        let spawn = std::thread::Builder::new()
             .name("ctp-dominant".into())
             .spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
@@ -405,16 +536,23 @@ impl CtpMarketStream {
                         break;
                     }
                     if let Some(day) = beijing_election_day() {
-                        me.elect_cycle(day);
+                        me.elect_cycle(day, criteria, confirm_days);
                     }
                 }
-            })
-            .ok();
+            });
+        if let Err(e) = spawn {
+            // 选举线程缺失 = 收盘后不会自动选主力，必须显式告警（不静默吞掉）。
+            tracing::error!(error = %e, "CTP 主力选举线程创建失败，收盘选举将不会运行");
+        }
     }
 
     /// 冷启动预设主力：把 `["cu:cu2512", ...]` 直接写入主力表（trading_day 取
-    /// 北京当日，cum_volume=0）。用于盘中重启/未到 15:00 选举窗口时让品种订阅
-    /// 立即只推指定合约；elect_cycle 因该品种当日已选而跳过，下一交易日真实选举接管。
+    /// 北京当日，metric_value=0、pending=None）。用于盘中重启/未到 15:00 选举窗口时让品种订阅
+    /// 立即只推指定合约；elect_cycle 因该品种当日已选而跳过。
+    ///
+    /// `metric_value=0` 表示**暂定**：下一交易日首轮真实选举**无条件覆盖**
+    /// （跳过月份守卫/确认天数），避免错误或过期预设被单向月份守卫永久锁死；
+    /// 覆盖后即进入正常语义。
     /// 格式非法/缺冒号的条目忽略并告警，不影响其余条目与行情启动。
     pub fn preset_dominants(&self, pairs: &[String]) -> usize {
         let Some(day) = beijing_trading_day() else {
@@ -445,7 +583,8 @@ impl CtpMarketStream {
                 DominantEntry {
                     symbol: symbol.to_string(),
                     trading_day: day,
-                    cum_volume: 0,
+                    metric_value: Decimal::ZERO,
+                    pending: None,
                 },
             );
             tracing::info!(product, symbol, trading_day = day, "已预设 CTP 主力合约");
@@ -547,10 +686,10 @@ mod tests {
         }
     }
 
-    fn tables() -> (Arc<TickTable>, Arc<LastVolumeTable>, Arc<DominantTable>) {
+    fn tables() -> (Arc<TickTable>, Arc<LastTickStatTable>, Arc<DominantTable>) {
         (
             Arc::new(TickTable::new()),
-            Arc::new(LastVolumeTable::new()),
+            Arc::new(LastTickStatTable::new()),
             Arc::new(DominantTable::new()),
         )
     }
@@ -662,7 +801,8 @@ mod tests {
             DominantEntry {
                 symbol: "cu2512".into(),
                 trading_day: 20261023,
-                cum_volume: 0,
+                metric_value: Decimal::ZERO,
+                pending: None,
             },
         );
         let dir = dir_with(vec![info("cu2511", "cu", true), info("cu2512", "cu", true)]);
@@ -690,7 +830,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["cu2511", "cu2511", "cu2512", "cu2512"]
         );
-        assert_eq!(s.last_volumes.get("cu2512"), Some(25));
+        let stat = s.last_stats.get("cu2512").expect("统计表已写入");
+        assert_eq!(stat.trading_day, 20261023);
+        assert_eq!(stat.cum_volume, 25);
     }
 
     #[test]
@@ -702,7 +844,8 @@ mod tests {
             DominantEntry {
                 symbol: "cu2512".into(),
                 trading_day: 20261023,
-                cum_volume: 0,
+                metric_value: Decimal::ZERO,
+                pending: None,
             },
         );
         let want = |syms: &[&str], bar: &str| {
@@ -731,7 +874,8 @@ mod tests {
             DominantEntry {
                 symbol: "cu2512".into(),
                 trading_day: 20261023,
-                cum_volume: 0,
+                metric_value: Decimal::ZERO,
+                pending: None,
             },
         );
         let dir = dir_with(vec![info("cu2512", "cu", true), info("cu2611", "cu", true)]);
@@ -760,7 +904,8 @@ mod tests {
             DominantEntry {
                 symbol: "cu2512".into(),
                 trading_day: 20261023,
-                cum_volume: 0,
+                metric_value: Decimal::ZERO,
+                pending: None,
             },
         );
         let persist = Arc::new(CountSink::default());
@@ -893,23 +1038,294 @@ mod tests {
         assert!(s.sweep_kline_finalized(660_000).len() == 1);
     }
 
-    #[test]
-    fn elect_cycle_picks_and_freezes_per_day() {
-        let (ticks, vols, doms) = tables();
-        let dir = dir_with(vec![info("cu2511", "cu", true), info("cu2512", "cu", true)]);
-        vols.put("cu2511", 100);
-        vols.put("cu2512", 500);
-        let s = CtpMarketStream::new(ticks, vols, doms, dir, Vec::new());
+    // ---- 收盘选举：指标 / 当日过滤 / 连击确认 / 月份守卫 ----
 
-        assert_eq!(s.elect_cycle(20261023), 1);
+    fn stat(day: u32, vol: i64, oi: i64) -> LastTickStat {
+        LastTickStat {
+            trading_day: day,
+            cum_volume: vol,
+            open_interest: Decimal::from(oi),
+        }
+    }
+
+    /// 构造带指定 (合约, 品种) 目录的行情流。
+    fn stream_with(pairs: &[(&str, &str)]) -> Arc<CtpMarketStream> {
+        let (ticks, stats, doms) = tables();
+        let dir = dir_with(
+            pairs
+                .iter()
+                .map(|(sym, prod)| info(sym, prod, true))
+                .collect(),
+        );
+        CtpMarketStream::new(ticks, stats, doms, dir, Vec::new())
+    }
+
+    /// 预置**已确认**的当前主力（模拟上一交易日真实选举结果）。
+    ///
+    /// `metric_value` 必须非 0：0 表示「暂定预设」，首轮真实选举会无条件覆盖。
+    fn preset_current(s: &CtpMarketStream, product: &str, symbol: &str, day: u32) {
+        s.dominants.put(
+            product,
+            DominantEntry {
+                symbol: symbol.into(),
+                trading_day: day,
+                metric_value: Decimal::ONE,
+                pending: None,
+            },
+        );
+    }
+
+    /// 预置**暂定**主力（等价 `preset_dominants` 写入：metric_value=0）。
+    fn preset_provisional(s: &CtpMarketStream, product: &str, symbol: &str, day: u32) {
+        s.dominants.put(
+            product,
+            DominantEntry {
+                symbol: symbol.into(),
+                trading_day: day,
+                metric_value: Decimal::ZERO,
+                pending: None,
+            },
+        );
+    }
+
+    #[test]
+    fn elect_cycle_cold_start_adopts_open_interest_and_freezes_same_day() {
+        let s = stream_with(&[("cu2512", "cu"), ("cu2601", "cu")]);
+        // 成交量 cu2601 更大，但默认指标是持仓量：cu2512 (900) 胜 cu2601 (100)。
+        s.last_stats.put("cu2512", stat(20261023, 100, 900));
+        s.last_stats.put("cu2601", stat(20261023, 500, 100));
+
+        assert_eq!(s.elect_cycle(20261023, DominantMetric::OpenInterest, 3), 1);
         assert_eq!(s.dominants.dominant_symbol("cu").as_deref(), Some("cu2512"));
-        // 同日冻结。
-        s.last_volumes.put("cu2511", 9999);
-        assert_eq!(s.elect_cycle(20261023), 0);
+        // 同日冻结：指标反转也不再重选。
+        s.last_stats.put("cu2601", stat(20261023, 9999, 9999));
+        assert_eq!(s.elect_cycle(20261023, DominantMetric::OpenInterest, 3), 0);
         assert_eq!(s.dominants.dominant_symbol("cu").as_deref(), Some("cu2512"));
-        // 次日允许重选。
-        assert_eq!(s.elect_cycle(20261024), 1);
-        assert_eq!(s.dominants.dominant_symbol("cu").as_deref(), Some("cu2511"));
+    }
+
+    #[test]
+    fn elect_cycle_volume_metric_selects_by_volume() {
+        let s = stream_with(&[("cu2512", "cu"), ("cu2601", "cu")]);
+        s.last_stats.put("cu2512", stat(20261023, 100, 900));
+        s.last_stats.put("cu2601", stat(20261023, 500, 100));
+        // 切成交量指标：cu2601 胜出。
+        assert_eq!(s.elect_cycle(20261023, DominantMetric::Volume, 3), 1);
+        assert_eq!(s.dominants.dominant_symbol("cu").as_deref(), Some("cu2601"));
+    }
+
+    #[test]
+    fn elect_cycle_ignores_stale_day_stats() {
+        // 陈旧交易日（前一天/周末残留）即使指标巨大也不参与选举。
+        let s = stream_with(&[("cu2612", "cu"), ("cu2701", "cu")]);
+        s.last_stats.put("cu2612", stat(20261022, 9999, 99_999));
+        s.last_stats.put("cu2701", stat(20261023, 10, 10));
+        assert_eq!(s.elect_cycle(20261023, DominantMetric::OpenInterest, 3), 1);
+        assert_eq!(s.dominants.dominant_symbol("cu").as_deref(), Some("cu2701"));
+    }
+
+    #[test]
+    fn elect_cycle_requires_consecutive_confirm_days_before_switch() {
+        let s = stream_with(&[("cu2701", "cu"), ("cu2705", "cu")]);
+        preset_current(&s, "cu", "cu2701", 20261101);
+
+        // 第 1/2 天：候选连胜 1/2，仍未切换。
+        for (day, streak) in [(20261102u32, 1u32), (20261103, 2)] {
+            s.last_stats.put("cu2701", stat(day, 10, 10));
+            s.last_stats.put("cu2705", stat(day, 100, 100));
+            assert_eq!(s.elect_cycle(day, DominantMetric::OpenInterest, 3), 1);
+            let e = s.dominants.get("cu").unwrap();
+            assert_eq!(e.symbol, "cu2701", "确认期内保持旧主力");
+            assert_eq!(e.pending.as_ref().map(|p| p.streak), Some(streak));
+            assert_eq!(
+                e.pending.as_ref().map(|p| p.symbol.as_str()),
+                Some("cu2705")
+            );
+            assert_eq!(e.trading_day, day, "每个有数据交易日都推进当日标记");
+        }
+        // 第 3 天：达到确认天数，切换。
+        s.last_stats.put("cu2701", stat(20261104, 10, 10));
+        s.last_stats.put("cu2705", stat(20261104, 100, 100));
+        assert_eq!(s.elect_cycle(20261104, DominantMetric::OpenInterest, 3), 1);
+        let e = s.dominants.get("cu").unwrap();
+        assert_eq!(e.symbol, "cu2705");
+        assert!(e.pending.is_none(), "确认切换后清空连击");
+    }
+
+    #[test]
+    fn elect_cycle_confirm_days_one_switches_same_day() {
+        let s = stream_with(&[("cu2701", "cu"), ("cu2705", "cu")]);
+        preset_current(&s, "cu", "cu2701", 20261101);
+        s.last_stats.put("cu2701", stat(20261102, 10, 10));
+        s.last_stats.put("cu2705", stat(20261102, 100, 100));
+        // confirm_days=1 等价旧行为：当天生效。
+        assert_eq!(s.elect_cycle(20261102, DominantMetric::OpenInterest, 1), 1);
+        assert_eq!(s.dominants.dominant_symbol("cu").as_deref(), Some("cu2705"));
+    }
+
+    #[test]
+    fn elect_cycle_candidate_change_resets_streak() {
+        let s = stream_with(&[("cu2701", "cu"), ("cu2705", "cu"), ("cu2707", "cu")]);
+        preset_current(&s, "cu", "cu2701", 20261101);
+        // day1：cu2705 连胜 1。
+        s.last_stats.put("cu2701", stat(20261102, 10, 10));
+        s.last_stats.put("cu2705", stat(20261102, 100, 100));
+        assert_eq!(s.elect_cycle(20261102, DominantMetric::OpenInterest, 3), 1);
+        // day2：换成 cu2707 → 连击重置为 1。
+        s.last_stats.put("cu2701", stat(20261103, 10, 10));
+        s.last_stats.put("cu2705", stat(20261103, 100, 100));
+        s.last_stats.put("cu2707", stat(20261103, 200, 200));
+        assert_eq!(s.elect_cycle(20261103, DominantMetric::OpenInterest, 3), 1);
+        let e = s.dominants.get("cu").unwrap();
+        assert_eq!(e.symbol, "cu2701");
+        let pending = e.pending.expect("候选连击已记录");
+        assert_eq!(pending.symbol, "cu2707");
+        assert_eq!(pending.streak, 1);
+    }
+
+    #[test]
+    fn elect_cycle_current_winner_clears_pending() {
+        let s = stream_with(&[("cu2701", "cu"), ("cu2705", "cu")]);
+        preset_current(&s, "cu", "cu2701", 20261101);
+        // day1：cu2705 连胜 1。
+        s.last_stats.put("cu2701", stat(20261102, 10, 10));
+        s.last_stats.put("cu2705", stat(20261102, 100, 100));
+        s.elect_cycle(20261102, DominantMetric::OpenInterest, 3);
+        // day2：当前主力重新胜出 → 连击清零。
+        s.last_stats.put("cu2701", stat(20261103, 500, 500));
+        s.last_stats.put("cu2705", stat(20261103, 100, 100));
+        s.elect_cycle(20261103, DominantMetric::OpenInterest, 3);
+        let e = s.dominants.get("cu").unwrap();
+        assert_eq!(e.symbol, "cu2701");
+        assert!(e.pending.is_none());
+    }
+
+    #[test]
+    fn elect_cycle_month_guard_never_rolls_back() {
+        // 当前 2701；候选 2612（更早月份）即使连续大胜也永不切换。
+        let s = stream_with(&[("cu2701", "cu"), ("cu2612", "cu")]);
+        preset_current(&s, "cu", "cu2701", 20261101);
+        for day in [20261102u32, 20261103, 20261104] {
+            s.last_stats.put("cu2701", stat(day, 1, 1));
+            s.last_stats.put("cu2612", stat(day, 9999, 9999));
+            assert_eq!(s.elect_cycle(day, DominantMetric::OpenInterest, 3), 1);
+            let e = s.dominants.get("cu").unwrap();
+            assert_eq!(e.symbol, "cu2701");
+            assert!(e.pending.is_none(), "回退候选不得累计连击");
+        }
+    }
+
+    #[test]
+    fn elect_cycle_unparseable_candidate_is_fail_closed() {
+        let s = stream_with(&[("cu2701", "cu"), ("cuXXXX", "cu")]);
+        preset_current(&s, "cu", "cu2701", 20261101);
+        s.last_stats.put("cu2701", stat(20261102, 1, 1));
+        s.last_stats.put("cuXXXX", stat(20261102, 9999, 9999));
+        assert_eq!(s.elect_cycle(20261102, DominantMetric::OpenInterest, 3), 1);
+        let e = s.dominants.get("cu").unwrap();
+        assert_eq!(e.symbol, "cu2701");
+        assert!(e.pending.is_none());
+    }
+
+    #[test]
+    fn elect_cycle_current_unparseable_accepts_valid_candidate() {
+        // 当前合约不可解析、候选合法 → 不做月份守卫拦截（仍受确认天数约束）。
+        let s = stream_with(&[("cuXXXX", "cu"), ("cu2705", "cu")]);
+        preset_current(&s, "cu", "cuXXXX", 20261101);
+        s.last_stats.put("cuXXXX", stat(20261102, 1, 1));
+        s.last_stats.put("cu2705", stat(20261102, 100, 100));
+        assert_eq!(s.elect_cycle(20261102, DominantMetric::OpenInterest, 1), 1);
+        assert_eq!(s.dominants.dominant_symbol("cu").as_deref(), Some("cu2705"));
+    }
+
+    #[test]
+    fn elect_cycle_no_data_day_does_not_break_streak() {
+        // 周末/无 tick 日：不推进当日标记、不打断连击。
+        let s = stream_with(&[("cu2701", "cu"), ("cu2705", "cu")]);
+        preset_current(&s, "cu", "cu2701", 20261101);
+        s.last_stats.put("cu2701", stat(20261102, 10, 10));
+        s.last_stats.put("cu2705", stat(20261102, 100, 100));
+        s.elect_cycle(20261102, DominantMetric::OpenInterest, 3);
+        assert_eq!(s.dominants.get("cu").unwrap().pending.unwrap().streak, 1);
+
+        // day3 无任何当日数据（stats 仍是 day2）：本轮不处理，状态原样保留。
+        assert_eq!(s.elect_cycle(20261103, DominantMetric::OpenInterest, 3), 0);
+        let e = s.dominants.get("cu").unwrap();
+        assert_eq!(e.trading_day, 20261102);
+        assert_eq!(e.pending.as_ref().unwrap().streak, 1);
+
+        // day4 恢复数据：同一候选继续累加到 2。
+        s.last_stats.put("cu2701", stat(20261104, 10, 10));
+        s.last_stats.put("cu2705", stat(20261104, 100, 100));
+        s.elect_cycle(20261104, DominantMetric::OpenInterest, 3);
+        assert_eq!(s.dominants.get("cu").unwrap().pending.unwrap().streak, 2);
+    }
+
+    #[test]
+    fn elect_cycle_same_day_repeat_does_not_advance_streak() {
+        // 60s 选举线程同一天可能多次触发：trading_day 标记必须保证连击只 +1 一次。
+        let s = stream_with(&[("cu2701", "cu"), ("cu2705", "cu")]);
+        preset_current(&s, "cu", "cu2701", 20261101);
+        s.last_stats.put("cu2701", stat(20261102, 10, 10));
+        s.last_stats.put("cu2705", stat(20261102, 100, 100));
+
+        assert_eq!(s.elect_cycle(20261102, DominantMetric::OpenInterest, 3), 1);
+        assert_eq!(s.dominants.get("cu").unwrap().pending.unwrap().streak, 1);
+        // 同日再次触发：本轮不处理，连击不得变成 2。
+        assert_eq!(s.elect_cycle(20261102, DominantMetric::OpenInterest, 3), 0);
+        assert_eq!(s.dominants.get("cu").unwrap().pending.unwrap().streak, 1);
+    }
+
+    #[test]
+    fn elect_cycle_provisional_preset_is_overridden_by_first_real_election() {
+        // H1：预设（metric_value=0）只是暂定，首轮真实选举必须无条件覆盖，
+        // 即使真实主力的月份「回退」于预设远月（旧逻辑会被月份守卫永久锁死）。
+        let s = stream_with(&[("cu2709", "cu"), ("cu2612", "cu")]);
+        preset_provisional(&s, "cu", "cu2709", 20261101);
+        s.last_stats.put("cu2709", stat(20261102, 10, 500));
+        s.last_stats.put("cu2612", stat(20261102, 100, 9000));
+
+        assert_eq!(s.elect_cycle(20261102, DominantMetric::OpenInterest, 3), 1);
+        let e = s.dominants.get("cu").unwrap();
+        assert_eq!(e.symbol, "cu2612", "暂定预设必须被首轮真实选举覆盖");
+        assert_eq!(e.metric_value, Decimal::from(9000));
+        assert!(e.pending.is_none());
+
+        // 覆盖后进入正常语义：再次出现更早月份的最大者，月份守卫应拒绝。
+        s.last_stats.put("cu2612", stat(20261103, 80, 8000));
+        s.last_stats.put("cu2611", stat(20261103, 999, 99_999));
+        assert_eq!(s.elect_cycle(20261103, DominantMetric::OpenInterest, 3), 1);
+        assert_eq!(s.dominants.dominant_symbol("cu").as_deref(), Some("cu2612"));
+    }
+
+    #[test]
+    fn elect_cycle_backward_max_masks_forward_runner_up_by_design() {
+        // H2 决议：不改为「先过滤再选最大」。全局最大若月份回退，则保留当前并清空
+        // pending；次大的前进候选本日不被考虑（这是已确认的语义，不是缺陷）。
+        let s = stream_with(&[("cu2701", "cu"), ("cu2612", "cu"), ("cu2705", "cu")]);
+        preset_current(&s, "cu", "cu2701", 20261101);
+
+        // day1：cu2705（前进）为最大 → 连击 1。
+        s.last_stats.put("cu2701", stat(20261102, 10, 5000));
+        s.last_stats.put("cu2612", stat(20261102, 10, 4000));
+        s.last_stats.put("cu2705", stat(20261102, 10, 8000));
+        s.elect_cycle(20261102, DominantMetric::OpenInterest, 3);
+        assert_eq!(s.dominants.get("cu").unwrap().pending.unwrap().streak, 1);
+
+        // day2：近月 cu2612 成为全局最大（回退月份）；cu2705 次大且前进但不被考虑。
+        s.last_stats.put("cu2701", stat(20261103, 10, 5000));
+        s.last_stats.put("cu2612", stat(20261103, 10, 9000));
+        s.last_stats.put("cu2705", stat(20261103, 10, 8500));
+        assert_eq!(s.elect_cycle(20261103, DominantMetric::OpenInterest, 3), 1);
+        let e = s.dominants.get("cu").unwrap();
+        assert_eq!(e.symbol, "cu2701", "全局最大为回退月份：保留当前");
+        assert!(e.pending.is_none(), "当前语义：守卫否决时清空 pending");
+
+        // day3：回退合约指标回落，cu2705 再胜 → 连击从 1 重新开始（不是 2）。
+        s.last_stats.put("cu2701", stat(20261104, 10, 5000));
+        s.last_stats.put("cu2612", stat(20261104, 10, 4000));
+        s.last_stats.put("cu2705", stat(20261104, 10, 8000));
+        s.elect_cycle(20261104, DominantMetric::OpenInterest, 3);
+        assert_eq!(s.dominants.get("cu").unwrap().pending.unwrap().streak, 1);
     }
 
     #[test]
@@ -920,7 +1336,8 @@ mod tests {
             DominantEntry {
                 symbol: "cu2512".into(),
                 trading_day: 20261023,
-                cum_volume: 0,
+                metric_value: Decimal::ZERO,
+                pending: None,
             },
         );
         let dir = dir_with(vec![info("cu2512", "cu", true)]);
@@ -950,7 +1367,8 @@ mod tests {
         assert_eq!(applied, 1);
         let e = doms.get("cu").expect("cu 主力已预设");
         assert_eq!(e.symbol, "cu2512");
-        assert_eq!(e.cum_volume, 0);
+        assert_eq!(e.metric_value, Decimal::ZERO);
+        assert!(e.pending.is_none());
         assert!(e.trading_day >= 20261026); // 北京当日
     }
 }

@@ -2,6 +2,9 @@
 
 use std::path::Path;
 
+use crate::ctp::dominant::DominantMetric;
+use crate::ctp::prep::ShfeClosePriority;
+
 /// CTP 运行参数（纯部署资源：.so 路径与流目录基准）。
 ///
 /// 前置环境开关（`is_production_mode`）不在此列：评测版合并 API（v6.7.11+）
@@ -29,6 +32,13 @@ pub struct CtpConfig {
     /// （买开=ask+n·tick、卖开=bid−n·tick）；**CTP 独立配置，与 deribit 漂移无关**。
     /// 平仓不漂移（取 best bid/ask）。默认 1；0 = 纯对手价。
     pub shfe_market_drift_ticks: i64,
+    /// SHFE 平仓腿先后顺序：`today_first`（默认，先平今）/ `yesterday_first`
+    /// （旧行为，先平昨）。两腿的实际 `ReqOrderInsert` 调用顺序即由此决定。
+    pub shfe_close_priority: ShfeClosePriority,
+    /// 主力选举指标：`volume`=当日累计成交量 / `open_interest`=当日持仓量（默认）。
+    pub main_contract_criteria: DominantMetric,
+    /// 主力切换确认天数：同一候选连续 N 个有数据交易日胜出才切换（默认 3；1=当天生效）。
+    pub main_contract_confirm_days: u32,
     /// 冷启动预设主力：`品种:主力合约` 列表，如 `["cu:cu2512"]`。
     /// 进程启动时直接写入主力表（trading_day 取当日），使**盘中重启/未到 15:00
     /// 选举窗口**时品种订阅（cu）也能立即只推该合约；当日收盘选举对该品种跳过
@@ -48,6 +58,9 @@ pub struct CtpConfig {
 /// SHFE 市价转限价漂移档数缺省值（穿 1 个最小变动价位提成交确定性）。
 pub const DEFAULT_SHFE_MARKET_DRIFT_TICKS: i64 = 1;
 
+/// 主力切换确认天数缺省值（连续 3 个有数据交易日胜出才切换）。
+pub const DEFAULT_MAIN_CONTRACT_CONFIRM_DAYS: u32 = 3;
+
 impl CtpConfig {
     /// vendored 缺省：仓库内 v6.7.13 linux64 动态库 + 系统临时流目录。
     pub fn vendored() -> Self {
@@ -64,6 +77,9 @@ impl CtpConfig {
             md_anon: false,
             md_pass_is_authcode: false,
             shfe_market_drift_ticks: DEFAULT_SHFE_MARKET_DRIFT_TICKS,
+            shfe_close_priority: ShfeClosePriority::default(),
+            main_contract_criteria: DominantMetric::default(),
+            main_contract_confirm_days: DEFAULT_MAIN_CONTRACT_CONFIRM_DAYS,
             preset_dominants: Vec::new(),
             kline_products: Vec::new(),
             instrument_specs_path: None,
@@ -73,6 +89,12 @@ impl CtpConfig {
     /// 覆盖 SHFE 市价转限价的漂移档数（builder 风格，0=纯对手价）。
     pub fn with_shfe_market_drift_ticks(mut self, ticks: i64) -> Self {
         self.shfe_market_drift_ticks = ticks.max(0);
+        self
+    }
+
+    /// 覆盖 SHFE 平仓腿顺序（builder 风格）。
+    pub fn with_shfe_close_priority(mut self, priority: ShfeClosePriority) -> Self {
+        self.shfe_close_priority = priority;
         self
     }
 
@@ -87,6 +109,9 @@ impl CtpConfig {
             md_anon: false,
             md_pass_is_authcode: false,
             shfe_market_drift_ticks: DEFAULT_SHFE_MARKET_DRIFT_TICKS,
+            shfe_close_priority: ShfeClosePriority::default(),
+            main_contract_criteria: DominantMetric::default(),
+            main_contract_confirm_days: DEFAULT_MAIN_CONTRACT_CONFIRM_DAYS,
             preset_dominants: Vec::new(),
             kline_products: Vec::new(),
             instrument_specs_path: None,
@@ -126,6 +151,12 @@ pub fn from_values(
     md_pass_is_authcode: Option<bool>,
     // SHFE 市价开仓穿价漂移档数（None=用内置默认 1）。
     shfe_market_drift_ticks: Option<i64>,
+    // SHFE 平仓腿顺序（None=默认先平今）。
+    shfe_close_priority: Option<ShfeClosePriority>,
+    // 主力选举指标（None=默认持仓量）。
+    main_contract_criteria: Option<DominantMetric>,
+    // 主力切换确认天数（None=默认 3；<1 由配置层 fail-fast）。
+    main_contract_confirm_days: Option<u32>,
     // 冷启动预设主力 `品种:合约` 列表（None=不预设）。
     preset_dominants: Option<Vec<String>>,
     // 配置基线 K线品种列表（None=空，仅按客户端动态订阅采集）。
@@ -146,6 +177,11 @@ pub fn from_values(
         shfe_market_drift_ticks: shfe_market_drift_ticks
             .unwrap_or(base.shfe_market_drift_ticks)
             .max(0),
+        shfe_close_priority: shfe_close_priority.unwrap_or(base.shfe_close_priority),
+        main_contract_criteria: main_contract_criteria.unwrap_or(base.main_contract_criteria),
+        main_contract_confirm_days: main_contract_confirm_days
+            .unwrap_or(base.main_contract_confirm_days)
+            .max(1),
         preset_dominants: preset_dominants.unwrap_or(base.preset_dominants),
         kline_products: kline_products.unwrap_or(base.kline_products),
         instrument_specs_path,
@@ -155,6 +191,13 @@ pub fn from_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 构造全部 None（vendored 缺省）的便捷入口。
+    fn all_none() -> CtpConfig {
+        from_values(
+            None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+        )
+    }
 
     #[test]
     fn from_values_overrides_partial() {
@@ -166,6 +209,9 @@ mod tests {
             Some("/tmp/ctp-flow-custom".into()),
             Some("tcp://101.226.250.133:42213".into()),
             Some("ctp-simnow".into()),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -196,6 +242,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
         // Assert：md_front 为空 = 行情线程不启动的信号。
         assert!(cfg.md_front.is_empty());
@@ -219,6 +268,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
         let auth = from_values(
             None,
@@ -228,6 +280,9 @@ mod tests {
             None,
             None,
             Some(true),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -255,6 +310,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
         assert_eq!(cfg.shfe_market_drift_ticks, 3);
         let zero = from_values(
@@ -269,12 +327,13 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
         assert_eq!(zero.shfe_market_drift_ticks, 0);
         // None 取内置默认；负值钳 0。
-        let dflt = from_values(
-            None, None, None, None, None, None, None, None, None, None, None,
-        );
+        let dflt = all_none();
         assert_eq!(
             dflt.shfe_market_drift_ticks,
             DEFAULT_SHFE_MARKET_DRIFT_TICKS
@@ -291,8 +350,93 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
         assert_eq!(neg.shfe_market_drift_ticks, 0);
+    }
+
+    #[test]
+    fn shfe_close_priority_is_configurable_and_defaults_today_first() {
+        // 缺省先平今（新默认）。
+        assert_eq!(
+            all_none().shfe_close_priority,
+            ShfeClosePriority::TodayFirst
+        );
+        // 显式切回先平昨（旧行为）。
+        let yd = from_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(ShfeClosePriority::YesterdayFirst),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(yd.shfe_close_priority, ShfeClosePriority::YesterdayFirst);
+        // builder 覆盖。
+        assert_eq!(
+            CtpConfig::for_tests()
+                .with_shfe_close_priority(ShfeClosePriority::YesterdayFirst)
+                .shfe_close_priority,
+            ShfeClosePriority::YesterdayFirst
+        );
+    }
+
+    #[test]
+    fn main_contract_selection_is_configurable_and_defaults() {
+        // 默认：持仓量 + 3 日确认。
+        let dflt = all_none();
+        assert_eq!(dflt.main_contract_criteria, DominantMetric::OpenInterest);
+        assert_eq!(
+            dflt.main_contract_confirm_days,
+            DEFAULT_MAIN_CONTRACT_CONFIRM_DAYS
+        );
+        // 显式覆盖为成交量 + 1 日确认（= 当天生效）。
+        let cfg = from_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(DominantMetric::Volume),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(cfg.main_contract_criteria, DominantMetric::Volume);
+        assert_eq!(cfg.main_contract_confirm_days, 1);
+        // 防御性钳制：0 不得使选举永不确认。
+        let zero = from_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(0),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(zero.main_contract_confirm_days, 1);
     }
 
     #[test]

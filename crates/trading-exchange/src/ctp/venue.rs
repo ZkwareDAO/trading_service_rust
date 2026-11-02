@@ -442,10 +442,13 @@ enum ClosePlan {
     GenericClose,
     /// 上期所单笔显式腿（纯平今或纯平昨）。
     ShfeSingle(crate::ctp::core::types::Offset, i32),
-    /// 上期所跨今昨一单两腿：**先平昨 `yesterday_n` 手、再平今 `today_n` 手**
-    /// （平今手续费高，省费优先），两物理报单共享同一 cid
+    /// 上期所跨今昨一单两腿：`first` 为**先下发**的腿、`second` 为后下发腿。
+    /// 谁今谁昨由 [`crate::ctp::prep::ShfeClosePriority`] 决定；两物理报单共享同一 cid
     /// （成交/终态由 leg_table 按 cid 聚合）。
-    ShfeTwo { yesterday_n: i32, today_n: i32 },
+    ShfeTwo {
+        first: (crate::ctp::core::types::Offset, i32),
+        second: (crate::ctp::core::types::Offset, i32),
+    },
 }
 
 /// 平仓路由决策失败原因（全部 fail-closed，绝不猜测发 Close）。
@@ -457,40 +460,38 @@ enum ClosePlanError {
     InsufficientPosition,
 }
 
-/// 平仓纯路由内核：给定交易所与该持仓方向的 (今,昨) 分布，决定物理腿。
+/// 平仓纯路由内核：给定交易所、该持仓方向的 (今,昨) 分布与平仓优先级，决定物理腿。
 ///
 /// * `exchange != Some("SHFE")`（含目录未预热到的 None）→
 ///   [`ClosePlan::GenericClose`]，保持非上期所路径零变化；
 /// * SHFE：`split=None`（路由表未就绪）→ [`ClosePlanError::SplitNotReady`]；
-///   复用 [`prep::close_offsets`] 得 1~2 腿（**先平昨**）——平量 ≤ 昨仓→单笔
-///   CloseYesterday、昨仓为 0→单笔 CloseToday、跨今昨→[`ClosePlan::ShfeTwo`]
-///   （先 CloseYesterday 后 CloseToday）；总量不足→拒。
+///   复用 [`prep::close_offsets`] 得 1~2 条**有序腿**——单腿即纯今或纯昨；
+///   跨今昨→[`ClosePlan::ShfeTwo`]（`first`/`second` 顺序即实际下发顺序，
+///   由 `priority` 决定先平今或先平昨）；总量不足→拒。
 fn plan_close(
     volume: i32,
     exchange: Option<&str>,
     split: Option<(i32, i32)>,
+    priority: crate::ctp::prep::ShfeClosePriority,
 ) -> Result<ClosePlan, ClosePlanError> {
-    use crate::ctp::core::types::Offset;
     use crate::ctp::prep::{close_offsets, TodayYdSplit};
     if exchange != Some(SHFE_EXCHANGE_ID) {
         return Ok(ClosePlan::GenericClose);
     }
     let (today, yesterday) = split.ok_or(ClosePlanError::SplitNotReady)?;
-    let legs = close_offsets(volume, Some(TodayYdSplit { today, yesterday }))
+    let legs = close_offsets(volume, Some(TodayYdSplit { today, yesterday }), priority)
         .map_err(|_| ClosePlanError::InsufficientPosition)?;
     // 不直接索引：release 下 debug_assert 被裁掉，裸 legs[1] 越界会 panic 掉整个
     // 账户会话线程。用切片模式匹配把"close_offsets 恒返回 1~2 腿"的隐含契约显式化，
     // 异常形态（未来改动引入 0/3+ 腿）fail-closed 拒单而非崩溃。
     match legs.as_slice() {
         [(offset, n)] => Ok(ClosePlan::ShfeSingle(*offset, *n)),
-        // close_offsets 现按「先平昨、不足再平今」产出，腿序固定为昨腿在前。
-        [(Offset::CloseYesterday, yesterday_n), (Offset::CloseToday, today_n)] => {
-            Ok(ClosePlan::ShfeTwo {
-                yesterday_n: *yesterday_n,
-                today_n: *today_n,
-            })
-        }
-        // 腿序/数量不符 prep 契约：不下单（理论不可达）。
+        // prep 已按优先级排好序：first 必须先下发，second 后下发（顺序即语义）。
+        [(first_offset, first_n), (second_offset, second_n)] => Ok(ClosePlan::ShfeTwo {
+            first: (*first_offset, *first_n),
+            second: (*second_offset, *second_n),
+        }),
+        // 腿数不符 prep 契约：不下单（理论不可达）。
         _ => Err(ClosePlanError::InsufficientPosition),
     }
 }
@@ -526,20 +527,21 @@ fn run_command(h: &mut TraderHandle, ctx: &EventContext, req: crate::ctp::mailbo
 }
 
 /// 路由后的物理下单：单笔（开仓/非 SHFE 借用原请求零克隆，或 SHFE 改写后拥有），
-/// 或跨今昨一单两腿（两笔独立 OrderRequest，共享 cid）。
+/// 或跨今昨一单两腿（两笔独立 OrderRequest，共享 cid；`first` 必须先下发）。
 #[derive(Debug)]
 enum RoutedInsert<'a> {
     Single(std::borrow::Cow<'a, crate::ctp::core::order::OrderRequest>),
     Two {
-        /// 先平昨腿（省费优先）。
-        yesterday: crate::ctp::core::order::OrderRequest,
-        /// 再平今腿。
-        today: crate::ctp::core::order::OrderRequest,
+        /// 先下发的腿（先平今或先平昨，由配置决定）。
+        first: crate::ctp::core::order::OrderRequest,
+        /// 后下发的腿。
+        second: crate::ctp::core::order::OrderRequest,
     },
 }
 
-/// 下单请求的平仓路由（纯函数）：开仓原样返回；平仓按交易所+今昨分布把笼统
-/// Close 改写为显式 CloseToday/CloseYesterday（SHFE 单腿或跨今昨两腿），非上期所原样返回。
+/// 下单请求的平仓路由（纯函数）：开仓原样返回；平仓按交易所+今昨分布+优先级把
+/// 笼统 Close 改写为显式 CloseToday/CloseYesterday（SHFE 单腿或跨今昨两腿），
+/// 非上期所原样返回。两腿顺序即实际 `ReqOrderInsert` 调用顺序（唯一事实来源）。
 ///
 /// `exchange` 为该合约的交易所目录查询值，`split` 为**被平持仓方向**的 (今,昨)
 /// （reduce_only：SELL 平多、BUY 平空，由调用方换算后传入）。
@@ -547,13 +549,14 @@ fn routed_insert<'a>(
     req: &'a crate::ctp::core::order::OrderRequest,
     exchange: Option<&str>,
     split: Option<(i32, i32)>,
+    priority: crate::ctp::prep::ShfeClosePriority,
 ) -> Result<RoutedInsert<'a>, ClosePlanError> {
     use crate::ctp::core::types::Offset;
     use std::borrow::Cow;
     if req.offset != Offset::Close {
         return Ok(RoutedInsert::Single(Cow::Borrowed(req)));
     }
-    match plan_close(req.volume, exchange, split) {
+    match plan_close(req.volume, exchange, split, priority) {
         Ok(ClosePlan::GenericClose) => Ok(RoutedInsert::Single(Cow::Borrowed(req))),
         // 单腿必为全量（close_offsets 单腿时 n==volume），仅改写开平标志。
         Ok(ClosePlan::ShfeSingle(offset, n)) => {
@@ -562,20 +565,17 @@ fn routed_insert<'a>(
             routed.offset = offset;
             Ok(RoutedInsert::Single(Cow::Owned(routed)))
         }
-        // 跨今昨两腿：同价/同方向，仅开平标志与手数不同；昨腿在前（先平昨省费）。
-        Ok(ClosePlan::ShfeTwo {
-            yesterday_n,
-            today_n,
-        }) => {
-            let make_leg = |offset: Offset, volume: i32| {
+        // 跨今昨两腿：同价/同方向，仅开平标志与手数不同；顺序沿用 prep 产出。
+        Ok(ClosePlan::ShfeTwo { first, second }) => {
+            let make_leg = |(offset, volume): (Offset, i32)| {
                 let mut leg = req.clone();
                 leg.offset = offset;
                 leg.volume = volume;
                 leg
             };
             Ok(RoutedInsert::Two {
-                yesterday: make_leg(Offset::CloseYesterday, yesterday_n),
-                today: make_leg(Offset::CloseToday, today_n),
+                first: make_leg(first),
+                second: make_leg(second),
             })
         }
         Err(e) => Err(e),
@@ -628,7 +628,7 @@ fn submit_insert(
     };
     let exchange = ctx.instrument_dir.exchange(&req.instrument);
     let split = ctx.position_dir.get(&req.instrument, holding);
-    let routed = match routed_insert(req, exchange.as_deref(), split) {
+    let routed = match routed_insert(req, exchange.as_deref(), split, ctx.shfe_close_priority) {
         Ok(r) => r,
         Err(e) => {
             // 路由失败：整单未发出，首腿（投递前已分配）的映射是脏数据。
@@ -642,13 +642,14 @@ fn submit_insert(
                 tracing::info!(
                     account = %ctx.account, instrument = %req.instrument,
                     offset = ?effective.offset, volume = effective.volume,
+                    priority = ctx.shfe_close_priority.as_str(),
                     "CTP SHFE 平仓路由：Close → 显式开平标志"
                 );
             }
             insert_one_leg(h, ctx, &effective, order_ref, "单腿").map(|()| 0)
         }
-        RoutedInsert::Two { yesterday, today } => {
-            submit_two_legs(h, ctx, req, order_ref, yesterday, today)
+        RoutedInsert::Two { first, second } => {
+            submit_two_legs(h, ctx, req, order_ref, first, second)
         }
     }
 }
@@ -680,14 +681,15 @@ fn insert_one_leg(
     }
 }
 
-/// 跨今昨两腿提交：同 cid、两个不同 OrderRef，**先平昨、再平今**（省平今高手续费）。
+/// 跨今昨两腿提交：同 cid、两个不同 OrderRef，**严格按 `first` → `second` 顺序下发**。
+/// 谁是平今、谁是平昨由 [`crate::ctp::prep::ShfeClosePriority`] 决定，本函数不再硬编码顺序。
 fn submit_two_legs(
     h: &mut TraderHandle,
     ctx: &EventContext,
     req: &crate::ctp::core::order::OrderRequest,
     first_ref: &str,
-    yesterday: crate::ctp::core::order::OrderRequest,
-    today: crate::ctp::core::order::OrderRequest,
+    first: crate::ctp::core::order::OrderRequest,
+    second: crate::ctp::core::order::OrderRequest,
 ) -> anyhow::Result<i32> {
     // 第二腿需要本会话第二个唯一 OrderRef；只有长 cid（在 registry 有映射）能分配。
     // 短 cid（≤13B 透传）allocate 会原样返回同一串，无法支撑两腿，fail-closed。
@@ -702,21 +704,23 @@ fn submit_two_legs(
     let second_ref = ctx.order_refs.allocate(&cid);
     tracing::info!(
         account = %ctx.account, instrument = %req.instrument, cid = %cid,
-        yesterday_n = yesterday.volume, today_n = today.volume,
-        yesterday_ref = first_ref, today_ref = second_ref,
-        "CTP SHFE 平仓路由：Close → 一单两腿（先平昨 + 再平今）"
+        priority = ctx.shfe_close_priority.as_str(),
+        first_offset = ?first.offset, first_volume = first.volume,
+        second_offset = ?second.offset, second_volume = second.volume,
+        first_ref, second_ref,
+        "CTP SHFE 平仓路由：Close → 一单两腿（按配置顺序下发）"
     );
-    // 第一腿（平昨）失败：第二腿未发，两个 ref 都是脏数据。
-    if let Err(e) = insert_one_leg(h, ctx, &yesterday, first_ref, "平昨腿") {
+    // 第一腿失败：第二腿未发，两个 ref 都是脏数据。
+    if let Err(e) = insert_one_leg(h, ctx, &first, first_ref, "第一腿") {
         ctx.order_refs.remove(&second_ref);
         return Err(e);
     }
-    // 昨腿已受理：今腿失败只清第二腿映射，昨腿保留（靠回报/对账收敛，不静默）。
+    // 第一腿已受理：第二腿失败只清第二腿映射，第一腿保留（靠回报/对账收敛，不静默）。
     // 因已有一腿送达柜台，整体应答不确定（不能当未受理拒绝），落 UNKNOWN 待收敛。
-    if let Err(e) = insert_one_leg(h, ctx, &today, &second_ref, "平今腿") {
+    if let Err(e) = insert_one_leg(h, ctx, &second, &second_ref, "第二腿") {
         return Err(crate::ctp::place_error::CtpPlaceError::indeterminate(
             format!(
-            "CTP 一单两腿：平昨腿已受理、平今腿失败（{e}）；整体判失败，已受理腿靠成交回报/对账收敛"
+            "CTP 一单两腿：第一腿已受理、第二腿失败（{e}）；整体判失败，已受理腿靠成交回报/对账收敛"
         ),
         ));
     }
@@ -869,6 +873,9 @@ pub(crate) struct EventContext {
     pub leg_table: Arc<crate::ctp::leg_table::LegTable>,
     /// 全成委托快照先于成交回报到达时的「待终态对齐」cid 集合（仅会话线程用）。
     pub pending_terminal: Arc<crate::ctp::pending_terminal::PendingTerminalTable>,
+    /// SHFE 平仓腿先后顺序（venue.toml `[ctp].shfe_close_priority`，进程配置）。
+    /// 两腿的实际下发顺序完全由此决定（顺序即语义）。
+    pub shfe_close_priority: crate::ctp::prep::ShfeClosePriority,
     /// 事件桥发送端；随会话线程结束（EventContext drop）而关闭，消费任务随之退出。
     pub tx: tokio::sync::mpsc::Sender<BridgeEvent>,
     /// 线程内去抖器（复用跨所通用纯决策内核）。
@@ -2419,75 +2426,108 @@ mod tests {
     // ---- SHFE 平仓平今/平昨路由纯内核 ----
 
     use crate::ctp::core::types::Offset;
+    use crate::ctp::prep::ShfeClosePriority;
+
+    const TODAY_FIRST: ShfeClosePriority = ShfeClosePriority::TodayFirst;
+    const YESTERDAY_FIRST: ShfeClosePriority = ShfeClosePriority::YesterdayFirst;
 
     #[test]
     fn close_route_non_shfe_is_single_generic_close() {
-        // 大商所/郑商所等：柜台自动冲抵今昨，笼统 Close 行为零变化。
-        assert_eq!(
-            plan_close(3, Some("DCE"), Some((2, 3))).unwrap(),
-            ClosePlan::GenericClose
-        );
-        // 交易所目录尚未预热到该合约（None）：同样按笼统 Close（≠SHFE 分支），
-        // SHFE 单会被柜台拒，不会发错显式标志。
-        assert_eq!(plan_close(3, None, None).unwrap(), ClosePlan::GenericClose);
+        // 大商所/郑商所等：柜台自动冲抵今昨，笼统 Close 行为零变化（优先级不参与）。
+        for p in [TODAY_FIRST, YESTERDAY_FIRST] {
+            assert_eq!(
+                plan_close(3, Some("DCE"), Some((2, 3)), p).unwrap(),
+                ClosePlan::GenericClose
+            );
+            // 交易所目录尚未预热到该合约（None）：同样按笼统 Close（≠SHFE 分支），
+            // SHFE 单会被柜台拒，不会发错显式标志。
+            assert_eq!(
+                plan_close(3, None, None, p).unwrap(),
+                ClosePlan::GenericClose
+            );
+        }
     }
 
     #[test]
-    fn close_route_shfe_yesterday_sufficient_is_single_close_yesterday() {
-        // 今 5 昨 3，平 3 ≤ 昨仓 → 单笔平昨，完全不碰今仓（省平今手续费）。
+    fn close_route_shfe_yesterday_first_within_yesterday_is_single_close_yesterday() {
+        // 先平昨：今 5 昨 3，平 3 ≤ 昨仓 → 单笔平昨，完全不碰今仓。
         assert_eq!(
-            plan_close(3, Some("SHFE"), Some((5, 3))).unwrap(),
-            ClosePlan::ShfeSingle(Offset::CloseYesterday, 3)
-        );
-        // 恰好平完全部昨仓仍是单腿平昨。
-        assert_eq!(
-            plan_close(3, Some("SHFE"), Some((5, 3))).unwrap(),
+            plan_close(3, Some("SHFE"), Some((5, 3)), YESTERDAY_FIRST).unwrap(),
             ClosePlan::ShfeSingle(Offset::CloseYesterday, 3)
         );
     }
 
     #[test]
-    fn close_route_shfe_no_yesterday_is_single_close_today() {
+    fn close_route_shfe_yesterday_first_no_yesterday_is_single_close_today() {
         // 昨 0 今 2，平 2 → 退化为单笔平今。
         assert_eq!(
-            plan_close(2, Some("SHFE"), Some((2, 0))).unwrap(),
+            plan_close(2, Some("SHFE"), Some((2, 0)), YESTERDAY_FIRST).unwrap(),
             ClosePlan::ShfeSingle(Offset::CloseToday, 2)
         );
     }
 
     #[test]
-    fn close_route_shfe_cross_split_is_two_legs_yesterday_first() {
+    fn close_route_shfe_yesterday_first_cross_split_is_two_legs_yesterday_then_today() {
         // 今 2 昨 3，平 4 → 一单两腿：先平昨 3、再平今 1。
         assert_eq!(
-            plan_close(4, Some("SHFE"), Some((2, 3))).unwrap(),
+            plan_close(4, Some("SHFE"), Some((2, 3)), YESTERDAY_FIRST).unwrap(),
             ClosePlan::ShfeTwo {
-                yesterday_n: 3,
-                today_n: 1
+                first: (Offset::CloseYesterday, 3),
+                second: (Offset::CloseToday, 1),
             }
         );
-        // 平量 ≤ 昨仓时绝不出两腿（今 2 昨 3 平 3 只平昨）。
+    }
+
+    #[test]
+    fn close_route_shfe_today_first_within_today_is_single_close_today() {
+        // 默认先平今：今 5 昨 3，平 3 ≤ 今仓 → 单笔平今，完全不碰昨仓。
         assert_eq!(
-            plan_close(3, Some("SHFE"), Some((2, 3))).unwrap(),
-            ClosePlan::ShfeSingle(Offset::CloseYesterday, 3)
+            plan_close(3, Some("SHFE"), Some((5, 3)), TODAY_FIRST).unwrap(),
+            ClosePlan::ShfeSingle(Offset::CloseToday, 3)
+        );
+    }
+
+    #[test]
+    fn close_route_shfe_today_first_no_today_is_single_close_yesterday() {
+        // 今 0 昨 2，平 2 → 退化为单笔平昨。
+        assert_eq!(
+            plan_close(2, Some("SHFE"), Some((0, 2)), TODAY_FIRST).unwrap(),
+            ClosePlan::ShfeSingle(Offset::CloseYesterday, 2)
+        );
+    }
+
+    #[test]
+    fn close_route_shfe_today_first_cross_split_is_two_legs_today_then_yesterday() {
+        // 今 2 昨 3，平 4 → 一单两腿：先平今 2、再平昨 2（顺序即实际下发顺序）。
+        assert_eq!(
+            plan_close(4, Some("SHFE"), Some((2, 3)), TODAY_FIRST).unwrap(),
+            ClosePlan::ShfeTwo {
+                first: (Offset::CloseToday, 2),
+                second: (Offset::CloseYesterday, 2),
+            }
         );
     }
 
     #[test]
     fn close_route_shfe_over_volume_is_rejected() {
-        // 平仓量超过今+昨总仓：拒单（不下半截单）。
-        assert_eq!(
-            plan_close(6, Some("SHFE"), Some((2, 3))),
-            Err(ClosePlanError::InsufficientPosition)
-        );
+        // 平仓量超过今+昨总仓：拒单（不下半截单，与优先级无关）。
+        for p in [TODAY_FIRST, YESTERDAY_FIRST] {
+            assert_eq!(
+                plan_close(6, Some("SHFE"), Some((2, 3)), p),
+                Err(ClosePlanError::InsufficientPosition)
+            );
+        }
     }
 
     #[test]
     fn close_route_shfe_split_not_ready_is_rejected() {
         // SHFE 但路由表无该方向今昨（刚重连/首轮对账未完成）：明确错误，绝不猜测发 Close。
-        assert_eq!(
-            plan_close(1, Some("SHFE"), None),
-            Err(ClosePlanError::SplitNotReady)
-        );
+        for p in [TODAY_FIRST, YESTERDAY_FIRST] {
+            assert_eq!(
+                plan_close(1, Some("SHFE"), None, p),
+                Err(ClosePlanError::SplitNotReady)
+            );
+        }
     }
 
     // ---- 下单请求平仓路由（routed_insert 纯函数）----
@@ -2511,7 +2551,7 @@ mod tests {
     #[test]
     fn routed_insert_non_shfe_close_passes_through_unchanged() {
         let req = close_req(Direction::Sell, 3);
-        let out = routed_insert(&req, Some("DCE"), Some((2, 3))).unwrap();
+        let out = routed_insert(&req, Some("DCE"), Some((2, 3)), TODAY_FIRST).unwrap();
         let r = single_routed(&out);
         assert_eq!(r.offset, Offset::Close, "非上期所保持笼统 Close");
         assert_eq!(r.volume, 3);
@@ -2522,10 +2562,10 @@ mod tests {
     }
 
     #[test]
-    fn routed_insert_shfe_close_within_yesterday_rewrites_to_close_yesterday() {
-        // 卖平多头、平量 ≤ 昨仓：Close → CloseYesterday（不碰今仓），量/价/方向不变。
+    fn routed_insert_shfe_yesterday_first_within_yesterday_rewrites_to_close_yesterday() {
+        // 先平昨、卖平多头、平量 ≤ 昨仓：Close → CloseYesterday，量/价/方向不变。
         let req = close_req(Direction::Sell, 3);
-        let out = routed_insert(&req, Some("SHFE"), Some((5, 3))).unwrap();
+        let out = routed_insert(&req, Some("SHFE"), Some((5, 3)), YESTERDAY_FIRST).unwrap();
         let r = single_routed(&out);
         assert_eq!(r.offset, Offset::CloseYesterday);
         assert_eq!(r.volume, 3);
@@ -2536,10 +2576,21 @@ mod tests {
     }
 
     #[test]
-    fn routed_insert_shfe_close_today_when_no_yesterday() {
+    fn routed_insert_shfe_today_first_within_today_rewrites_to_close_today() {
+        // 默认先平今、平量 ≤ 今仓：Close → CloseToday，完全不碰昨仓。
+        let req = close_req(Direction::Buy, 2);
+        let out = routed_insert(&req, Some("SHFE"), Some((4, 1)), TODAY_FIRST).unwrap();
+        let r = single_routed(&out);
+        assert_eq!(r.offset, Offset::CloseToday);
+        assert_eq!(r.volume, 2);
+        assert_eq!(req.offset, Offset::Close, "原请求未被修改");
+    }
+
+    #[test]
+    fn routed_insert_shfe_yesterday_first_close_today_when_no_yesterday() {
         // 昨仓为 0：退化为单笔平今。
         let req = close_req(Direction::Buy, 2);
-        let out = routed_insert(&req, Some("SHFE"), Some((4, 0))).unwrap();
+        let out = routed_insert(&req, Some("SHFE"), Some((4, 0)), YESTERDAY_FIRST).unwrap();
         let r = single_routed(&out);
         assert_eq!(r.offset, Offset::CloseToday);
         assert_eq!(r.volume, 2);
@@ -2547,28 +2598,47 @@ mod tests {
 
     #[test]
     fn routed_insert_open_is_untouched_even_on_shfe() {
-        // 开仓不读交易所/路由表，原样借用提交。
+        // 开仓不读交易所/路由表/优先级，原样借用提交。
         let req = OrderRequest::limit("rb2510", Direction::Buy, Offset::Open, 3300.0, 2);
-        let out = routed_insert(&req, Some("SHFE"), None).unwrap();
+        let out = routed_insert(&req, Some("SHFE"), None, YESTERDAY_FIRST).unwrap();
         let r = single_routed(&out);
         assert_eq!(r.offset, Offset::Open);
         assert_eq!(r.volume, 2);
     }
 
     #[test]
-    fn routed_insert_shfe_cross_split_produces_two_legs_yesterday_first() {
-        // 今 2 昨 3 平 4 → 两腿：先平昨 3、再平今 1，同价同方向，昨腿在前。
+    fn routed_insert_shfe_yesterday_first_two_legs_yesterday_then_today() {
+        // 先平昨：今 2 昨 3 平 4 → 先平昨 3、再平今 1，同价同方向。
         let req = close_req(Direction::Sell, 4);
-        let out = routed_insert(&req, Some("SHFE"), Some((2, 3))).unwrap();
+        let out = routed_insert(&req, Some("SHFE"), Some((2, 3)), YESTERDAY_FIRST).unwrap();
         match out {
-            RoutedInsert::Two { yesterday, today } => {
-                assert_eq!(yesterday.offset, Offset::CloseYesterday);
-                assert_eq!(yesterday.volume, 3);
-                assert_eq!(today.offset, Offset::CloseToday);
-                assert_eq!(today.volume, 1);
-                assert_eq!(yesterday.direction, Direction::Sell);
-                assert_eq!(yesterday.price, 3300.0);
-                assert_eq!(today.price, 3300.0);
+            RoutedInsert::Two { first, second } => {
+                assert_eq!(first.offset, Offset::CloseYesterday);
+                assert_eq!(first.volume, 3);
+                assert_eq!(second.offset, Offset::CloseToday);
+                assert_eq!(second.volume, 1);
+                assert_eq!(first.direction, Direction::Sell);
+                assert_eq!(first.price, 3300.0);
+                assert_eq!(second.price, 3300.0);
+            }
+            _ => panic!("期望跨今昨两腿"),
+        }
+    }
+
+    #[test]
+    fn routed_insert_shfe_today_first_two_legs_today_then_yesterday() {
+        // 默认先平今：今 2 昨 3 平 4 → 先平今 2、再平昨 2（顺序即下发顺序）。
+        let req = close_req(Direction::Sell, 4);
+        let out = routed_insert(&req, Some("SHFE"), Some((2, 3)), TODAY_FIRST).unwrap();
+        match out {
+            RoutedInsert::Two { first, second } => {
+                assert_eq!(first.offset, Offset::CloseToday);
+                assert_eq!(first.volume, 2);
+                assert_eq!(second.offset, Offset::CloseYesterday);
+                assert_eq!(second.volume, 2);
+                assert_eq!(first.direction, Direction::Sell);
+                assert_eq!(first.price, 3300.0);
+                assert_eq!(second.price, 3300.0);
             }
             _ => panic!("期望跨今昨两腿"),
         }
@@ -2577,15 +2647,17 @@ mod tests {
     #[test]
     fn routed_insert_shfe_propagates_fail_closed_errors() {
         let req = close_req(Direction::Sell, 3);
-        // 未就绪 / 超量都原样冒泡，调用方据此回执明确错误。
-        assert_eq!(
-            routed_insert(&req, Some("SHFE"), None).unwrap_err(),
-            ClosePlanError::SplitNotReady
-        );
-        assert_eq!(
-            routed_insert(&req, Some("SHFE"), Some((1, 1))).unwrap_err(),
-            ClosePlanError::InsufficientPosition
-        );
+        // 未就绪 / 超量都原样冒泡，调用方据此回执明确错误（与优先级无关）。
+        for p in [TODAY_FIRST, YESTERDAY_FIRST] {
+            assert_eq!(
+                routed_insert(&req, Some("SHFE"), None, p).unwrap_err(),
+                ClosePlanError::SplitNotReady
+            );
+            assert_eq!(
+                routed_insert(&req, Some("SHFE"), Some((1, 1)), p).unwrap_err(),
+                ClosePlanError::InsufficientPosition
+            );
+        }
     }
 
     // ---- ActiveQuery 单在途闸门：前台/后台分流、QueryEnd 收尾、断线回执 ----
@@ -2604,6 +2676,7 @@ mod tests {
             position_dir: Arc::new(crate::ctp::position_dir::PositionDir::new()),
             leg_table: Arc::new(crate::ctp::leg_table::LegTable::new()),
             pending_terminal: Arc::new(crate::ctp::pending_terminal::PendingTerminalTable::new()),
+            shfe_close_priority: ShfeClosePriority::default(),
             tx,
             debouncer: Arc::new(Mutex::new(crate::reconcile::ReconcileDebouncer::new(
                 500, 60_000,

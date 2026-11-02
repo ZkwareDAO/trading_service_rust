@@ -38,3 +38,4 @@ pub mod spec_fetch;
 pub mod venue;
 
 pub use config::{from_values, CtpConfig, DEFAULT_SHFE_MARKET_DRIFT_TICKS};
+pub use prep::ShfeClosePriority;

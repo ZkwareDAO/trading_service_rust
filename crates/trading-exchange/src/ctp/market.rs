@@ -435,7 +435,7 @@ fn run_md_session(
                         }
                     }
                 }
-                // K线集 → 写 TickTable/LastVolumeTable + 聚合（与业务路径正交，可同走）。
+                // K线集 → 写 TickTable/LastTickStatTable + 聚合（与业务路径正交，可同走）。
                 if in_kline {
                     if let Some(k) = kline {
                         let day = t.trading_day_u32();

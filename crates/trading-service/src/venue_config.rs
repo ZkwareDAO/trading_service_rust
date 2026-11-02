@@ -107,6 +107,23 @@ impl KlineBackfillConfig {
     }
 }
 
+/// 解析 `[ctp]` 下的枚举型配置：缺省/空串返回 `None`（由 CtpConfig 给默认），
+/// 未知值启动期 fail-fast（错误信息点名配置项并列出合法取值）。
+#[cfg(feature = "ctp")]
+fn parse_enum_setting<T>(
+    raw: &Option<String>,
+    key: &str,
+    allowed: &str,
+    parse: fn(&str) -> Option<T>,
+) -> anyhow::Result<Option<T>> {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(v) => parse(v)
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("[ctp] {key} 非法：`{v}`（合法值 {allowed}）")),
+    }
+}
+
 /// 解析可选时长字段：缺省取 `default`；裸 `"0"` 在 `allow_zero` 时映射为 ZERO；
 /// 其余交给 [`trading_core::timeutil::parse_duration`]（要求带单位且 >0）。
 fn parse_optional_duration(
@@ -256,6 +273,12 @@ struct CtpSection {
     md_pass_is_authcode: Option<bool>,
     /// SHFE 市价开仓穿价漂移档数（缺省用 trading-exchange 内置默认 1）。
     shfe_market_drift_ticks: Option<i64>,
+    /// SHFE 平仓腿顺序：`today_first`（默认）/ `yesterday_first`；未知值启动报错。
+    shfe_close_priority: Option<String>,
+    /// 主力选举指标：`volume` / `open_interest`（默认）；未知值启动报错。
+    main_contract_criteria: Option<String>,
+    /// 主力切换确认天数（默认 3；<1 启动报错）。
+    main_contract_confirm_days: Option<u32>,
     /// 冷启动预设主力 `品种:合约` 列表（如 ["cu:cu2512"]）；缺省不预设。
     preset_dominants: Option<Vec<String>>,
     /// 配置基线 K线品种（如 ["cu","rb"]），默认就采集；缺省仅按客户端动态订阅。
@@ -277,6 +300,30 @@ pub fn load(path: &Path) -> anyhow::Result<LoadedVenueConfigs> {
     // 回补配置非法（坏时长/越界）在启动期 fail-fast。
     let backfill = KlineBackfillConfig::from_section(&parsed.kline.backfill)
         .map_err(|e| anyhow::anyhow!("解析 venue 配置 {path:?}: {e}"))?;
+    #[cfg(feature = "ctp")]
+    let shfe_close_priority = parse_enum_setting(
+        &parsed.ctp.shfe_close_priority,
+        "shfe_close_priority",
+        "today_first / yesterday_first",
+        trading_exchange::ctp::prep::ShfeClosePriority::parse,
+    )
+    .map_err(|e| anyhow::anyhow!("解析 venue 配置 {path:?}: {e}"))?;
+    #[cfg(feature = "ctp")]
+    let main_contract_criteria = parse_enum_setting(
+        &parsed.ctp.main_contract_criteria,
+        "main_contract_criteria",
+        "volume / open_interest",
+        trading_exchange::ctp::dominant::DominantMetric::parse,
+    )
+    .map_err(|e| anyhow::anyhow!("解析 venue 配置 {path:?}: {e}"))?;
+    #[cfg(feature = "ctp")]
+    if let Some(n) = parsed.ctp.main_contract_confirm_days {
+        if n < 1 {
+            anyhow::bail!(
+                "解析 venue 配置 {path:?}: [ctp] main_contract_confirm_days 必须 ≥1，实际 {n}"
+            );
+        }
+    }
     Ok(LoadedVenueConfigs {
         deribit: PrepConfig {
             drift_ticks: parsed.deribit.open_drift_ticks,
@@ -299,6 +346,9 @@ pub fn load(path: &Path) -> anyhow::Result<LoadedVenueConfigs> {
             parsed.ctp.md_anon,
             parsed.ctp.md_pass_is_authcode,
             parsed.ctp.shfe_market_drift_ticks,
+            shfe_close_priority,
+            main_contract_criteria,
+            parsed.ctp.main_contract_confirm_days,
             parsed.ctp.preset_dominants,
             parsed.ctp.kline_products,
             parsed
@@ -325,7 +375,7 @@ pub fn default_configs() -> LoadedVenueConfigs {
         },
         #[cfg(feature = "ctp")]
         ctp: trading_exchange::ctp::from_values(
-            None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None, None, None,
         ),
     }
 }
@@ -397,6 +447,92 @@ mod tests {
             cfg.ctp.shfe_market_drift_ticks,
             trading_exchange::ctp::DEFAULT_SHFE_MARKET_DRIFT_TICKS
         );
+    }
+
+    #[cfg(feature = "ctp")]
+    #[test]
+    fn parses_ctp_shfe_close_priority_and_defaults_today_first() {
+        use trading_exchange::ctp::ShfeClosePriority;
+        let dir = tempfile::tempdir().unwrap();
+        // 缺省：先平今。
+        let path = dir.path().join("a.toml");
+        std::fs::write(&path, "[ctp]\n").unwrap();
+        assert_eq!(
+            load(&path).unwrap().ctp.shfe_close_priority,
+            ShfeClosePriority::TodayFirst
+        );
+        // 显式覆盖为先平昨（含大小写/空白容错）。
+        let path = dir.path().join("b.toml");
+        std::fs::write(
+            &path,
+            "[ctp]\nshfe_close_priority = \" Yesterday_First \"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load(&path).unwrap().ctp.shfe_close_priority,
+            ShfeClosePriority::YesterdayFirst
+        );
+        // 空串同样取默认。
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, "[ctp]\nshfe_close_priority = \"\"\n").unwrap();
+        assert_eq!(
+            load(&path).unwrap().ctp.shfe_close_priority,
+            ShfeClosePriority::TodayFirst
+        );
+    }
+
+    #[cfg(feature = "ctp")]
+    #[test]
+    fn invalid_ctp_shfe_close_priority_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "[ctp]\nshfe_close_priority = \"both\"\n").unwrap();
+        let err = load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("shfe_close_priority"),
+            "错误信息需点名配置项: {err}"
+        );
+        assert!(err.contains("today_first"), "错误信息需写明合法取值: {err}");
+    }
+
+    #[cfg(feature = "ctp")]
+    #[test]
+    fn parses_ctp_main_contract_selection_and_defaults() {
+        use trading_exchange::ctp::dominant::DominantMetric;
+        let dir = tempfile::tempdir().unwrap();
+        // 缺省：持仓量 + 3 日确认。
+        let path = dir.path().join("a.toml");
+        std::fs::write(&path, "[ctp]\n").unwrap();
+        let cfg = load(&path).unwrap();
+        assert_eq!(cfg.ctp.main_contract_criteria, DominantMetric::OpenInterest);
+        assert_eq!(cfg.ctp.main_contract_confirm_days, 3);
+        // 显式覆盖：成交量 + 1 日确认。
+        let path = dir.path().join("b.toml");
+        std::fs::write(
+            &path,
+            "[ctp]\nmain_contract_criteria = \" Volume \"\nmain_contract_confirm_days = 1\n",
+        )
+        .unwrap();
+        let cfg = load(&path).unwrap();
+        assert_eq!(cfg.ctp.main_contract_criteria, DominantMetric::Volume);
+        assert_eq!(cfg.ctp.main_contract_confirm_days, 1);
+    }
+
+    #[cfg(feature = "ctp")]
+    #[test]
+    fn invalid_ctp_main_contract_selection_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        // 未知指标。
+        let p = dir.path().join("a.toml");
+        std::fs::write(&p, "[ctp]\nmain_contract_criteria = \"oi\"\n").unwrap();
+        let err = load(&p).unwrap_err().to_string();
+        assert!(err.contains("main_contract_criteria"), "{err}");
+        assert!(err.contains("open_interest"), "{err}");
+        // 确认天数 <1。
+        let p = dir.path().join("b.toml");
+        std::fs::write(&p, "[ctp]\nmain_contract_confirm_days = 0\n").unwrap();
+        let err = load(&p).unwrap_err().to_string();
+        assert!(err.contains("main_contract_confirm_days"), "{err}");
     }
 
     #[test]

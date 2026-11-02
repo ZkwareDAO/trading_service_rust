@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use store_core::{Model, PersistHandle, PersistOptions, Store, StoreError, Table};
 use trading_core::kline::{
-    BarTable, DominantTable, GapRegistry, KlineRegistry, LastVolumeTable, TickTable,
+    BarTable, DominantTable, GapRegistry, KlineRegistry, LastTickStatTable, TickTable,
 };
 use trading_core::order_rule::OrderRuleTable;
 use trading_core::quote::QuoteTable;
@@ -210,11 +210,11 @@ impl TradingStore {
         self.memory.get_or_init(MemoryTables::new).ctp_ticks.clone()
     }
 
-    /// CTP K线：合约 → 当日最后累计成交量（主力选举原料）。
-    pub fn ctp_last_volumes(&self) -> Arc<LastVolumeTable> {
+    /// CTP K线：合约 → 当日最后 tick 统计（主力选举原料）。
+    pub fn ctp_last_stats(&self) -> Arc<LastTickStatTable> {
         self.memory
             .get_or_init(MemoryTables::new)
-            .ctp_last_volumes
+            .ctp_last_stats
             .clone()
     }
 

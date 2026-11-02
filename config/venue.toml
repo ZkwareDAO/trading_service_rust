@@ -49,7 +49,7 @@ concurrency = 2
 # 行情前置（交易/行情端口分离；空则不启动 CTP 行情线程）。
 md_front = "tcp://101.226.250.133:42213"
 # 行情登录用账户名（account.csv 中的 name；交易所级行情不随用户区分）。
-md_account = "ctp-simnow"
+md_account = "ctp_test"
 # 行情登录形态：匿名（标准 CTP 行情前置形态，BrokerID/UserID/Password 全空）。
 md_anon = false
 # 行情密码填认证码（部分柜台行情鉴权形态；与 md_anon 二选一）。
@@ -58,10 +58,20 @@ md_pass_is_authcode = false
 # （买开=ask+n、卖开=bid−n；平仓不漂移，取 best bid/ask）。缺省/注释=用内置默认 1，0=纯对手价。
 # 规则引擎与手动 API 共用；仅作用于 SHFE（非 SHFE 市价维持原生 AnyPrice+IOC）。
 shfe_market_drift_ticks = 1
+# SHFE 平仓腿顺序：today_first=先平今（默认）/ yesterday_first=先平昨（旧行为，省平今费）。
+# 两腿的 ReqOrderInsert 实际下发顺序即由此决定；未知值启动期报错。
+shfe_close_priority = "today_first"
+# 主力选举指标：volume=当日累计成交量 / open_interest=当日持仓量（默认）。
+main_contract_criteria = "open_interest"
+# 主力切换确认天数：同一候选连续 N 个有数据交易日胜出才切换（默认 3；1=当天生效）。
+main_contract_confirm_days = 3
 # 冷启动预设主力（品种:合约），用于盘中重启/未到 15:00 收盘选举窗口时，
-# 品种订阅（cu）立即只推该合约；当日收盘选举对该品种跳过，次日由真实成交量接管。
-# E2E 验证用：cu 当前最近月合约。
-preset_dominants = ["cu:cu2611"]
+# 品种订阅（cu）立即只推该合约；当日收盘选举对该品种跳过。
+# 预设仅为「暂定」：下一交易日首轮真实选举（main_contract_criteria）无条件覆盖，
+# 避免错误/过期预设被单向月份守卫永久锁死。
+# 2026-11-02 盘中按实时累计成交量核对（收盘选举会按当日真实指标覆盖）。
+preset_dominants = ["cu:cu2612", "rb:rb2701", "i:i2701", "au:au2612", "ag:ag2612", "ru:ru2701"]
 # 配置基线 K线品种：服务启动即默认采集这些品种（展开为全部在交易合约），
 # 与南向客户端运行时订阅取并集；客户端退订不会移除这里配置的品种。
-kline_products = ["cu"]
+# 沪铜/螺纹钢/铁矿石/黄金/白银/橡胶。
+kline_products = ["cu", "rb", "i", "au", "ag", "ru"]

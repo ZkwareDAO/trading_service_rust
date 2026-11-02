@@ -196,7 +196,7 @@ impl AppState {
             #[cfg(feature = "ctp")]
             ctp_ticks: store.ctp_ticks(),
             #[cfg(feature = "ctp")]
-            ctp_last_volumes: store.ctp_last_volumes(),
+            ctp_last_stats: store.ctp_last_stats(),
             #[cfg(feature = "ctp")]
             ctp_dominants: store.ctp_dominants(),
             // K线：无条件全量持久化 sink（定稿即落 CSV，绕过 symbol/主力路由）。

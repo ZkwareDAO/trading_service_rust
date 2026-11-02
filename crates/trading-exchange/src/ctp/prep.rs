@@ -102,18 +102,60 @@ pub fn prepare_shfe_market_limit(
     Ok(req)
 }
 
-/// 上期所路由结果：一次平仓请求需要的 (Offset, 手数) 序列。
+/// 上期所平仓腿的先后顺序（今/昨两腿谁先下发）。
 ///
-/// **先平昨、不足再平今**（上期所平今手续费远高于平昨，省费优先）：
-/// * 平仓量 ≤ 昨仓 → 仅一笔 `CloseYesterday`，完全不碰今仓；
-/// * 平仓量 > 昨仓 → 先平完全部昨仓（`CloseYesterday`），剩余平今仓（`CloseToday`）；
-/// * 昨仓为 0 → 全部 `CloseToday`；
-/// * 总量不足/非正手数 → 返回错误（拒单，不下部分仓位的半截单）。
+/// 上期所强制显式区分平今/平昨；顺序直接影响手续费与两笔报单的实际下发次序。
+/// 默认 `TodayFirst`（先平今、不足再平昨）；可配置回 `YesterdayFirst`（旧行为）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShfeClosePriority {
+    /// 先平今，不足再平昨（默认）。
+    #[default]
+    TodayFirst,
+    /// 先平昨，不足再平今（省平今高手续费，旧行为）。
+    YesterdayFirst,
+}
+
+impl ShfeClosePriority {
+    /// 解析配置字符串；未知值返回 `None`（由配置层 fail-fast）。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "today_first" => Some(Self::TodayFirst),
+            "yesterday_first" => Some(Self::YesterdayFirst),
+            _ => None,
+        }
+    }
+
+    /// 配置口径字符串（日志/文档/错误信息展示用）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TodayFirst => "today_first",
+            Self::YesterdayFirst => "yesterday_first",
+        }
+    }
+
+    /// 第一腿的开平标志与可用手数；第二腿为剩余部分的标志。
+    fn first_leg(self, split: TodayYdSplit) -> (Offset, i32, Offset) {
+        match self {
+            Self::TodayFirst => (Offset::CloseToday, split.today, Offset::CloseYesterday),
+            Self::YesterdayFirst => (Offset::CloseYesterday, split.yesterday, Offset::CloseToday),
+        }
+    }
+}
+
+/// 上期所路由结果：一次平仓请求需要的 (Offset, 手数) 有序序列。
+///
+/// 顺序由 [`ShfeClosePriority`] 决定：
+/// * `TodayFirst`（默认）——先平今、不足再平昨；
+/// * `YesterdayFirst`——先平昨、不足再平今（旧行为，省平今高手续费）；
+///
+/// 无论哪种顺序：平量 ≤ 第一腿可用仓 → 仅一笔；跨今昨 → 两笔；
+/// 总量不足/非正手数 → 返回错误（拒单，不下部分仓位的半截单）。
 ///
 /// 非上期所（`split=None`）恒为单笔 `Offset::Close`，由柜台路由今/昨。
 pub fn close_offsets(
     volume: i32,
     split: Option<TodayYdSplit>,
+    priority: ShfeClosePriority,
 ) -> Result<Vec<(Offset, i32)>, PlaceErrorKind> {
     use PlaceErrorKind::Rejected;
     let Some(split) = split else {
@@ -122,20 +164,21 @@ pub fn close_offsets(
     if volume <= 0 {
         return Err(Rejected);
     }
-    if volume > split.today + split.yesterday {
-        // 持仓不足以平：拒单。
+    if volume > split.today.saturating_add(split.yesterday) {
+        // 持仓不足以平：拒单（饱和加法避免极端计数下 debug 溢出 panic）。
         return Err(Rejected);
     }
+    let (first_offset, first_avail, second_offset) = priority.first_leg(split);
+    // 1) 第一腿：平量与第一腿可用仓取小（0 = 该腿无仓，跳过）。
+    let first = volume.min(first_avail);
     let mut out = Vec::with_capacity(2);
-    // 1) 先平昨（平量与昨仓取小）。
-    let yd = volume.min(split.yesterday);
-    if yd > 0 {
-        out.push((Offset::CloseYesterday, yd));
+    if first > 0 {
+        out.push((first_offset, first));
     }
-    // 2) 超出昨仓的部分才平今（昨仓已在上方 min 钳制，rest≥0）。
-    let rest = volume - yd;
+    // 2) 剩余部分走第二腿（第一腿已 min 钳制，rest≥0）。
+    let rest = volume - first;
     if rest > 0 {
-        out.push((Offset::CloseToday, rest));
+        out.push((second_offset, rest));
     }
     Ok(out)
 }
@@ -386,31 +429,58 @@ mod tests {
 
     #[test]
     fn close_without_split_is_single_close() {
-        assert_eq!(close_offsets(3, None).unwrap(), vec![(Offset::Close, 3)]);
+        assert_eq!(
+            close_offsets(3, None, ShfeClosePriority::TodayFirst).unwrap(),
+            vec![(Offset::Close, 3)]
+        );
     }
 
     #[test]
-    fn shfe_close_yesterday_first_then_today() {
+    fn shfe_close_priority_parses_config_values() {
+        // 合法口径（大小写/空白容错）。
+        assert_eq!(
+            ShfeClosePriority::parse("today_first"),
+            Some(ShfeClosePriority::TodayFirst)
+        );
+        assert_eq!(
+            ShfeClosePriority::parse(" Yesterday_First "),
+            Some(ShfeClosePriority::YesterdayFirst)
+        );
+        // 未知值交给配置层 fail-fast。
+        assert_eq!(ShfeClosePriority::parse("both"), None);
+        // 默认先平今。
+        assert_eq!(ShfeClosePriority::default(), ShfeClosePriority::TodayFirst);
+        assert_eq!(ShfeClosePriority::TodayFirst.as_str(), "today_first");
+        assert_eq!(
+            ShfeClosePriority::YesterdayFirst.as_str(),
+            "yesterday_first"
+        );
+    }
+
+    // ---- 先平昨（旧行为，yesterday_first）----
+
+    #[test]
+    fn shfe_yesterday_first_then_today() {
         // 平今手续费远高于平昨：先平昨 3，不足的 1 手才平今。
         let split = TodayYdSplit {
             today: 2,
             yesterday: 3,
         };
         assert_eq!(
-            close_offsets(4, Some(split)).unwrap(),
+            close_offsets(4, Some(split), ShfeClosePriority::YesterdayFirst).unwrap(),
             vec![(Offset::CloseYesterday, 3), (Offset::CloseToday, 1)]
         );
     }
 
     #[test]
-    fn shfe_close_within_yesterday_never_touches_today() {
+    fn shfe_yesterday_first_within_yesterday_never_touches_today() {
         // 平仓量 ≤ 昨仓：只发平昨，完全不碰今仓。
         let split = TodayYdSplit {
             today: 2,
             yesterday: 3,
         };
         assert_eq!(
-            close_offsets(2, Some(split)).unwrap(),
+            close_offsets(2, Some(split), ShfeClosePriority::YesterdayFirst).unwrap(),
             vec![(Offset::CloseYesterday, 2)]
         );
         // 昨仓足够时即使今仓更多，也只平昨。
@@ -419,33 +489,121 @@ mod tests {
             yesterday: 3,
         };
         assert_eq!(
-            close_offsets(3, Some(split)).unwrap(),
+            close_offsets(3, Some(split), ShfeClosePriority::YesterdayFirst).unwrap(),
             vec![(Offset::CloseYesterday, 3)]
         );
     }
 
     #[test]
-    fn shfe_close_today_only_when_no_yesterday() {
+    fn shfe_yesterday_first_today_only_when_no_yesterday() {
         // 昨仓为 0：退化为单笔平今。
         let split = TodayYdSplit {
             today: 2,
             yesterday: 0,
         };
         assert_eq!(
-            close_offsets(2, Some(split)).unwrap(),
+            close_offsets(2, Some(split), ShfeClosePriority::YesterdayFirst).unwrap(),
             vec![(Offset::CloseToday, 2)]
         );
     }
 
     #[test]
-    fn shfe_close_all_yesterday_when_no_today() {
+    fn shfe_yesterday_first_all_yesterday_when_no_today() {
         let split = TodayYdSplit {
             today: 0,
             yesterday: 3,
         };
         assert_eq!(
-            close_offsets(2, Some(split)).unwrap(),
+            close_offsets(2, Some(split), ShfeClosePriority::YesterdayFirst).unwrap(),
             vec![(Offset::CloseYesterday, 2)]
+        );
+    }
+
+    #[test]
+    fn shfe_yesterday_first_exact_split_is_single_leg() {
+        // 平量恰好等于昨仓：单腿平昨，绝不出两腿。
+        let split = TodayYdSplit {
+            today: 5,
+            yesterday: 3,
+        };
+        assert_eq!(
+            close_offsets(3, Some(split), ShfeClosePriority::YesterdayFirst).unwrap(),
+            vec![(Offset::CloseYesterday, 3)]
+        );
+    }
+
+    // ---- 先平今（默认，today_first）----
+
+    #[test]
+    fn shfe_today_first_then_yesterday() {
+        // 今 2 昨 3 平 4：先平今 2，剩余 2 手平昨。
+        let split = TodayYdSplit {
+            today: 2,
+            yesterday: 3,
+        };
+        assert_eq!(
+            close_offsets(4, Some(split), ShfeClosePriority::TodayFirst).unwrap(),
+            vec![(Offset::CloseToday, 2), (Offset::CloseYesterday, 2)]
+        );
+    }
+
+    #[test]
+    fn shfe_today_first_within_today_never_touches_yesterday() {
+        // 平量 ≤ 今仓：只发平今，完全不碰昨仓。
+        let split = TodayYdSplit {
+            today: 3,
+            yesterday: 2,
+        };
+        assert_eq!(
+            close_offsets(2, Some(split), ShfeClosePriority::TodayFirst).unwrap(),
+            vec![(Offset::CloseToday, 2)]
+        );
+        // 今仓足够时即使昨仓更多，也只平今。
+        let split = TodayYdSplit {
+            today: 5,
+            yesterday: 3,
+        };
+        assert_eq!(
+            close_offsets(3, Some(split), ShfeClosePriority::TodayFirst).unwrap(),
+            vec![(Offset::CloseToday, 3)]
+        );
+    }
+
+    #[test]
+    fn shfe_today_first_yesterday_only_when_no_today() {
+        // 今仓为 0：退化为单笔平昨。
+        let split = TodayYdSplit {
+            today: 0,
+            yesterday: 3,
+        };
+        assert_eq!(
+            close_offsets(2, Some(split), ShfeClosePriority::TodayFirst).unwrap(),
+            vec![(Offset::CloseYesterday, 2)]
+        );
+    }
+
+    #[test]
+    fn shfe_today_first_all_today_when_no_yesterday() {
+        let split = TodayYdSplit {
+            today: 3,
+            yesterday: 0,
+        };
+        assert_eq!(
+            close_offsets(2, Some(split), ShfeClosePriority::TodayFirst).unwrap(),
+            vec![(Offset::CloseToday, 2)]
+        );
+    }
+
+    #[test]
+    fn shfe_today_first_exact_split_is_single_leg() {
+        // 平量恰好等于今仓：单腿平今，绝不出两腿。
+        let split = TodayYdSplit {
+            today: 3,
+            yesterday: 5,
+        };
+        assert_eq!(
+            close_offsets(3, Some(split), ShfeClosePriority::TodayFirst).unwrap(),
+            vec![(Offset::CloseToday, 3)]
         );
     }
 
@@ -455,7 +613,15 @@ mod tests {
             today: 1,
             yesterday: 1,
         };
-        assert_eq!(close_offsets(3, Some(split)), Err(PlaceErrorKind::Rejected));
+        for p in [
+            ShfeClosePriority::TodayFirst,
+            ShfeClosePriority::YesterdayFirst,
+        ] {
+            assert_eq!(
+                close_offsets(3, Some(split), p),
+                Err(PlaceErrorKind::Rejected)
+            );
+        }
     }
 
     #[test]
@@ -464,7 +630,32 @@ mod tests {
             today: 1,
             yesterday: 1,
         };
-        assert_eq!(close_offsets(0, Some(split)), Err(PlaceErrorKind::Rejected));
+        for p in [
+            ShfeClosePriority::TodayFirst,
+            ShfeClosePriority::YesterdayFirst,
+        ] {
+            assert_eq!(
+                close_offsets(0, Some(split), p),
+                Err(PlaceErrorKind::Rejected)
+            );
+        }
+    }
+
+    #[test]
+    fn shfe_close_position_counts_near_i32_max_do_not_overflow() {
+        // 今/昨仓计数均为 i32::MAX 时，"今+昨" 必须用饱和加法：debug 下不得 panic。
+        let split = TodayYdSplit {
+            today: i32::MAX,
+            yesterday: i32::MAX,
+        };
+        assert_eq!(
+            close_offsets(i32::MAX, Some(split), ShfeClosePriority::TodayFirst).unwrap(),
+            vec![(Offset::CloseToday, i32::MAX)]
+        );
+        assert_eq!(
+            close_offsets(i32::MAX, Some(split), ShfeClosePriority::YesterdayFirst).unwrap(),
+            vec![(Offset::CloseYesterday, i32::MAX)]
+        );
     }
 
     // ---- SHFE 市价单 → 穿价限价（GFD）----

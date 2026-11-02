@@ -12,7 +12,7 @@
 
 pub mod decimal_wire;
 pub mod id;
-/// K线采集专用高频内存表（TickTable/LastVolumeTable/DominantTable，纯内存不落盘）。
+/// K线采集专用高频内存表（TickTable/LastTickStatTable/DominantTable，纯内存不落盘）。
 pub mod kline;
 pub mod order_rule;
 pub mod protocol;

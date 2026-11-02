@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use trading_core::kline::{
-    BarTable, DominantTable, GapRegistry, KlineRegistry, LastVolumeTable, TickTable,
+    BarTable, DominantTable, GapRegistry, KlineRegistry, LastTickStatTable, TickTable,
 };
 use trading_core::order_rule::OrderRuleTable;
 use trading_core::quote::QuoteTable;
@@ -32,8 +32,8 @@ pub struct MemoryTables {
     pub leverages: LeverageRepo,
     /// CTP K线：原始 tick WAL 待刷盘窗口。
     pub ctp_ticks: Arc<TickTable>,
-    /// CTP K线：合约 → 当日最后累计成交量（主力选举原料）。
-    pub ctp_last_volumes: Arc<LastVolumeTable>,
+    /// CTP K线：合约 → 当日最后 tick 统计（交易日/累计量/持仓，主力选举原料）。
+    pub ctp_last_stats: Arc<LastTickStatTable>,
     /// CTP K线：品种 → 当前主力（收盘选举写入，次日冻结）。
     pub ctp_dominants: Arc<DominantTable>,
     /// K线：定稿 bar 待刷盘窗口（四家共用）。
@@ -52,7 +52,7 @@ impl MemoryTables {
             quotes: Arc::new(QuoteTable::new()),
             leverages: LeverageRepo::new(),
             ctp_ticks: Arc::new(TickTable::new()),
-            ctp_last_volumes: Arc::new(LastVolumeTable::new()),
+            ctp_last_stats: Arc::new(LastTickStatTable::new()),
             ctp_dominants: Arc::new(DominantTable::new()),
             bar_table: Arc::new(BarTable::new()),
             kline_registry: Arc::new(KlineRegistry::new()),
@@ -122,10 +122,7 @@ mod tests {
         assert!(Arc::ptr_eq(&mem.order_rules, &store.order_rules()));
         assert!(Arc::ptr_eq(&mem.quotes, &store.quotes()));
         assert!(Arc::ptr_eq(&mem.ctp_ticks, &store.ctp_ticks()));
-        assert!(Arc::ptr_eq(
-            &mem.ctp_last_volumes,
-            &store.ctp_last_volumes()
-        ));
+        assert!(Arc::ptr_eq(&mem.ctp_last_stats, &store.ctp_last_stats()));
         assert!(Arc::ptr_eq(&mem.ctp_dominants, &store.ctp_dominants()));
         assert!(Arc::ptr_eq(&mem.bar_table, &store.bar_table()));
         assert!(Arc::ptr_eq(&mem.kline_registry, &store.kline_registry()));

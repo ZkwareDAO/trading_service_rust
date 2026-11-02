@@ -88,9 +88,9 @@ pub struct ProviderDeps {
     /// CTP K线：最新原始 tick 内存表（纯内存不落盘）。
     #[cfg(feature = "ctp")]
     pub ctp_ticks: Arc<trading_core::kline::TickTable>,
-    /// CTP K线：合约 → 当日最后累计成交量（主力原料）。
+    /// CTP K线：合约 → 当日最后 tick 统计（主力原料）。
     #[cfg(feature = "ctp")]
-    pub ctp_last_volumes: Arc<trading_core::kline::LastVolumeTable>,
+    pub ctp_last_stats: Arc<trading_core::kline::LastTickStatTable>,
     /// CTP K线：品种 → 当前主力（收盘选举写入）。
     #[cfg(feature = "ctp")]
     pub ctp_dominants: Arc<trading_core::kline::DominantTable>,

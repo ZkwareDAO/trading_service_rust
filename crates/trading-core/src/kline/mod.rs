@@ -5,7 +5,7 @@
 //!
 //! * [`TickTable`]：CTP 原始 tick 的 WAL 待刷盘窗口（append 每笔、批量 drain 后清空）；
 //! * [`BarTable`]：定稿 bar 待刷盘窗口；
-//! * [`LastVolumeTable`] / [`DominantTable`]：主力选举原料与结果；
+//! * [`LastTickStatTable`] / [`DominantTable`]：主力选举原料（当日量/持仓）与结果；
 //! * [`KlineRegistry`] / [`KlineKey`]：客户端订阅登记（引用计数、断连清理）；
 //! * [`RegistrySource`]：登记表在某 (venue,itype,interval) 作用域的期望符号快照。
 //!
@@ -19,7 +19,9 @@ mod source;
 mod tick;
 
 pub use bar::{BarTable, DirtyBar, SeriesKey, SeriesStarts};
-pub use dominant::{DominantEntry, DominantTable, LastVolumeTable};
+pub use dominant::{
+    DominantEntry, DominantTable, LastTickStat, LastTickStatTable, PendingCandidate,
+};
 pub use gap::{
     coalesce_starts, detect_tail_gap, scan_gaps, stall_gap, GapRange, GapRegistry, GapSeries,
     PendingGap,

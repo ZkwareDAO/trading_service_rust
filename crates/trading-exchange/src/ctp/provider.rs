@@ -113,7 +113,7 @@ impl CtpProvider {
         let stream = self.market_stream.get_or_init(|| {
             let stream = crate::ctp::market_stream::CtpMarketStream::new(
                 Arc::clone(&self.deps.ctp_ticks),
-                Arc::clone(&self.deps.ctp_last_volumes),
+                Arc::clone(&self.deps.ctp_last_stats),
                 Arc::clone(&self.deps.ctp_dominants),
                 Arc::clone(&self.instrument_dir),
                 self.config.kline_products.clone(),
@@ -341,7 +341,11 @@ impl VenueProvider for CtpProvider {
         if !self.config.preset_dominants.is_empty() {
             stream.preset_dominants(&self.config.preset_dominants);
         }
-        stream.spawn_election(Arc::clone(&self.md_stop));
+        stream.spawn_election(
+            Arc::clone(&self.md_stop),
+            self.config.main_contract_criteria,
+            self.config.main_contract_confirm_days,
+        );
         let handle = crate::ctp::market::spawn_market_worker(
             crate::ctp::market::MdParams {
                 // 行情前置需要合法账户结构（BrokerID/UserID 编码进登录请求），
@@ -447,7 +451,7 @@ mod tests {
             market_interest: None,
             ctp: test_config(),
             ctp_ticks: Arc::new(trading_core::kline::TickTable::new()),
-            ctp_last_volumes: Arc::new(trading_core::kline::LastVolumeTable::new()),
+            ctp_last_stats: Arc::new(trading_core::kline::LastTickStatTable::new()),
             ctp_dominants: Arc::new(trading_core::kline::DominantTable::new()),
             persist_bar_sink: None,
             hist_fetch: crate::provider::HistoricalFetchConfig::default_for_backfill(),
