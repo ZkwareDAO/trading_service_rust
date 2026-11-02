@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use ctp2rs::v1alpha1::{
     CThostFtdcDepthMarketDataField, CThostFtdcMdSpiExt, CThostFtdcReqUserLoginField,
@@ -392,6 +393,10 @@ impl MockMdFront {
                 }
             };
             let mut prev_ts: Option<i64> = None;
+            // 绝对时间轴：epoch 固定于本轮文件起点，planned 是相对它的累计计划毫秒。
+            // 每笔只累加不重排，因此睡眠过冲不会逐笔累积成整段漂移。
+            let epoch = Instant::now();
+            let mut planned_ms: u64 = 0;
             loop {
                 if stop.load(Ordering::Relaxed) {
                     return;
@@ -407,17 +412,16 @@ impl MockMdFront {
                 };
                 // 首帧立即（prev_ts=None 标志本文件尚未推过，循环重读时同样立即）；
                 // 其后定速，或按相邻时间戳差（截断上限）。
-                let wait = if d.interval_ms > 0 {
-                    if prev_ts.is_none() {
-                        0
-                    } else {
-                        d.interval_ms
-                    }
-                } else {
-                    next_delay(prev_ts, tick.ts_ms, d.speed, d.max_gap_ms)
-                };
-                if wait > 0 {
-                    sleep_brief(wait, stop);
+                planned_ms = advance_planned(
+                    planned_ms,
+                    prev_ts,
+                    tick.ts_ms,
+                    d.interval_ms,
+                    d.speed,
+                    d.max_gap_ms,
+                );
+                if planned_ms > 0 {
+                    sleep_until(epoch + Duration::from_millis(planned_ms), stop);
                 }
                 if stop.load(Ordering::Relaxed) {
                     return;
@@ -596,6 +600,45 @@ fn sleep_brief(total_ms: u64, stop: &AtomicBool) {
         let step = left.min(10);
         thread::sleep(std::time::Duration::from_millis(step));
         left = left.saturating_sub(step);
+    }
+}
+
+/// 在已排期的累计毫秒上追加本 tick 的计划等待（首帧/循环重读整点不等待）。
+///
+/// 回放用「epoch + 累计计划毫秒」的**绝对 deadline** 调度，而不是逐笔
+/// `sleep` 相对等待：`thread::sleep` 每次都存在毫秒级过冲，逐笔累积会在
+/// 长回放中产生秒级漂移（实测 3 分钟漂 ~1.9s，30 分钟将错分钟桶）。
+fn advance_planned(
+    planned_ms: u64,
+    prev_ts: Option<i64>,
+    ts: i64,
+    interval_ms: u64,
+    speed: f64,
+    max_gap_ms: u64,
+) -> u64 {
+    let wait = if interval_ms > 0 {
+        if prev_ts.is_none() {
+            0
+        } else {
+            interval_ms
+        }
+    } else {
+        next_delay(prev_ts, ts, speed, max_gap_ms)
+    };
+    planned_ms.saturating_add(wait)
+}
+
+/// 睡到绝对 deadline（10ms 分片以便 stop 快速生效）；已过期立即返回。
+fn sleep_until(deadline: Instant, stop: &AtomicBool) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        thread::sleep((deadline - now).min(Duration::from_millis(10)));
     }
 }
 
@@ -976,5 +1019,36 @@ mod tests {
         // 未索引合约：ensure 为空操作，不起任务、不报错。
         h.front.ensure_replay_for("NOPE");
         h.front.shutdown();
+    }
+
+    #[test]
+    fn advance_planned_accumulates_absolute_deadlines() {
+        // 首帧不等待；其后按相邻时间差累加到同一时间轴（不重排、不丢增量）。
+        let mut p = advance_planned(0, None, 1_000, 0, 1.0, 30_000);
+        assert_eq!(p, 0);
+        p = advance_planned(p, Some(1_000), 1_500, 0, 1.0, 30_000);
+        assert_eq!(p, 500);
+        p = advance_planned(p, Some(1_500), 2_000, 0, 1.0, 30_000);
+        assert_eq!(p, 1_000);
+        // 负差钳 0：时间轴不倒退。
+        assert_eq!(
+            advance_planned(p, Some(2_000), 1_900, 0, 1.0, 30_000),
+            p
+        );
+    }
+
+    #[test]
+    fn advance_planned_honors_speed_interval_and_gap_cap() {
+        // 相邻差按倍速缩放、超上限截断。
+        assert_eq!(advance_planned(0, Some(0), 10_000, 0, 10.0, 30_000), 1_000);
+        assert_eq!(advance_planned(0, Some(0), 100_000, 0, 1.0, 30_000), 30_000);
+        // interval_ms > 0：忽略文件时间差，首帧仍立即。
+        assert_eq!(advance_planned(0, None, 1_000, 200, 1.0, 30_000), 0);
+        assert_eq!(advance_planned(0, Some(1_000), 2_000, 200, 1.0, 30_000), 200);
+        // 饱和：极端累计不 panic。
+        assert_eq!(
+            advance_planned(u64::MAX - 1, Some(0), 1_000, 0, 1.0, 30_000),
+            u64::MAX
+        );
     }
 }

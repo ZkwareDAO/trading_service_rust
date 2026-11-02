@@ -175,6 +175,10 @@ cp third_party/ctp-mock/ctp-mock.example.toml third_party/ctp-mock/ctp-mock.toml
 回放优先）。配置项：`data_root`(支持 `~/`)、`speed`、`interval_ms`、`max_gap_ms`、
 `loop`、`instruments`(白名单，空＝全部)，语义见模板注释。
 
+> 回放按**绝对 deadline**（文件起点 epoch + 累计计划毫秒）调度，不是逐笔相对 `sleep`；
+> 长回放不会累积睡眠过冲造成的漂移（实测 30 分钟偏移跨度 <10ms）。单笔相邻间隔仍受
+> `max_gap_ms` 截断，`loop=true` 每轮重读时首帧立即推送。
+
 源文件为 **15 列、带 UTF-8 BOM** 的采集格式（与服务自身落盘的 33 列 RawTick 不同），
 盘口是一列 Python 字面量 `quotes`（恒 1 档），表头：
 
