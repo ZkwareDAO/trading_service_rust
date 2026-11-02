@@ -206,6 +206,12 @@ sudo ./deploy/deploy.sh      # 构建并安装到 /opt/trading_service_rust，�
 | `--south-secret-file` | 空 | 南向 HMAC 密钥路径（缺省取 `<data-dir>/south.key`，首启自动生成 0600） |
 | `--flush-interval` | `5s` | 脏表定时落盘周期 |
 | `--kline-flush-interval` | `5s` | K线（定稿 1m bar / CTP 原始 tick）批量 append 到 CSV 的周期（独立 OS 线程，同步 IO 不进 tokio worker） |
+| `--kline-retain-bars` | `1440` | BarTable 每序列（venue×symbol）内存保留的最近 bar 条数上限（1m，1440≈24h） |
+| `--kline-retain-age` | `24h` | BarTable 每序列 bar 的内存保留时长；与条数上限取先到者 |
+| `--kline-history-default-limit` | `300` | `get_klines` 不传 limit 时的缺省返回根数 |
+| `--kline-history-max-limit` | `1500` | `get_klines` 单次返回根数硬上限（超限截断） |
+| `--kline-gap-scan-interval` | `5m` | 三家 K线缺口内部扫描周期（binance/deribit/hyperliquid）；`0` 关闭周期扫描（实时尾检仍在） |
+| `--kline-stall-threshold` | `3m` | 三家静默停推阈值：`now-末键` 超过该时长即登记缺口（必须 >0） |
 | `--rest-timeout` | `5s` | 交易所 REST 超时 |
 | `--account-reload-interval` | `2s` | 账户表对账周期（重载版本变化即停旧起新） |
 | `--rule-refresh-interval` | `720h` | 交易所规则表刷新周期 |
@@ -231,9 +237,14 @@ sudo ./deploy/deploy.sh      # 构建并安装到 /opt/trading_service_rust，�
 | --- | --- | --- |
 | `http_proxy` / `https_proxy` | 否 | 出站代理（binance/deribit 为 https/wss 目标，`https_proxy` 必需才走代理）；部署脚本自动从执行用户环境或 `~/.proxy_env` 注入 systemd 单元 |
 | `no_proxy` | 否 | 直连例外列表；`localhost`、`127.*`、`::1` 恒直连（代码内建） |
+| `RUST_LOG` | 否 | tracing 过滤器；缺省 `info,trading_service=info,trading_store=info`（来源：`main.rs` 的 `EnvFilter::try_from_default_env`） |
 | `TRADING_DATA_DIR` | 否 | account-tool 默认路径基准目录（manage.sh 自动导出；未设时回退 `/opt/.../data` 探测，再回退 `./data`） |
 
 <!-- END AUTO-GENERATED -->
+
+CTP 模拟器联调专用变量（`CTP_MOCK_CTRL_TD` / `CTP_MOCK_CTRL_MD` /
+`CTP_MOCK_AUTO_TICK` / `CTP_MOCK_PRESET` / `CTP_MOCK_LOG` 等）只由 `third_party/ctp-mock`
+读取，详见 [third_party/ctp-mock/README.md](third_party/ctp-mock/README.md)。
 
 ## 测试
 
@@ -245,6 +256,8 @@ cargo test -p trading-exchange --features ctp ctp
 cargo test -p trading-service --features ctp
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+# CTP 模拟器是独立嵌套 workspace（自带 Cargo.lock/target，不在根 workspace 测试集内）
+cd third_party/ctp-mock && cargo test --workspace
 ```
 
 CTP 联调 / 历史 tick 回放需先构建模拟器：`scripts/build-ctp-mock.sh`。

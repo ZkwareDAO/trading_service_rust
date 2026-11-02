@@ -18,10 +18,16 @@
 | `cargo clippy --workspace --all-targets -- -D warnings` | 全目标 lint（含测试代码） |
 | `cargo fmt --all -- --check` | 格式检查 |
 | `scripts/build-ctp-mock.sh` | 构建 CTP 模拟器 `.so` 与 `ctp-mock-ctl`（联调 / 历史 tick 回放） |
+| `cd third_party/ctp-mock && cargo test --workspace` | CTP 模拟器自身单测（嵌套 workspace） |
+| `cd third_party/ctp-mock && cargo clippy --workspace --all-targets` | CTP 模拟器 lint |
 
 > `ctp` 不是默认 feature：`cargo test --workspace` 不会编译 CTP 适配代码。改动
 > `crates/trading-exchange/src/ctp/**` 或 `trading-service` 的 CTP 路径时，必须额外跑带
 > `--features ctp` 的测试。
+>
+> `third_party/ctp-mock` 是**独立嵌套 workspace**（自带 `Cargo.lock` 与 `target/`）：根
+> `cargo test/clippy/fmt --workspace` 不覆盖它，改动模拟器时需在 `third_party/ctp-mock`
+> 目录内单独执行。
 
 ## 提交规范
 
