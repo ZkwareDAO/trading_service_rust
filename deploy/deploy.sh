@@ -12,9 +12,15 @@
 #     ├── bin/      trading-service 二进制 + manage.sh 管理入口（软链到 /usr/local/bin）
 #     ├── conf/     venue.toml（用户改这里）
 #     ├── data/     account.csv / account.key / south.key / 按日 CSV 账本
+#     ├── lib/ctp/  CTP vendored 动态库（thosttraderapi_se.so / thostmduserapi_se.so）
 #     ├── logs/     trading-service.log
 #     └── （源码仓库本身不复制；脚本只装运行所需文件）
 #
+# CTP：默认以 --features ctp 构建；首次安装自动把仓库 vendored 的 .so 装到 lib/ctp，
+#      并向 conf/venue.toml 的 [ctp] 注入 trader_so/md_so（不触碰 md_front/md_account）。
+#      前置依赖由用户预装：x86_64 Linux、Rust>=1.80、clang/libclang-dev、g++/make。
+#
+# 本脚本只安装：不 enable、不启动。完成账户与 [ctp] 配置后执行 bin/start.sh。
 # 幂等：重复执行即升级——二进制重装、配置/数据/账户文件已存在则不动。
 #
 set -euo pipefail
@@ -50,12 +56,41 @@ if ! command -v cargo >/dev/null 2>&1; then
   done
 fi
 if ! command -v cargo >/dev/null 2>&1; then
-  echo "错误：未找到 cargo，请先安装 Rust（https://rustup.rs）后重试。" >&2
+  echo "错误：未找到 cargo，请先安装 Rust（https://rustup.rs，见 docs/部署文档.md §3.1.1）后重试。" >&2
+  exit 1
+fi
+
+# 构建依赖（由用户预装；这里只 fail-fast，不自动安装）。
+# CTP vendored 动态库仅支持 x86_64 Linux。
+if [ "$(uname -m)" != "x86_64" ]; then
+  echo "错误：CTP vendored 动态库仅支持 x86_64 Linux（当前 $(uname -m)）。" >&2
+  exit 1
+fi
+if ! command -v clang >/dev/null 2>&1; then
+  echo "错误：未找到 clang（ctp2rs build.rs 需要）。请安装 clang libclang-dev（见 docs/部署文档.md §3.1.1）。" >&2
+  exit 1
+fi
+if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
+  echo "错误：未找到 C 编译器（cc/gcc）。请安装 build-essential（见 docs/部署文档.md §3.1.1）。" >&2
+  exit 1
+fi
+if ! (ldconfig -p 2>/dev/null | grep -q 'libclang') \
+  && ! ls /usr/lib/llvm-*/lib/libclang.so* >/dev/null 2>&1; then
+  echo "错误：未找到 libclang（ctp2rs build.rs 需要）。请安装 clang libclang-dev（见 docs/部署文档.md §3.1.1）。" >&2
   exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# CTP vendored 动态库（仓库内 v6.7.13 linux64）；运行期安装到 lib/ctp。
+CTP_SO_SRC_DIR="$PROJECT_DIR/third_party/ctp2rs/ctp-dyn/api/ctp/v6.7.13/v6.7.13_20260225_api_traderapi_se_linux64"
+CTP_LIB_DIR="${OPT_ROOT}/lib/ctp"
+for so in thosttraderapi_se.so thostmduserapi_se.so; do
+  if [ ! -f "$CTP_SO_SRC_DIR/$so" ]; then
+    echo "错误：缺少 CTP 动态库 $CTP_SO_SRC_DIR/$so（请确认仓库 clone 完整）。" >&2
+    exit 1
+  fi
+done
 # ——— 部署源单元：一律以 deploy/trading-service.service 为准 ———
 # .example 只是首次部署的种子模板：目录下没有 .service 时拷一份出来。
 # 之后用户直接编辑 .service（监听地址、webhook、参数等全部以它为准），
@@ -67,7 +102,7 @@ if [ ! -f "$SERVICE_SRC" ]; then
   echo "    后续请编辑该文件自定义配置（如 --south-addr 监听地址），重跑部署即生效"
 fi
 
-for f in "$SERVICE_SRC" "$PROJECT_DIR/config/venue.toml" "$SCRIPT_DIR/account.example.csv"; do
+for f in "$SERVICE_SRC" "$PROJECT_DIR/config/venue.toml" "$SCRIPT_DIR/account.example.csv" "$SCRIPT_DIR/start.sh"; do
   if [ ! -f "$f" ]; then
     echo "错误：缺少 $f，请在项目根目录下执行本脚本。" >&2
     exit 1
@@ -75,8 +110,8 @@ for f in "$SERVICE_SRC" "$PROJECT_DIR/config/venue.toml" "$SCRIPT_DIR/account.ex
 done
 
 # ——— 1. 构建 release 二进制（核心服务 + account-tool 账户管理工具） ———
-echo "==> cargo build --release（首次编译可能需要数分钟）"
-(cd "$PROJECT_DIR" && cargo build --release -p trading-service \
+echo "==> cargo build --release --features ctp（首次编译可能需要数分钟）"
+(cd "$PROJECT_DIR" && cargo build --release --features ctp -p trading-service \
   --bin trading-service --bin account-tool)
 BIN_SRC="$PROJECT_DIR/target/release/trading-service"
 TOOL_SRC="$PROJECT_DIR/target/release/account-tool"
@@ -90,6 +125,13 @@ install -d -m 0755 -o "$RUN_USER" -g "$RUN_USER" \
 echo "==> 安装二进制"
 install -m 0755 "$BIN_SRC" "$BIN_DST"
 install -m 0755 "$TOOL_SRC" "${OPT_ROOT}/bin/account-tool"
+# CTP 运行库：装到安装目录，避免依赖编译期绝对路径。
+echo "==> 安装 CTP 动态库"
+install -d -m 0755 -o "$RUN_USER" -g "$RUN_USER" "$CTP_LIB_DIR"
+install -m 0755 -o "$RUN_USER" -g "$RUN_USER" \
+  "$CTP_SO_SRC_DIR/thosttraderapi_se.so" "$CTP_LIB_DIR/"
+install -m 0755 -o "$RUN_USER" -g "$RUN_USER" \
+  "$CTP_SO_SRC_DIR/thostmduserapi_se.so" "$CTP_LIB_DIR/"
 # manage.sh：普通用户的日常管理入口（状态/日志/重载账户/重启）。
 cat > "${OPT_ROOT}/bin/manage.sh" << EOF
 #!/usr/bin/env bash
@@ -112,14 +154,46 @@ EOF
 chmod 0755 "${OPT_ROOT}/bin/manage.sh"
 chown "$RUN_USER:$RUN_USER" "${OPT_ROOT}/bin/manage.sh"
 ln -sf "${OPT_ROOT}/bin/manage.sh" "$MANAGE_LINK"
+# start.sh：deploy 本身不启动服务；配置完成后由用户执行本脚本。
+install -m 0755 -o "$RUN_USER" -g "$RUN_USER" "$SCRIPT_DIR/start.sh" "${OPT_ROOT}/bin/start.sh"
 
 # ——— 4. 配置文件（已存在则不动，保留用户调优） ———
+# 首次安装时向 [ctp] 注入 .so 安装路径；不触碰 md_front/md_account。
+inject_ctp_so_paths() {
+  local conf="$1" libdir="$2" tmp
+  tmp="$(mktemp)"
+  awk -v trader="$libdir/thosttraderapi_se.so" -v md="$libdir/thostmduserapi_se.so" '
+    BEGIN { in_ctp = 0; found = 0 }
+    /^\[ctp\][[:space:]]*(#.*)?$/ {
+      print
+      print "trader_so = \"" trader "\""
+      print "md_so = \"" md "\""
+      in_ctp = 1; found = 1; next
+    }
+    /^\[/ { in_ctp = 0 }
+    in_ctp && /^[[:space:]]*trader_so[[:space:]]*=/ { next }
+    in_ctp && /^[[:space:]]*md_so[[:space:]]*=/ { next }
+    { print }
+    END {
+      if (!found) {
+        print ""
+        print "[ctp]"
+        print "trader_so = \"" trader "\""
+        print "md_so = \"" md "\""
+      }
+    }
+  ' "$conf" > "$tmp" && mv "$tmp" "$conf"
+}
+
 if [ ! -f "$CONF_DIR/venue.toml" ]; then
   install -m 0644 "$PROJECT_DIR/config/venue.toml" "$CONF_DIR/venue.toml"
+  inject_ctp_so_paths "$CONF_DIR/venue.toml" "$CTP_LIB_DIR"
   chown "$RUN_USER:$RUN_USER" "$CONF_DIR/venue.toml" 2>/dev/null || true
-  echo "    已安装 $CONF_DIR/venue.toml"
+  echo "    已安装 $CONF_DIR/venue.toml（已注入 [ctp] trader_so/md_so）"
+  echo "    警告：conf/venue.toml 的 [ctp] md_front/md_account 可能来自仓库默认，"
+  echo "          脚本不会修改；请确认属于本机柜台并手动替换。"
 else
-  echo "    $CONF_DIR/venue.toml 已存在，跳过"
+  echo "    $CONF_DIR/venue.toml 已存在，跳过（如需更新 [ctp] .so 路径请手动编辑）"
 fi
 
 # ——— 5. account.csv 初始化（不存在则只建表头，存在则不动） ———
@@ -214,31 +288,35 @@ fi
 sed -f "$SED_SCRIPT" "$SERVICE_SRC" > "$SERVICE_DST"
 chmod 0644 "$SERVICE_DST"
 
-# ——— 7. 启动 ———
+# ——— 7. 注册 systemd 单元（不 enable、不启动；配置完成后用 bin/start.sh） ———
 systemctl daemon-reload
-systemctl enable ${PROJECT_NAME} >/dev/null
-systemctl restart ${PROJECT_NAME}
-systemctl --no-pager status ${PROJECT_NAME} | head -5 || true
 
 echo
-echo "部署完成。"
+echo "部署完成（服务尚未启动）。"
+echo
+echo "下一步（请按顺序完成）："
+echo "  1) 添加账户：${OPT_ROOT}/bin/account-tool add-account"
+echo "     （CTP 账户的 name 必须与 [ctp].md_account 完全一致）"
+echo "  2) 如需使用 CTP，编辑 ${CONF_DIR}/venue.toml 的 [ctp] md_front / md_account"
+echo "  3) 启动服务：sudo ${OPT_ROOT}/bin/start.sh"
+echo "     之后账户变更用 ${PROJECT_NAME} reload（无需重启）；[ctp] 变更重跑 start.sh"
+echo
 echo "  安装目录：$OPT_ROOT（属主 $RUN_USER，日常操作无需 sudo）"
 echo "  管理：${PROJECT_NAME} {status|start|stop|restart|log|reload|conf}"
 echo "        （已软链到 $MANAGE_LINK；start/stop/restart 内部仍走 sudo）"
 echo "  日志：tail -f $LOG_DIR/${PROJECT_NAME}.log"
+echo "  CTP 运行库：$CTP_LIB_DIR（trader_so/md_so 已写入 conf/venue.toml）"
 echo "  查看生效配置：cat $SERVICE_DST（自定义监听地址/webhook 等：编辑 deploy/trading-service.service 后重跑本脚本）"
 echo
 if [ "$ACCOUNT_CSV_FRESH" -eq 1 ]; then
-  echo "添加账户（脚本只初始化 $ACCOUNT_CSV 的表头，不含任何账户记录）："
-  echo "  1. 交互式添加：${OPT_ROOT}/bin/account-tool add-account"
-  echo "     （逐项提问、secret 不回显、写入前自动加密；或手工编辑 $ACCOUNT_CSV）"
-  echo "  2. 账户落盘后触发重载：${PROJECT_NAME} reload（或 curl -X POST http://127.0.0.1:9100/admin/accounts/reload）"
+  echo "提示：account-tool add-account 会逐项提问、secret 不回显、写入前自动加密；"
+  echo "     也可手工编辑 $ACCOUNT_CSV（表头同 deploy/account.example.csv）。"
 else
-  echo "账户文件已存在；新增/修改账户后同样调用 reload 接口热加载。"
+  echo "账户文件已存在；新增/修改账户后执行 ${PROJECT_NAME} reload 热加载。"
 fi
 echo
 echo "可选：需要企业微信播报时，编辑 $SERVICE_DST 中 REPLACE_WITH_*_WEBHOOK 五项，"
-echo "然后 systemctl daemon-reload && systemctl restart ${PROJECT_NAME}；"
+echo "然后 systemctl daemon-reload && sudo ${OPT_ROOT}/bin/start.sh；"
 echo "已填过的 webhook 在重跑本脚本时会被自动保留。"
-echo "首启后 WS 接入密钥：$DATA_DIR/south.key（分发给策略方）。"
+echo "启动后 WS 接入密钥：$DATA_DIR/south.key（分发给策略方）。"
 echo "卸载：sudo ./deploy/uninstall.sh"

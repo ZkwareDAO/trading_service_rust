@@ -180,17 +180,19 @@ id,name,exchange,credentials,deleted,created_at,updated_at
 生产环境一键部署（/opt 一体化布局，详见 [docs/部署文档.md](docs/部署文档.md)）：
 
 ```bash
-sudo ./deploy/deploy.sh      # 构建并安装到 /opt/trading_service_rust，注册 systemd 并启动
+sudo ./deploy/deploy.sh      # 构建并安装到 /opt/trading_service_rust，注册 systemd（不启动）
 ```
 
+- 首次部署完成后：添加账户、按需配置 `conf/venue.toml` 的 `[ctp]`，再执行
+  `sudo /opt/trading_service_rust/bin/start.sh`（enable + start）；
 - 安装目录属主为执行 sudo 的用户，日常管理用 `trading-service {status|log|reload|account|restart}`（管理入口已软链到 PATH，`account` 即交互式添加账户）；
 - `account.csv` 首次部署自动创建仅含表头的文件；添加账户用
   `/opt/trading_service_rust/bin/account-tool add-account`（逐项提问、secret 不回显、
-  写入前自动加密、可选测试网），落盘后 `trading-service reload` 热加载；
+  写入前自动加密、可选测试网）；服务已启动后增改账户用 `trading-service reload` 热加载；
 - **代理继承**：部署脚本自动探测执行用户的代理环境（`http_proxy`/`https_proxy`
   环境变量，或 `~/.proxy_env` 文件）注入 systemd 单元；直连外网的机器保持为空。
   注意 binance 等为 https/wss 目标，`https_proxy` 必须存在；
-- 升级即重跑部署脚本（配置与数据保留）；卸载用 `sudo ./deploy/uninstall.sh`。
+- 升级即重跑部署脚本并执行 `start.sh`（配置与数据保留）；卸载用 `sudo ./deploy/uninstall.sh`。
 
 ## 运行参数（trading-service CLI）
 
