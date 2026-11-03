@@ -9,7 +9,8 @@
 //! 数据流（零 channel，同 `QuoteObserver` 模式）：
 //! - 驱动读帧 → `feed.decode` 得 [`PriceTick`] / [`Kline`]；
 //! - 价格 tick：`feed.write_quote` 同步直写 `QuoteTable` + observer（托管摄取主路径）；
-//! - 定稿 bar：[`HubRegistry::dispatch_bar`] 按注册表路由给 K线消费者（catch_unwind+计时摘除）。
+//! - 定稿 bar：[`HubRegistry::dispatch_bar`] 先通知无条件下游（按 sink 策略隔离/
+//!   自愈），再按注册表路由给 K线消费者（南向严格 catch_unwind+计时摘除）。
 //!
 //! 订阅集每 500ms 从 [`HubRegistry`] 锁读「价格并集 ∪ K线并集」，经 `feed.reconcile`
 //! 做频道 diff 后增量订阅/退订；断线重连后本地 `subscribed` 清空 → 整体重放。
@@ -26,7 +27,7 @@ use trading_core::quote::QuoteTable;
 
 use crate::backoff::ReconnectBackoff;
 use crate::market::{BarSink, DesiredSource, Kline, PriceTick, SubscriptionGuard};
-use crate::market_hub::HubRegistry;
+use crate::market_hub::{HubRegistry, NETWORK_SINK_BUDGET};
 use crate::port::QuoteObserver;
 use crate::ws::WsStream;
 
@@ -38,8 +39,6 @@ const PING_INTERVAL: Duration = Duration::from_secs(10);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 /// 无任何入站帧超过该时长即判死连重连。
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
-/// bar sink 单次回调的摘除阈值：目标 <1µs，1ms 为「卡死」兜底门槛（抖动不误摘）。
-const BAR_SINK_BUDGET: Duration = Duration::from_millis(1);
 
 /// 一轮对账产出的频道增/删（元素已是各所线上频道字符串）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -219,11 +218,11 @@ impl WsHubEngine {
             .push(guard);
     }
 
-    /// 注册无条件 bar 下游（全量持久化）：每根定稿 bar（含零订阅标的）都不经
+    /// 注册**持久化**无条件 bar 下游（全量落盘）：每根定稿 bar（含零订阅标的）都不经
     /// symbol 路由地通知它。进程寿命、不可注销；应在引擎 spawn 后装配期注册一次，
-    /// 坏/慢 sink 在 dispatch 时被隔离摘除。
-    pub fn register_unconditional_bar_sink(&self, sink: Arc<dyn BarSink>) {
-        self.hub.register_unconditional_bar_sink(sink);
+    /// 重复注册幂等。纯内存、不计耗时，panic 后自愈。
+    pub fn register_persistent_bar_sink(&self, sink: Arc<dyn BarSink>) -> bool {
+        self.hub.register_persistent_bar_sink(sink)
     }
 }
 
@@ -335,8 +334,8 @@ async fn run_connection<F: WsMarketFeed>(
                     feed.write_quote(tick, quotes, observer);
                 }
                 for bar in &msg.bars {
-                    // 坏/慢 sink 在 dispatch_bar 内隔离摘除，不影响连接与价格路径。
-                    hub.dispatch_bar(bar, BAR_SINK_BUDGET);
+                    // 无条件 sink 按注册策略隔离/自愈；南向路由坏/慢消费者摘除。
+                    hub.dispatch_bar(bar, NETWORK_SINK_BUDGET);
                 }
             }
         }
@@ -394,7 +393,7 @@ mod tests {
         let sink = Arc::new(RecSink {
             seen: Mutex::new(Vec::new()),
         });
-        engine.register_unconditional_bar_sink(sink.clone());
+        engine.register_persistent_bar_sink(sink.clone());
 
         let bar = Kline {
             venue: "binance".into(),

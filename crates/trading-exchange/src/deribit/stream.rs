@@ -25,9 +25,9 @@ impl DeribitMarketStream {
         self.engine.register_managed_prices(src);
     }
 
-    /// 注册无条件 bar 下游（全量持久化）：委托给引擎，装配期注册一次。
-    pub(crate) fn register_unconditional_bar_sink(&self, sink: Arc<dyn BarSink>) {
-        self.engine.register_unconditional_bar_sink(sink);
+    /// 注册持久化 bar 下游（全量落盘）：委托给引擎，装配期注册一次（幂等）。
+    pub(crate) fn register_persistent_bar_sink(&self, sink: Arc<dyn BarSink>) -> bool {
+        self.engine.register_persistent_bar_sink(sink)
     }
 }
 
@@ -98,7 +98,7 @@ mod tests {
         let stream = DeribitMarketStream::from_engine(engine);
 
         let persist = RecSink::new();
-        stream.register_unconditional_bar_sink(persist.clone() as Arc<dyn BarSink>);
+        stream.register_persistent_bar_sink(persist.clone() as Arc<dyn BarSink>);
 
         assert_eq!(
             reg.dispatch_bar(&bar("ETH-18SEP26-2550-P"), Duration::from_secs(1)),

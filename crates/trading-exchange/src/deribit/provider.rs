@@ -52,7 +52,7 @@ impl DeribitProvider {
             let stream = DeribitMarketStream::from_engine(engine);
             // 无条件全量落盘 sink：单例闭包内只注册一次（行为同 binance/CTP）。
             if let Some(persist) = &self.deps.persist_bar_sink {
-                stream.register_unconditional_bar_sink(Arc::clone(persist));
+                stream.register_persistent_bar_sink(Arc::clone(persist));
             }
             Arc::new(stream)
         });

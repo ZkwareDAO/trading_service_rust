@@ -6,7 +6,7 @@
 //! - [`Self::price_symbols`] / [`Self::bar_symbols`] 供 drain 计算「业务兴趣 ∪ K线
 //!   期望（品种经 [`InstrumentDir`] 展开为全部 is_trading 合约）」并集向柜台订阅；
 //! - [`Self::on_kline_tick`]：K线集 tick 喂入 [`BarAggSink`]，分钟翻转定稿后按注册表
-//!   路由（catch_unwind+计时摘除）；原始 tick/累计量写三表在同路径完成；
+//!   路由（南向严格 catch_unwind+计时摘除；全量持久化走 LocalPersist，慢回调不摘除）；
 //! - [`Self::elect_cycle`]：收盘选举纯内核（按配置指标取当日最大/tiebreak、
 //!   N 日连击确认、月份单向守卫、每日只处理一次），由 [`Self::spawn_election`]
 //!   独立线程在日盘收盘后触发。
@@ -35,7 +35,7 @@ use crate::ctp::instrument_dir::InstrumentDir;
 use crate::market::{
     BarSink, DesiredSource, Kline, KlineInterval, MarketDataStream, SubscriptionGuard,
 };
-use crate::market_hub::{safe_notify, NotifyOutcome};
+use crate::market_hub::{safe_notify, NotifyOutcome, NETWORK_SINK_BUDGET};
 
 /// 落 RawTick 时除聚合三量外的盘口/日 OHLC 字段（CandleTick 保持精简，1m 聚合不用它们）。
 ///
@@ -71,9 +71,6 @@ impl From<&crate::ctp::core::quote::TickSnapshot> for RawTickDepth {
         }
     }
 }
-
-/// bar sink 单次回调摘除阈值（目标 <1µs，1ms 兜底）。
-const BAR_BUDGET: Duration = Duration::from_millis(1);
 
 /// CTP 的 venue 标识（落盘行与南向路由口径一致）。
 const CTP_VENUE: &str = "ctp";
@@ -163,7 +160,7 @@ impl BarRouter {
         };
         let mut evicted = Vec::new();
         for (id, sink) in targets {
-            match safe_notify(sink.as_ref(), bar, BAR_BUDGET) {
+            match safe_notify(sink.as_ref(), bar, NETWORK_SINK_BUDGET) {
                 NotifyOutcome::Ok => {}
                 _ => evicted.push(id),
             }
@@ -339,9 +336,9 @@ impl CtpMarketStream {
 
     /// 注册全量持久化 sink：此后**每根定稿 bar（含非主力、零南向订阅）**都不经
     /// 订阅/主力路由地通知它（用于「有 tick 定稿即落 CSV」）。须在行情喂 tick 前
-    /// 注册一次；panic/慢 sink 在聚合层被隔离摘除，不影响行情连接与南向路由。
+    /// 注册一次；重复注册幂等。纯内存、不计耗时，panic 后由聚合层自愈重注册。
     pub fn register_persistent_bar_sink(&self, sink: Arc<dyn BarSink>) {
-        self.bar_agg.lock().unwrap().add_unconditional_sink(sink);
+        self.bar_agg.lock().unwrap().register_persistent_sink(sink);
     }
 
     /// 强制定稿所有未闭桶并把 bar 同时送全量持久化 sink 与南向路由（优雅停机收口用）。
@@ -892,6 +889,21 @@ mod tests {
         s.on_kline_tick("cu2611", &mk(10, 600_000), &RawTickDepth::default());
         s.on_kline_tick("cu2611", &mk(11, 660_000), &RawTickDepth::default());
         assert_eq!(sink.count(), 1);
+    }
+
+    #[test]
+    fn register_persistent_bar_sink_is_idempotent_and_receives_sweep() {
+        // 重复装配（如 ensure 被多次调用）不导致重复落盘；墙钟 sweep 定稿仍送达。
+        let (ticks, vols, doms) = tables();
+        let persist = Arc::new(CountSink::default());
+        let s = CtpMarketStream::new(ticks, vols, doms, dir_with(vec![]), Vec::new());
+        s.register_persistent_bar_sink(persist.clone() as Arc<dyn BarSink>);
+        s.register_persistent_bar_sink(persist.clone() as Arc<dyn BarSink>);
+
+        s.on_kline_tick("cu2701", &mk(10, 600_000), &RawTickDepth::default());
+        let bars = s.sweep_kline_finalized(660_000);
+        assert_eq!(bars.len(), 1);
+        assert_eq!(persist.count(), 1);
     }
 
     #[test]

@@ -15,16 +15,12 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use rust_decimal::Decimal;
 
 use crate::ctp::candle::{CandleAggregator, CandleTick};
 use crate::market::{BarSink, Kline, KlineInterval};
-use crate::market_hub::{safe_notify, NotifyOutcome};
-
-/// 无条件 sink 单次回调摘除阈值（与 BarRouter 同口径：目标 <1µs，1ms 兜底）。
-const PERSIST_BUDGET: Duration = Duration::from_millis(1);
+use crate::market_hub::UnconditionalSinkSet;
 
 /// K线集 tick 聚合器（单连接一份）。
 pub struct BarAggSink {
@@ -37,8 +33,9 @@ pub struct BarAggSink {
     /// 定稿 bar 的下游（BarRouter 按订阅意图 + 主力表路由给 K线消费者）。
     sink: Arc<dyn BarSink>,
     /// 无条件下游（如全量持久化 sink）：**绕过订阅/主力路由**，每根定稿 bar
-    /// （含非主力、零订阅）都通知；坏/慢者经 safe_notify 隔离摘除，不牵连主下游。
-    unconditional: Vec<Arc<dyn BarSink>>,
+    /// （含非主力、零订阅）都通知；策略/边沿告警/panic 摘除与自愈统一由
+    /// [`UnconditionalSinkSet`] 处理，不牵连主下游。
+    unconditional: UnconditionalSinkSet,
 }
 
 impl BarAggSink {
@@ -48,29 +45,21 @@ impl BarAggSink {
             interval,
             aggregators: BTreeMap::new(),
             sink,
-            unconditional: Vec::new(),
+            unconditional: UnconditionalSinkSet::new(),
         }
     }
 
-    /// 注册一个无条件下游：此后每根定稿 bar（on_tick 翻转与 flush_all 收口）都通知它，
-    /// 不经订阅/主力过滤，用于「有 tick 定稿即全量落盘」。须在喂 tick 前注册一次。
+    /// 注册本地普通无条件下游（LocalBounded：超时仅告警不摘除）。
+    /// 须在喂 tick 前注册一次。
     pub fn add_unconditional_sink(&mut self, sink: Arc<dyn BarSink>) {
-        self.unconditional.push(sink);
+        self.unconditional.register(sink);
     }
 
-    /// 逐个隔离通知无条件 sink；panic/超时者摘除，绝不影响主下游与行情连接。
-    fn notify_unconditional(&mut self, bar: &Kline) {
-        let mut survivors = Vec::with_capacity(self.unconditional.len());
-        for sink in self.unconditional.drain(..) {
-            match safe_notify(sink.as_ref(), bar, PERSIST_BUDGET) {
-                NotifyOutcome::Ok => survivors.push(sink),
-                outcome => tracing::warn!(
-                    ?outcome,
-                    "无条件 bar sink 异常，已摘除（不影响其余持久化/路由）"
-                ),
-            }
-        }
-        self.unconditional = survivors;
+    /// 注册全量持久化下游（LocalPersist：不计耗时、panic 后自愈、重复注册幂等）。
+    /// 此后每根定稿 bar（on_tick 翻转与 flush_all/sweep 收口）都通知它，
+    /// 不经订阅/主力过滤，用于「有 tick 定稿即全量落盘」。
+    pub fn register_persistent_sink(&mut self, sink: Arc<dyn BarSink>) -> bool {
+        self.unconditional.register_persistent(sink)
     }
 
     /// 定稿 bar 的统一双下游出口：先全量持久化（绕过订阅/主力路由），再交 Router 分发。
@@ -89,7 +78,8 @@ impl BarAggSink {
             volume = bar.volume,
             "CTP 1m K线定稿"
         );
-        self.notify_unconditional(bar);
+        // 策略/告警/摘除/自愈全在集合内部；慢持久化 sink 不再被误摘。
+        self.unconditional.notify_all(bar);
         self.sink.on_bar(bar);
     }
 
@@ -172,6 +162,7 @@ pub fn to_candle_tick(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     /// 记录收到 bar 的 sink。
     #[derive(Default)]
@@ -180,6 +171,29 @@ mod tests {
     }
     impl BarSink for RecSink {
         fn on_bar(&self, bar: &Kline) {
+            self.bars.lock().unwrap().push(bar.symbol.clone());
+        }
+    }
+
+    /// 延时 + 计数的 sink（持久化不测耗时的回归用）。
+    struct SleepCountSink {
+        delay: Duration,
+        bars: Mutex<Vec<String>>,
+    }
+    impl SleepCountSink {
+        fn new(delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                delay,
+                bars: Mutex::new(Vec::new()),
+            })
+        }
+        fn count(&self) -> usize {
+            self.bars.lock().unwrap().len()
+        }
+    }
+    impl BarSink for SleepCountSink {
+        fn on_bar(&self, bar: &Kline) {
+            std::thread::sleep(self.delay);
             self.bars.lock().unwrap().push(bar.symbol.clone());
         }
     }
@@ -276,6 +290,49 @@ mod tests {
         // 3 次跨分钟定稿（660/720/780 各一根）。
         assert_eq!(router.bars.lock().unwrap().len(), 3);
         assert_eq!(good.bars.lock().unwrap().len(), 3);
+    }
+
+    // ===== 持久化 sink（LocalPersist：不测耗时、重复注册幂等） =====
+
+    #[test]
+    fn finalized_bars_reach_persistent_sink_once() {
+        let router = Arc::new(RecSink::default());
+        let persist = Arc::new(RecSink::default());
+        let mut agg = BarAggSink::new("ctp", router.clone() as Arc<dyn BarSink>, KlineInterval::M1);
+        // 重复注册被幂等忽略：每根定稿 bar 只落一次。
+        assert!(agg.register_persistent_sink(persist.clone() as Arc<dyn BarSink>));
+        assert!(!agg.register_persistent_sink(persist.clone() as Arc<dyn BarSink>));
+
+        agg.on_tick("cu2601", &tick(20261023, 600_000, 100, 10));
+        agg.on_tick("cu2601", &tick(20261023, 660_000, 101, 11));
+
+        assert_eq!(router.bars.lock().unwrap().clone(), vec!["cu2601"]);
+        assert_eq!(persist.bars.lock().unwrap().clone(), vec!["cu2601"]);
+    }
+
+    /// 回归 2026-11-02 事故：持久化 sink 单次回调 >1ms 时曾被判 Slow 永久摘除，
+    /// 导致其后所有 bar 不再落盘。LocalPersist 策略不测耗时，全部收到。
+    #[test]
+    fn slow_persistent_sink_still_receives_all_swept_bars() {
+        let router = Arc::new(RecSink::default());
+        let persist = SleepCountSink::new(Duration::from_millis(2));
+        let mut agg = BarAggSink::new("ctp", router.clone() as Arc<dyn BarSink>, KlineInterval::M1);
+        agg.register_persistent_sink(persist.clone() as Arc<dyn BarSink>);
+
+        agg.on_tick("cu2701", &tick(20261027, 600_000, 100, 10));
+        agg.on_tick("rb2701", &tick(20261027, 600_000, 200, 20));
+        agg.on_tick("jm2701", &tick(20261027, 600_000, 300, 30));
+
+        let bars = agg.sweep_finalized(660_000);
+        assert_eq!(bars.len(), 3);
+        // 每根回调都 >1ms，但一根都不丢。
+        assert_eq!(persist.count(), 3);
+        assert_eq!(router.bars.lock().unwrap().len(), 3);
+
+        // 后续分钟继续定稿，持久化 sink 仍在（未被摘除）。
+        agg.on_tick("cu2701", &tick(20261027, 660_000, 101, 11));
+        assert_eq!(agg.sweep_finalized(720_000).len(), 1);
+        assert_eq!(persist.count(), 4);
     }
 
     // ===== 墙钟 sweep_finalized（多合约一次性到点定稿）=====

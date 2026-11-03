@@ -117,7 +117,7 @@ impl BinanceProvider {
             // 维度（venue="binance" 唯一），同时挂现货会让将来的现货/合约同名标的
             // 静默写进同一 CSV，故刻意不注册现货。
             if let Some(persist) = &self.deps.persist_bar_sink {
-                hubs.1.register_unconditional_bar_sink(Arc::clone(persist));
+                hubs.1.register_persistent_bar_sink(Arc::clone(persist));
             }
             hubs
         })

@@ -181,8 +181,9 @@ impl DesiredSource for InterestSource {
 /// 定稿 K线接收方。
 ///
 /// **契约（硬约束）**：同步、纯内存、廉价（比较/差分/写内存表/入既有队列），
-/// 禁止 IO、await、长锁，目标 <1µs。调用方以 `catch_unwind` + 单次耗时计时隔离，
-/// panic 或超时的 sink 会被摘除，不影响连接与其它消费者。
+/// 禁止 IO、await、长锁，目标 <1µs。调用方以 `catch_unwind` + 单次耗时计时隔离：
+/// 南向网络路由消费者 panic/超时会被摘除；本地无条件下游按注册策略处理
+/// （持久化 sink 不测耗时、panic 后自愈），均不影响连接与其它消费者。
 pub trait BarSink: Send + Sync {
     /// 一根 K线定稿时被同步调用。
     fn on_bar(&self, bar: &Kline);

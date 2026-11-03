@@ -23,9 +23,9 @@ impl BinanceMarketStream {
         Self { engine }
     }
 
-    /// 注册无条件 bar 下游（全量持久化）：委托给引擎，装配期注册一次。
-    pub(crate) fn register_unconditional_bar_sink(&self, sink: Arc<dyn BarSink>) {
-        self.engine.register_unconditional_bar_sink(sink);
+    /// 注册持久化 bar 下游（全量落盘）：委托给引擎，装配期注册一次（幂等）。
+    pub(crate) fn register_persistent_bar_sink(&self, sink: Arc<dyn BarSink>) -> bool {
+        self.engine.register_persistent_bar_sink(sink)
     }
 }
 
@@ -146,7 +146,7 @@ mod tests {
 
         // 经具名流（而非直接摸引擎）注册全量落盘 sink。
         let persist = RecSink::new();
-        stream.register_unconditional_bar_sink(persist.clone() as Arc<dyn BarSink>);
+        stream.register_persistent_bar_sink(persist.clone() as Arc<dyn BarSink>);
 
         // 没有任何 register_klines 消费者：无条件 sink 仍收到，摘除计数 0。
         assert_eq!(

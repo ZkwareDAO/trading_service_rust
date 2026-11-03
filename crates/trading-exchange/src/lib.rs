@@ -11,7 +11,8 @@
 //!   binance/deribit/hyperliquid 的 `XxxMarketStream` 与 ctp 的 `CtpMarketStream`；
 //!   xili 不覆盖，取默认 Unsupported。
 //! - [`market_hub`]：消费者注册表 / 全局并集 / 订阅 diff / 按 symbol 路由 /
-//!   `catch_unwind`+单次耗时摘除异常 sink（纯内核、零 channel、`Arc<Mutex>` 短临界区）。
+//!   `catch_unwind` 隔离异常 sink（南向路由严格摘除；本地落盘 sink 慢仅边沿告警、
+//!   panic 后自愈）（纯内核、零 channel、`Arc<Mutex>` 短临界区）。
 //! - [`market_ws`]：可组合引擎 [`market_ws::WsHubEngine`]——WS 三家共用的唯一连接生命周期
 //!   （退避/10s Ping/5s 看门狗 20s 判死/500ms 对账/重连整体重放）+ [`market_ws::WsMarketFeed`]
 //!   协议端口（各所只留协议纯函数）。引擎**自身不实现** `MarketDataStream`，由各所具名流
