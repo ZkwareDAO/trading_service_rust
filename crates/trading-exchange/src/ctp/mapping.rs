@@ -11,6 +11,9 @@ use crate::ctp::core::event::{OrderSnapshot, PositionSnapshot, TradeSnapshot};
 use crate::ctp::core::types::Direction;
 use trading_models::{InstrumentType, OrderStatus};
 
+/// 保证金补齐差额日志的相对容差：避免浮点尾差（如 5527.2 vs 5527.200000001）刷日志。
+const MARGIN_SHORTFALL_REL_TOL: f64 = 1e-6;
+
 /// 统一 `Side`（买/卖）→ CTP `Direction`。
 /// reduce_only 只影响开平标志，不改变方向语义。
 pub fn direction_from_side(side: trading_models::Side) -> Direction {
@@ -141,9 +144,10 @@ pub struct MergedPosition {
 /// * 总成本 `C = Σ PositionCost`；
 /// * 合并开仓单价 `entry = C / (N × multiplier)`——**先求和再除**
 ///   （手数加权；绝不可先算各行单价再平均）；
-/// * 占用保证金 `margin = Σ UseMargin`；柜台对整组回报 0 时按
-///   `Σ PositionCost × 方向合约保证金率`（`long_margin_ratio`/`short_margin_ratio`）
-///   兜底估算，详见 [`effective_total_margin`]；比率也缺失则为 0（不退化为全额成本）；
+/// * 占用保证金：`UseMargin > 0` 的行取柜台值；`UseMargin <= 0` 的有效分片按
+///   `该行 PositionCost × 方向合约保证金率`（`long_margin_ratio`/`short_margin_ratio`）
+///   补齐（整组全 0 等价于旧兜底）；柜台和已覆盖全组估算时不追加，详见
+///   [`effective_total_margin`]；比率也缺失则为 0（不退化为全额成本）；
 /// * `today = Σ TodayPosition`、`yesterday = Σ YdPosition`（喂 PositionDir）。
 ///
 /// 现价/pnl/roi/notional 适配层不计算（`mark_price=None`、`unrealized_pnl=None`），
@@ -178,7 +182,7 @@ pub fn merge_position_snapshots(
         return None;
     }
     let total_cost: f64 = valid.iter().map(|p| p.position_cost).sum();
-    // 占用保证金：柜台 ΣUseMargin>0 用之；否则按 Σcost×方向合约保证金率兜底（见纯函数）。
+    // 占用保证金：柜台正数分片 + 缺失分片按成本×方向比率补齐（见纯函数，防重复记账）。
     let total_margin: f64 = effective_total_margin(&valid, long_margin_ratio, short_margin_ratio);
     let today = saturating_sum(|p| p.today_position.max(0));
     let yesterday = saturating_sum(|p| p.yd_position.max(0));
@@ -232,44 +236,87 @@ pub fn position_info_from_snapshot(
 
 /// 计算同 `(合约,方向)` 持仓分片的**有效占用保证金**（纯 f64 算术，不触 FFI/目录）。
 ///
-/// * 柜台 `Σ UseMargin > 0`：以柜台权威值为准，**绝不覆盖**（对锁优惠等真实口径保留）；
-/// * 柜台对整组回报 0/缺失（对锁仓、今昨分片记账、SimNow 回填不全）：按
-///   `Σ PositionCost × 方向合约保证金率` 估算，避免上层在 CTP `leverage=1` 下把
-///   保证金兜底成**全额名义成本**（低估杠杆、止损/强平预警不触发）。
+/// 柜台会把同一仓位拆成今/昨等多行，`UseMargin` 可能只记在其中一行：
+/// * 每行 `UseMargin > 0`：原样计入（柜台权威值，绝不覆盖）；
+/// * `UseMargin <= 0`（含负/NaN）：若该行 `PositionCost` 与方向比率有效，
+///   按 `PositionCost × 方向比率` 补齐——避免部分分片为 0 时少算保证金、
+///   放大 `roi = pnl/margin`；
+/// * 整组全 0：结果即 `Σ cost×ratio`，与旧兜底一致；
+/// * **防重复记账**：正数和已 ≥ 全组 `Σcost×ratio` 时不再追加补齐
+///   （柜台把整组保证金记在一行时不会翻倍）；
+/// * 成本/比率缺失的行补 0；比率全缺失时保留柜台和，绝不退化为全额名义成本。
 ///
 /// 方向逐行取自 `PosiDirection`：`'2'` 多→`long_ratio`，`'3'` 空→`short_ratio`。
-/// 成本/比率必须有限且为正才计入；任一缺失对应行不计入；全部缺失返回 `0.0`
-/// ——**绝不在此退化为全额名义成本**。
 ///
 /// 前置条件：`rows` 须是已过滤的有效持仓行（`position != 0` 且方向为 `'2'`/`'3'`），
 /// 由唯一调用方 [`merge_position_snapshots`] 的 `valid` 过滤保证，本函数不再重复该过滤。
 fn effective_total_margin(rows: &[&PositionSnapshot], long_ratio: f64, short_ratio: f64) -> f64 {
-    // 柜台占用保证金之和：只累加有限、非负值（畸形负/NaN 不计）。
+    // 「有限且严格为正」：成本/比率/柜台保证金共用同一有效性口径。
+    let positive = |v: f64| v.is_finite() && v > 0.0;
+    // 柜台值不可信（0/负/NaN）的行按成本×比率补齐。
+    let is_missing = |p: &PositionSnapshot| !positive(p.use_margin);
+    let ratio_of = |p: &PositionSnapshot| match p.direction {
+        '2' => long_ratio,
+        '3' => short_ratio,
+        _ => 0.0,
+    };
+    let estimate = |p: &PositionSnapshot| {
+        let ratio = ratio_of(p);
+        if positive(p.position_cost) && positive(ratio) {
+            p.position_cost * ratio
+        } else {
+            0.0
+        }
+    };
+    // 全组「成本 × 方向比率」估算（比率缺失的行贡献 0）。
+    let expected: f64 = rows.iter().map(|p| estimate(p)).sum();
+    // 柜台可信的占用保证金之和（负数/NaN 不计）。
     let counter: f64 = rows
         .iter()
         .map(|p| p.use_margin)
-        .filter(|m| m.is_finite() && *m >= 0.0)
+        .filter(|m| positive(*m))
         .sum();
-    if counter > 0.0 {
+    // 柜台整组缺失（或全部非法）：按全组估算兜底。
+    if counter <= 0.0 {
+        return expected;
+    }
+    // 无缺失行，或柜台和已覆盖全组估算：以柜台为准，绝不追加。
+    if !rows.iter().any(|p| is_missing(p)) || expected <= counter {
         return counter;
     }
-    // 「有限且严格为正」：成本与比率同时满足才计入兜底（0/负/NaN/无穷一律按缺失）。
-    let positive = |v: f64| v.is_finite() && v > 0.0;
-    // 柜台整组缺失：逐行 成本 × 该方向有效比率；非法值贡献 0，绝不给全额。
-    rows.iter()
-        .map(|p| {
-            let ratio = match p.direction {
-                '2' => long_ratio,
-                '3' => short_ratio,
-                _ => 0.0,
-            };
-            if positive(p.position_cost) && positive(ratio) {
-                p.position_cost * ratio
-            } else {
-                0.0
-            }
-        })
-        .sum()
+    // 部分分片缺失：只补缺失行，且总量不超过全组估算（防整组记账重复计算）。
+    let supplement: f64 = rows
+        .iter()
+        .filter(|p| is_missing(p))
+        .map(|p| estimate(p))
+        .sum();
+    let total = counter + supplement;
+    // 正数分片也可能少算：补齐后仍显著低于全组估算时打印差额与原始分片，
+    // 便于发现“部分正数少算”的变体（相对容差避免浮点尾差刷日志）。
+    let shortfall = expected - total;
+    if shortfall > expected.abs().max(1.0) * MARGIN_SHORTFALL_REL_TOL {
+        let shards: Vec<_> = rows
+            .iter()
+            .map(|p| {
+                (
+                    p.position,
+                    p.today_position,
+                    p.yd_position,
+                    p.position_cost,
+                    p.use_margin,
+                )
+            })
+            .collect();
+        tracing::debug!(
+            counter,
+            supplement,
+            expected,
+            shortfall,
+            shards = ?shards,
+            "CTP 保证金补齐后仍低于成本×比率估算"
+        );
+    }
+    total.min(expected)
 }
 
 #[cfg(test)]
@@ -681,16 +728,102 @@ mod tests {
     }
 
     #[test]
-    fn effective_margin_partial_zero_shard_keeps_counter_sum() {
-        // 今/昨分片一行 32050、一行 0：汇总仍 >0，属柜台正常记账，不触发兜底。
+    fn effective_margin_partial_zero_shard_supplements_missing_row() {
+        // b2702 多头 2 手：3948 × 10 × 2 × 7% = 5527.2。
+        // 今/昨各 1 手分片：一行柜台给 2763.6，另一行 UseMargin=0 → 补齐另一行。
         let rows = [
-            margin_row('2', 64_100.0, 32_050.0),
-            margin_row('2', 32_050.0, 0.0),
+            margin_row('2', 39_480.0, 2_763.6),
+            margin_row('2', 39_480.0, 0.0),
         ];
-        let got = calc(&rows, 0.10, 0.20);
+        let got = calc(&rows, 0.07, 0.07);
         assert!(
-            (got - 32_050.0).abs() < 1e-9,
-            "ΣUseMargin=32050 时不得用比率重算"
+            (got - 5_527.2).abs() < 1e-9,
+            "部分分片为 0 时必须按缺失行成本×比率补齐，got={got}"
+        );
+    }
+
+    #[test]
+    fn effective_margin_partial_zero_shard_supplement_uses_short_ratio() {
+        // 空头分片：一行有值、一行 0；补齐必须取 ShortMarginRatio。
+        let rows = [
+            margin_row('3', 39_480.0, 2_763.6),
+            margin_row('3', 39_480.0, 0.0),
+        ];
+        let got = calc(&rows, 0.05, 0.07);
+        assert!((got - 5_527.2).abs() < 1e-9, "空头补齐应取 short ratio");
+    }
+
+    #[test]
+    fn effective_margin_group_level_counter_not_double_supplemented() {
+        // 柜台把整组保证金记在一行：正数和=5527.2 已覆盖全组估算，不得再加零行。
+        let rows = [
+            margin_row('2', 39_480.0, 5_527.2),
+            margin_row('2', 39_480.0, 0.0),
+        ];
+        let got = calc(&rows, 0.07, 0.07);
+        assert!(
+            (got - 5_527.2).abs() < 1e-9,
+            "柜台和已覆盖全组时不得重复补齐，got={got}"
+        );
+    }
+
+    #[test]
+    fn effective_margin_zero_shard_without_ratio_keeps_counter_sum() {
+        // 比率缺失时无法补齐：保留柜台正数和，绝不退化为全额成本。
+        let rows = [
+            margin_row('2', 39_480.0, 2_763.6),
+            margin_row('2', 39_480.0, 0.0),
+        ];
+        let got = calc(&rows, 0.0, 0.0);
+        assert!(
+            (got - 2_763.6).abs() < 1e-9,
+            "比率缺失时保留柜台和，got={got}"
+        );
+    }
+
+    #[test]
+    fn effective_margin_negative_or_nan_use_margin_is_supplemented() {
+        for bad in [-1.0_f64, f64::NAN] {
+            let rows = [
+                margin_row('2', 39_480.0, 2_763.6),
+                margin_row('2', 39_480.0, bad),
+            ];
+            let got = calc(&rows, 0.07, 0.07);
+            assert!(
+                (got - 5_527.2).abs() < 1e-9,
+                "非法 UseMargin={bad} 应按缺失补齐，got={got}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_margin_positive_under_margined_row_is_not_topped_up() {
+        // 一行正数但低于应有值、一行 0：只补 0 行，正数行保持柜台值。
+        let rows = [
+            margin_row('2', 39_480.0, 1_000.0),
+            margin_row('2', 39_480.0, 0.0),
+        ];
+        let got = calc(&rows, 0.07, 0.07);
+        // 1000 + 2763.6 = 3763.6（仍低于全组 5527.2，属已知残差，由 debug 日志暴露）。
+        assert!(
+            (got - 3_763.6).abs() < 1e-9,
+            "正数分片不得被覆盖，got={got}"
+        );
+    }
+
+    #[test]
+    fn merge_partial_zero_shard_margin_matches_two_lot_requirement() {
+        // 聚合层回归：真实量纲下 margin 必须等于 2 手全额，而非 1 手。
+        let group = vec![
+            rb_shard('2', 1, 1, 0, 39_480.0, 2_763.6),
+            rb_shard('2', 1, 0, 1, 39_480.0, 0.0),
+        ];
+        let merged = merge_position_snapshots(&group, 10, 0.07, 0.07).unwrap();
+        let expected = Decimal::try_from(5_527.2).unwrap();
+        let got = merged.info.margin.unwrap();
+        assert!(
+            (got - expected).abs() < Decimal::new(1, 6),
+            "2 手保证金应≈5527.2，got={got}"
         );
     }
 

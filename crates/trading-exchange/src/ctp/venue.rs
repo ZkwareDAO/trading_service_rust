@@ -1315,6 +1315,23 @@ fn finalize_position_batch(
         let mult = ctx.instrument_dir.multiple(&instrument);
         // 合约多/空保证金率与乘数同源（InstrumentDir）；UseMargin=0 时供 merge 兜底估算。
         let (long_ratio, short_ratio) = ctx.instrument_dir.margin_ratios(&instrument);
+        // 原始分片取证：柜台可能只在一行记保证金。下一轮对账据此判断是
+        // “1 手有值 + 1 手 0”还是“单行 position=2 只给半额”，用于验证补齐口径。
+        for row in &group {
+            tracing::debug!(
+                account = %ctx.account,
+                instrument = %instrument,
+                direction = %dir_char,
+                position = row.position,
+                today = row.today_position,
+                yd = row.yd_position,
+                position_cost = row.position_cost,
+                use_margin = row.use_margin,
+                long_margin_ratio = long_ratio,
+                short_margin_ratio = short_ratio,
+                "CTP 持仓原始分片"
+            );
+        }
         match merge_position_snapshots(&group, mult, long_ratio, short_ratio) {
             Some(merged) => {
                 // 快照是真相源：整批覆盖该 (合约,方向) 的今/昨。
@@ -3048,6 +3065,54 @@ mod tests {
             Some((2, 3))
         );
         assert!(active.is_none());
+    }
+
+    #[test]
+    fn back_positions_supplements_zero_margin_shard_from_dir_ratios() {
+        // b2702：今/昨各 1 手，一行 2763.6、一行 0，比率 7% → 聚合 5527.2。
+        let (ctx, mut bridge_rx) = ctx_and_rx();
+        let h = handle();
+        let mut active = Some(ActiveQuery::BackPositions { rows: Vec::new() });
+        // 与 warm_rb_multiple 同源，但带多/空保证金率（补齐依据）。
+        ctx.instrument_dir.remember(InstrumentInfo {
+            instrument: "rb2510".into(),
+            exchange_id: "SHFE".into(),
+            product_id: "rb".into(),
+            is_trading: true,
+            volume_multiple: 10,
+            price_tick: 1.0,
+            long_margin_ratio: 0.07,
+            short_margin_ratio: 0.07,
+        });
+        dispatch_event(
+            CtpEvent::Position(rb_row(1, 1, 0, 39_480.0, 2_763.6)),
+            &h,
+            &ctx,
+            &mut active,
+        );
+        dispatch_event(
+            CtpEvent::Position(rb_row(1, 0, 1, 39_480.0, 0.0)),
+            &h,
+            &ctx,
+            &mut active,
+        );
+
+        // Act
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+
+        // Assert：聚合后的 margin 是 2 手全额，而不是柜台部分和的 1 手。
+        match bridge_rx.try_recv() {
+            Ok(BridgeEvent::Positions(ps)) => {
+                assert_eq!(ps.len(), 1);
+                let expected = rust_decimal::Decimal::try_from(5_527.2).unwrap();
+                let got = ps[0].margin.unwrap();
+                assert!(
+                    (got - expected).abs() < rust_decimal::Decimal::new(1, 6),
+                    "margin 应为 2 手全额≈5527.2，got={got}"
+                );
+            }
+            other => panic!("expected merged positions, got {other:?}"),
+        }
     }
 
     #[test]
