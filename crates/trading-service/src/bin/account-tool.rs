@@ -5,6 +5,8 @@
 //! * `encrypt`：加密单个明文，输出 `enc.v1.*`
 //! * `migrate`：把**旧宽表** account.csv 逐行迁移为新 7 列格式（原文件备份
 //!   `.bak`；`--key` 提供时 credentials 整串加密回写）
+//! * `encrypt-csv`：把 account.csv 中所有**明文** credentials 批量加密
+//!   （幂等：已密文/空值跳过；有变更才备份 `.csv.bak` 并原子回写）
 //! * `add-account`：校验并追加一条账户到 account.csv（文件不存在先建表头；
 //!   同名账户默认拒绝，`--update` 时按 name 整行替换）。新 7 列格式：公共列 +
 //!   `credentials` JSON（按 exchange 选 schema，binance/ctp 模板见
@@ -142,6 +144,20 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         update: bool,
     },
+
+    /// 批量加密 account.csv 中所有明文 credentials（幂等；有变更才备份 .bak）。
+    ///
+    /// 已密文（`enc.v1.*`）/ 空值行原样跳过，可重复执行。与其余命令一致，
+    /// 未传 `--key` 时在交互终端提问所用主密钥；非交互环境必须显式指定，
+    /// 绝不静默按明文处理。
+    EncryptCsv {
+        /// 主密钥文件（32 字节 raw）；非交互环境必填。
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// account.csv 路径。
+        #[arg(long)]
+        csv: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -195,6 +211,46 @@ fn main() -> anyhow::Result<()> {
                 println!(
                     "已迁移 {} 条账户到新 7 列格式：{}",
                     report.migrated,
+                    csv.display()
+                );
+                if let Some(b) = report.backup {
+                    println!("原文件已备份：{}（验证无误后可删除）", b.display());
+                }
+                println!("手工触发重载：curl -X POST {RELOAD_URL}");
+            }
+        }
+
+        Cmd::EncryptCsv { key, csv } => {
+            let csv = match csv {
+                Some(c) => c,
+                None => prompt_path("account.csv 路径", &default_data_file("account.csv"))?,
+            };
+            // 与其余命令一致：缺省交互提问用哪把主密钥。区别在于本命令目的就是
+            // 加密，非交互环境必须显式给 --key，拒绝静默回退/空操作。
+            let key = match key {
+                Some(k) => k,
+                None if interactive() => prompt_path(
+                    "主密钥文件路径（用于加密所有明文 credentials）",
+                    &default_data_file("account.key"),
+                )?,
+                None => anyhow::bail!(
+                    "缺少主密钥：请用 --key 指定 account.key（非交互环境不会自动采用默认值）"
+                ),
+            };
+            println!("使用主密钥：{}", key.display());
+            println!("目标账户文件：{}", csv.display());
+            let cipher = load_cipher(&key)?;
+            let report = encrypt_csv(&csv, &cipher)?;
+            if report.encrypted == 0 {
+                println!(
+                    "未发现明文 credentials（跳过 {} 行：已是密文/空值），未改动文件。",
+                    report.skipped
+                );
+            } else {
+                println!(
+                    "已加密 {} 行 credentials，跳过 {} 行（已是密文/空值）：{}",
+                    report.encrypted,
+                    report.skipped,
                     csv.display()
                 );
                 if let Some(b) = report.backup {
@@ -541,6 +597,74 @@ fn migrate_csv(path: &Path, cipher: Option<&SecretCipher>) -> anyhow::Result<Mig
     write_csv_atomic(path, &writer.into_inner()?)?;
     Ok(MigrateReport {
         migrated: new_rows.len(),
+        backup: Some(backup),
+    })
+}
+
+/// encrypt-csv 的结果：加密/跳过的行数与备份路径（无变更时 backup=None）。
+#[derive(Debug)]
+struct EncryptCsvReport {
+    encrypted: usize,
+    skipped: usize,
+    backup: Option<PathBuf>,
+}
+
+/// 把 account.csv 中所有**明文** credentials 批量整串加密（幂等）。
+///
+/// 已是 `enc.v1.*` / 空值的行原样跳过，因此可重复执行。存在任何变更时先备份
+/// `.csv.bak` 再原子回写；无变更时不碰文件、不产生备份。旧宽表（无
+/// credentials 列）报错并提示先执行 `migrate`，不猜测列含义。
+fn encrypt_csv(path: &Path, cipher: &SecretCipher) -> anyhow::Result<EncryptCsvReport> {
+    if !path.exists() {
+        anyhow::bail!("account.csv 不存在：{}", path.display());
+    }
+    let (headers, mut rows) = read_csv_or_header(path, &ACCOUNT_CSV_HEADER)?;
+    let cred_idx = headers
+        .iter()
+        .position(|h| h.trim() == "credentials")
+        .ok_or_else(|| {
+            anyhow::anyhow!("CSV 缺少 credentials 列；旧宽表请先执行 account-tool migrate 迁移")
+        })?;
+
+    let mut encrypted = 0usize;
+    let mut skipped = 0usize;
+    for row in &mut rows {
+        let Some(cell) = row.get_mut(cred_idx) else {
+            // 截断行（缺列）：不猜测内容，计为跳过。
+            skipped += 1;
+            continue;
+        };
+        let (stored, changed) = cipher.encrypt_if_plaintext(cell)?;
+        *cell = stored;
+        if changed {
+            encrypted += 1;
+        } else {
+            skipped += 1;
+        }
+    }
+
+    if encrypted == 0 {
+        return Ok(EncryptCsvReport {
+            encrypted,
+            skipped,
+            backup: None,
+        });
+    }
+
+    let backup = path.with_extension("csv.bak");
+    std::fs::copy(path, &backup).with_context(|| format!("备份原文件失败 {}", path.display()))?;
+    // flexible：截断行原样保留，不补齐也不丢弃（改写只应改变 credentials 列）。
+    let mut writer = csv::WriterBuilder::new()
+        .flexible(true)
+        .from_writer(Vec::new());
+    writer.write_record(headers.iter())?;
+    for row in &rows {
+        writer.write_record(row.iter())?;
+    }
+    write_csv_atomic(path, &writer.into_inner()?)?;
+    Ok(EncryptCsvReport {
+        encrypted,
+        skipped,
         backup: Some(backup),
     })
 }
@@ -1132,6 +1256,152 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ———————— encrypt-csv ————————
+
+    /// 独立临时目录 + account.csv 路径（目录名含用例名与 pid，测试并行安全）。
+    fn tmp_csv(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("acct_enc_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (dir.clone(), dir.join("account.csv"))
+    }
+
+    /// 用 csv writer 落一份账户文件（credentials 含逗号/引号，必须走 writer 转义）。
+    fn write_rows(path: &Path, rows: Vec<Vec<String>>) -> Vec<u8> {
+        let mut w = csv::Writer::from_writer(Vec::new());
+        w.write_record(HEADER.iter()).unwrap();
+        for row in &rows {
+            w.write_record(row.iter()).unwrap();
+        }
+        let bytes = w.into_inner().unwrap();
+        std::fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn encrypt_csv_encrypts_only_plaintext_rows() {
+        // Arrange：明文 / 已密文 / 空值 三行。
+        let (dir, path) = tmp_csv("mix");
+        let cipher = SecretCipher::from_key_bytes(&SecretCipher::random_key()).unwrap();
+        let plain = r#"{"api_key":"k","api_secret":"s"}"#;
+        let already = cipher.encrypt("already").unwrap();
+        // 空 credentials 行（build_account_row 会拒绝空值，故先建行再清空该列）。
+        let mut empty_creds = sample_row("c", "placeholder");
+        let cred_pos = HEADER.iter().position(|h| *h == "credentials").unwrap();
+        empty_creds[cred_pos] = String::new();
+        let original = write_rows(
+            &path,
+            vec![
+                sample_row("a", plain),
+                sample_row("b", &already),
+                empty_creds,
+            ],
+        );
+
+        // Act
+        let report = encrypt_csv(&path, &cipher).unwrap();
+
+        // Assert：只有明文行被加密；备份与原文件逐字节一致。
+        assert_eq!(report.encrypted, 1);
+        assert_eq!(report.skipped, 2);
+        let backup = report.backup.expect("有变更应产出 .bak");
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+
+        let (headers, rows) = read_csv_or_header(&path, &HEADER).unwrap();
+        let cred = headers
+            .iter()
+            .position(|h| h.trim() == "credentials")
+            .unwrap();
+        let stored = &rows[0][cred];
+        assert!(stored.starts_with(trading_models::account::SECRET_PREFIX));
+        assert_eq!(cipher.decrypt(stored).unwrap(), plain);
+        assert_eq!(rows[1][cred], already, "已密文行必须原样保留");
+        assert_eq!(rows[2][cred], "", "空值行必须原样保留");
+        // 其余列不受影响。
+        assert_eq!(rows[0][1], "a");
+        assert_eq!(rows[0][2], "binance");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn encrypt_csv_noop_when_everything_already_encrypted() {
+        // Arrange：全部已是密文。
+        let (dir, path) = tmp_csv("noop");
+        let cipher = SecretCipher::from_key_bytes(&SecretCipher::random_key()).unwrap();
+        let enc = cipher.encrypt("x").unwrap();
+        write_rows(&path, vec![sample_row("a", &enc)]);
+        let before = std::fs::read(&path).unwrap();
+
+        // Act
+        let report = encrypt_csv(&path, &cipher).unwrap();
+
+        // Assert：不写文件、不产生备份。
+        assert_eq!(report.encrypted, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(report.backup.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.with_extension("csv.bak").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn encrypt_csv_errors_when_credentials_column_absent() {
+        // Arrange：旧宽表（无 credentials 列）。
+        let (dir, path) = tmp_csv("legacy");
+        std::fs::write(
+            &path,
+            "id,name,exchange,api_key,api_secret\n0,a,binance,K,S\n",
+        )
+        .unwrap();
+
+        // Act
+        let err = encrypt_csv(
+            &path,
+            &SecretCipher::from_key_bytes(&SecretCipher::random_key()).unwrap(),
+        )
+        .unwrap_err();
+
+        // Assert：提示先迁移，而不是静默成功。
+        assert!(err.to_string().contains("credentials"));
+        assert!(err.to_string().contains("migrate"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn encrypt_csv_errors_when_file_missing() {
+        let (dir, path) = tmp_csv("missing");
+        let err = encrypt_csv(
+            &path,
+            &SecretCipher::from_key_bytes(&SecretCipher::random_key()).unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("不存在"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn encrypt_csv_skips_short_rows_without_panic() {
+        // Arrange：表头 7 列，但第二条只有 2 列（截断行）。
+        let (dir, path) = tmp_csv("short");
+        let cipher = SecretCipher::from_key_bytes(&SecretCipher::random_key()).unwrap();
+        // flexible：允许写入列数不足的截断行（模拟外部手工编辑的坏行）。
+        let mut w = csv::WriterBuilder::new()
+            .flexible(true)
+            .from_writer(Vec::new());
+        w.write_record(HEADER.iter()).unwrap();
+        w.write_record(sample_row("a", "plain-json").iter())
+            .unwrap();
+        w.write_record(["0", "b"].iter()).unwrap();
+        std::fs::write(&path, w.into_inner().unwrap()).unwrap();
+
+        // Act
+        let report = encrypt_csv(&path, &cipher).unwrap();
+
+        // Assert：短行计为跳过，不 panic；明文行正常加密。
+        assert_eq!(report.encrypted, 1);
+        assert_eq!(report.skipped, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
