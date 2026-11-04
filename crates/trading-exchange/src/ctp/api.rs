@@ -109,7 +109,7 @@ impl ExchangeApi for CtpApi {
                     req,
                     false,
                     None,
-                    Some("CTP 合约/行情尚未就绪，SHFE 市价无法定价，请稍后重试".into()),
+                    Some("CTP 合约/对手盘行情尚未就绪，市价单暂不可下单，请稍后重试".into()),
                 ));
             }
             // 当前 check_close_spread 恒放行（价差闸门为预留位），此臂暂不可达；
@@ -454,12 +454,20 @@ mod tests {
             short_margin_ratio: 0.0,
         });
         let req = market_req(Side::Buy, false);
-        let api = test_api(
-            registry,
-            mailbox.clone(),
-            dir,
-            std::sync::Arc::new(trading_core::quote::QuoteTable::new()),
+        // 预热 DCE 盘口（买 600 / 卖 601）：满足对手盘预检后仍走原生 AnyPrice+IOC。
+        let quotes = std::sync::Arc::new(trading_core::quote::QuoteTable::new());
+        let inst = trading_models::Instrument::new(
+            trading_models::Venue::Ctp,
+            trading_models::MarketKind::Futures,
+            "rb2510",
         );
+        let mut u = trading_core::quote::QuoteUpdate::new(1);
+        u.book = Some(trading_models::TopOfBook::new(
+            Some(Decimal::from(600)),
+            Some(Decimal::from(601)),
+        ));
+        quotes.apply(&inst, u);
+        let api = test_api(registry, mailbox.clone(), dir, quotes);
         let captured = std::sync::Arc::new(tokio::sync::Mutex::new(None));
         let cap2 = captured.clone();
         let responder = tokio::spawn(async move {
@@ -479,6 +487,38 @@ mod tests {
             *captured.lock().await,
             Some((PriceType::AnyPrice, TimeCondition::Ioc))
         );
+    }
+
+    #[tokio::test]
+    async fn manual_non_shfe_market_without_book_returns_rejected_ack_not_pending() {
+        // 无对手盘：DCE 市价单不挂起、不投信箱，直接 rejected ACK 让调用方稍后重试。
+        use crate::ctp::core::event::InstrumentInfo;
+        let registry = std::sync::Arc::new(crate::ctp::order_ref::OrderRefRegistry::new());
+        let mailbox = std::sync::Arc::new(SessionMailbox::new());
+        let dir = std::sync::Arc::new(crate::ctp::instrument_dir::InstrumentDir::new());
+        dir.remember(InstrumentInfo {
+            instrument: "rb2510".into(),
+            exchange_id: "DCE".into(),
+            product_id: "rb".into(),
+            is_trading: true,
+            volume_multiple: 10,
+            price_tick: 1.0,
+            long_margin_ratio: 0.0,
+            short_margin_ratio: 0.0,
+        });
+        let api = test_api(
+            registry,
+            mailbox.clone(),
+            dir,
+            std::sync::Arc::new(trading_core::quote::QuoteTable::new()),
+        );
+        let ack = api
+            .place_order(&market_req(Side::Buy, false))
+            .await
+            .unwrap();
+        assert!(!ack.accepted, "无对手盘应 rejected");
+        assert!(ack.message.unwrap().contains("尚未就绪"));
+        assert!(mailbox.take_next().is_none());
     }
 
     #[tokio::test]

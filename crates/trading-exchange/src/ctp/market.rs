@@ -34,27 +34,33 @@ fn instrument_key(symbol: &str) -> Instrument {
     Instrument::new(Venue::Ctp, MarketKind::Futures, symbol)
 }
 
+/// 柜台以 0 / `DBL_MAX` 表示该侧无报价：归一为可选合法价格。
+fn book_price(p: f64) -> Option<Decimal> {
+    if p > 1e-9 && p < f64::MAX {
+        Decimal::try_from(p).ok()
+    } else {
+        None
+    }
+}
+
 /// TickSnapshot → QuoteUpdate（CTP 最新价即 last；盘口写入买一卖一；
 /// 柜台以 f64::MAX 表示无对手价，视为缺侧）。
 fn tick_to_update(t: &TickSnapshot, now_ms: i64) -> QuoteUpdate {
     // 业务 QuoteTable 路径本期仍只用 best1（五档全量仅落 RawTick）。
-    let bid = t.bids[0].price;
-    let ask = t.asks[0].price;
-    let book = if bid > 1e-9 && ask > 1e-9 && ask < f64::MAX {
-        Some(TopOfBook::new(
-            Decimal::try_from(bid).ok(),
-            Decimal::try_from(ask).ok(),
-        ))
-    } else {
-        None
-    };
+    // 两侧分别判有效，保留单边盘口供市价单取对手价（涨停只有 bid、
+    // 跌停只有 ask）。两侧都缺失时写**空 book** 而非 None——None 的语义是
+    // “本消息不带盘口、保留旧值”，会在停牌/涨跌停时让过期盘口继续参与下单；
+    // 空 book 则明确表达“当前无盘口”。
     QuoteUpdate {
         last: Decimal::try_from(t.last_price)
             .ok()
             .filter(|p| *p > Decimal::ZERO),
         mark: None,
         mid: None,
-        book,
+        book: Some(TopOfBook::new(
+            book_price(t.bids[0].price),
+            book_price(t.asks[0].price),
+        )),
         ts_exchange_ms: now_ms,
         ts_recv_ms: now_ms,
     }
@@ -607,10 +613,62 @@ mod tests {
     }
 
     #[test]
-    fn tick_with_missing_side_has_no_book() {
-        let u = tick_to_update(&tick(0.0, f64::MAX), 100);
-        assert!(u.book.is_none());
+    fn book_price_keeps_positive_finite_prices() {
+        assert_eq!(book_price(3204.5), Some(Decimal::try_from(3204.5).unwrap()));
+    }
+
+    #[test]
+    fn book_price_rejects_zero_negative_nan_and_sentinels() {
+        for bad in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+        ] {
+            assert_eq!(book_price(bad), None, "非法价格 {bad} 应视为缺侧");
+        }
+    }
+
+    #[test]
+    fn tick_with_only_bid_keeps_bid_and_clears_ask() {
+        // 涨停：买一有价、卖一缺失。单边盘口必须保留，供市价平多取 bid。
+        let u = tick_to_update(&tick(3204.0, 0.0), 100);
+        let book = u.book.expect("单边盘口应保留为 Some");
+        assert_eq!(book.bid, Some(Decimal::from(3204)));
+        assert_eq!(book.ask, None);
         assert_eq!(u.last, Some(Decimal::from(3205)));
+    }
+
+    #[test]
+    fn tick_with_only_ask_keeps_ask_and_clears_bid() {
+        // 跌停：卖一有价、买一缺失。单边盘口必须保留，供市价平空取 ask。
+        let u = tick_to_update(&tick(0.0, 3205.0), 100);
+        let book = u.book.expect("单边盘口应保留为 Some");
+        assert_eq!(book.bid, None);
+        assert_eq!(book.ask, Some(Decimal::from(3205)));
+    }
+
+    #[test]
+    fn tick_with_both_sides_missing_clears_book() {
+        // 两侧都无价：写空 book 主动清除旧盘口，避免停牌/涨跌停沿用过期价位。
+        let u = tick_to_update(&tick(0.0, f64::MAX), 100);
+        assert_eq!(u.book, Some(TopOfBook::new(None, None)));
+        assert_eq!(u.last, Some(Decimal::from(3205)));
+    }
+
+    #[test]
+    fn one_sided_tick_clears_stale_book_in_table() {
+        // 先写入双边，再收到单边 tick：缺失侧必须被清空，不能沿用旧卖一。
+        let table = QuoteTable::new();
+        let key = instrument_key("rb2510");
+        table.apply(&key, tick_to_update(&tick(3204.0, 3205.0), 1));
+        table.apply(&key, tick_to_update(&tick(3204.0, 0.0), 2));
+        let q = table.get(&key).unwrap();
+        let book = q.book.unwrap();
+        assert_eq!(book.bid, Some(Decimal::from(3204)));
+        assert_eq!(book.ask, None, "单边 tick 必须清掉旧卖一");
     }
 
     #[test]
