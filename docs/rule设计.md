@@ -149,6 +149,14 @@ repo.chain_fire(current_id, target_id)?;
 repo.retire(rule.id)?;   // 幂等
 ```
 
+> **服务层 retire 收口**：订单终态触发的 retire 不直接调 `RuleRepo::retire`，
+> 而是统一走 `trading-service/src/rules/mod.rs::retire_rule_for_order`：
+> 先校验 `order.account_id == rule.account_id`、`rule.exchange` 非空时再校验
+> exchange、`rule.created_at <= order.created_at`；任一不符只 warn 跳过。
+> 规则 id 是可回收的裸数字（跨日 purge + 重启后 `next_id` 回落），旧订单的
+> `rule_id` 可能命中复用后的新规则，这三重校验用于防止误 retire（2026-11-05
+> HL 订单 2096 / CTP rule 51 事故）。
+
 通用表 `watch_rules()` 仅用于 CRUD/查询；**业务状态机一律走 `RuleRepo`**
 （`claim_self` / `chain_fire` / `retire` / `list_active(_for_position)`），
 禁止在 `update`/`with_row` 闭包内回查本表、不要在外层再包 `Mutex`，
@@ -164,7 +172,7 @@ repo.retire(rule.id)?;   // 幂等
 | `eval.rs` | 操作符 `>= <= > < ==` 的纯 Decimal 判定 | 纯函数 |
 | `metrics.rs` | `Position + Market → EvaluationContext`：**规则 roi 直接取仓位 roi（`pnl÷占用保证金`，保证金收益率口径）**，profit_drawdown 取仓位字段，price/position 跨标的经注入闭包；price 缺价本轮不触发，跨标的**持仓量**无仓补 0 | 零 IO |
 | `order.rs` | 命中规则 → `Order`/`PlaceOrderRequest`：risk 取持仓反向 + `reduce_only`，平仓量 `quantity>0 ? quantity : 持仓量×quantity_pct`，杠杆随持仓；new 用规则行 `side`/价/量/`leverage`；统一写 `Order.rule_id`；另有纯判定 `terminal_rule_id` | 纯构造 |
-| `engine.rs` | 一轮扫描：只评估 `active` 规则 → risk 绑定仓位消失即 retire；命中后链式 `chain_fire`，或预检→`claim_self`→落内存订单→下单端口；跨标的价 **QuoteTable 优先、缺失回退活跃仓位 current_price**；另有 `reconcile_terminal_orders` REST 终态兜底 | 状态走 store，网络经端口 |
+| `engine.rs` | 一轮扫描：只评估 `active` 规则 → risk 绑定仓位消失即 retire；**仓位账户与规则账户不一致时按绑定失效 retire（账户未知则跳过，保留热加载语义）**；命中后链式 `chain_fire`（**跨账户目标拒绝**），或预检→`claim_self`→落内存订单→下单端口；跨标的价 **QuoteTable 优先、缺失回退活跃仓位 current_price**；另有 `reconcile_terminal_orders` REST 终态兜底（**交易所已终态但本地被降级为 PARTIAL 时 `force_terminal` 强制收敛**） | 状态走 store，网络经端口 |
 | `placer.rs` | 生产下单口（futures 且 leverage>1 先 `set_leverage`：开仓失败按拒单 retire、平仓失败不阻断）；另有 `ExchangeRuleOrderQuerier` REST 查单口 | 网络 |
 
 关键口径：
@@ -175,9 +183,13 @@ repo.retire(rule.id)?;   // 幂等
 - main 以 `--rule-scan-interval`（默认 200ms）定时调 `run_scan`，以
   `--position-reconcile-interval`（默认 60s）定时调 `reconcile_terminal_orders`
   （用户流 WS 漏推时 REST 查单收敛终态）；仓位指标由流水线（行情重估 + 对账）刷新；
-- 订单终态回收统一经 `event.rs::retire_rule_for_terminal_order`：
-  `rule_id != 0 && status.is_terminal()` → `RuleRepo::retire`（幂等），WS 回报与
-  REST 兜底共用同一收口，覆盖 FILLED/CANCELED/REJECTED/EXPIRED。
+- 订单终态回收统一经 `rules::retire_rule_for_order`（WS 的
+  `event.rs::retire_rule_for_terminal_order` 与 REST 的
+  `engine.rs::retire_after_converged` 共用）：先 `terminal_rule_id` 判定
+  （`rule_id != 0 && status.is_terminal()`），再校验
+  **account / exchange（规则非空时）/ `rule.created_at <= order.created_at`**，
+  通过后才 `RuleRepo::retire`（幂等）。任一不符只 warn 跳过，防止 rule_id
+  复用误杀新规则。
 
 ## 8. 远程建规则（南向 create_rule）
 
