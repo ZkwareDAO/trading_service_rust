@@ -1,0 +1,217 @@
+# Venue 可调参数（交易所特定）。
+# 该文件缺失时，服务使用内置默认值（与此处相同），不会启动失败。
+# 可用 --venue-config <path> 指定其它路径。
+
+[deribit]
+# 平仓价差闸门：期权 order book 买一卖一的绝对价差（以 BTC 计）。
+# 市价平仓时：
+#   · spread <= close_spread_max → 按对手 best bid/ask 转限价平仓；
+#   · spread >  close_spread_max → 本轮不下单、规则保持 active，
+#       每 200ms 重新判断价差，直到收敛；同时发「需人工平仓」企业微信告警
+#       （同一 symbol 每 60s 最多发送一次）。
+close_spread_max = "0.005"
+
+# 市价开仓的「档位漂移」：以 mark 为基准、向有利方向漂移 N 个 tick
+# （买低 N tick / 卖高 N tick）挂限价被动单。限价开仓不使用此项。
+open_drift_ticks = 5
+
+[hyperliquid]
+# 市价单（IOC）相对中间价 mid 的滑点比率；0.05=5%。该段或字段缺失时缺省 0.05。
+slippage = "0.05"
+
+[binance]
+# 配置基线 1m K线标的：服务启动即向 U 本位永续行情流订阅这些合约，
+# 定稿 bar 无条件全量落盘 CSV（与是否有南向客户端在线无关）；
+# 客户端运行时订阅仍走 subscribe_kline 命令并额外获得南向推送。
+# 符号用币安原生大写交易对（小写会被自动归一为大写），缺省/空表＝不订阅。
+# kline_symbols = ["BTCUSDT", "ETHUSDT"]
+kline_symbols = [
+  "ETHUSDT",
+  "BTCUSDT",
+  "HYPEUSDT",
+  "BNBUSDT",
+  "ZECUSDT",
+  "SOLUSDT",
+  "LABUSDT",
+  "XLMUSDT",
+  "PORTALUSDT",
+  "XRPUSDT",
+  "STGUSDT",
+  "ALLOUSDT",
+  "WLDUSDT",
+  "NEARUSDT",
+  "XAUUSDT",
+  "PLAYUSDT",
+  "XAGUSDT",
+  "HUSDT",
+  "DOGEUSDT",
+  "SUIUSDT",
+  "CLUSDT",
+  "HOMEUSDT",
+  "ASTERUSDT",
+  "TONUSDT",
+  "1000PEPEUSDT",
+  "AIAUSDT",
+  "MUUSDT",
+  "ADAUSDT",
+  "ONDOUSDT",
+  "FETUSDT",
+  "TAOUSDT",
+  "HIVEUSDT",
+  "GUNUSDT",
+  "BCHUSDT",
+  "AVAXUSDT",
+  "LINKUSDT",
+  "FILUSDT",
+  "ENAUSDT",
+  "INJUSDT",
+  "BZUSDT",
+  "VVVUSDT",
+  "SNDKUSDT",
+  "UBUSDT",
+  "HBARUSDT",
+  "DOTUSDT",
+  "BSBUSDT",
+  "LITUSDT",
+  "HEIUSDT",
+  "INTCUSDT",
+  "IDUSDT",
+  "LTCUSDT",
+  "EWYUSDT",
+  "ZORAUSDT",
+  "MEMEUSDT",
+  "NVDAUSDT",
+  "UNIUSDT",
+  "TRUMPUSDT",
+  "TRXUSDT",
+  "GENIUSUSDT",
+  "BILLUSDT",
+  "PUMPUSDT",
+  "LAUSDT",
+  "GUAUSDT",
+  "ICPUSDT",
+  "BEATUSDT",
+  "RENDERUSDT",
+  "ALGOUSDT",
+  "SIGNUSDT",
+  "SEIUSDT",
+  "MANTRAUSDT",
+  "DASHUSDT",
+  "PENGUUSDT",
+  "AAVEUSDT",
+  "FARTCOINUSDT",
+  "OPGUSDT",
+  "XPLUSDT",
+  "PUNDIXUSDT",
+  "ARBUSDT",
+  "XMRUSDT",
+  "GIGGLEUSDT",
+  "PAXGUSDT",
+  "DRAMUSDT",
+  "PHAROSUSDT",
+  "MYXUSDT",
+  "TAUSDT",
+  "APTUSDT",
+  "1000LUNCUSDT",
+  "SPCXUSDT",
+  "TIAUSDT",
+  "ESPORTSUSDT",
+  "JTOUSDT",
+  "SAHARAUSDT",
+  "VIRTUALUSDT",
+  "CRCLUSDT",
+  "FFUSDT",
+  "OPUSDT",
+  "ORDIUSDT",
+  "SKYAIUSDT",
+  "WLFIUSDT",
+]
+
+# —— K线历史缺失自动回补（仅 binance/deribit/hyperliquid；CTP 无历史接口不生效）——
+[kline.backfill]
+# 自动回补轮询周期；"0" = 关闭后台自动回补（管理面手动补区间 POST /admin/klines/backfill 仍可用）。
+interval = "5m"
+# 单次 REST 拉取分页根数（三家按 1m，建议 ≤1000）。
+page_size = 1000
+# 同一交易所相邻两页请求间隔（节流，避免触发限频）；"0"=不 sleep。
+page_delay = "500ms"
+# 单个交易所同时进行的回补任务上限。
+concurrency = 2
+
+# ---- CTP 国内期货（feature="ctp" 编译时生效）----
+[ctp]
+# 柜台交易/行情 API 动态库路径；缺省用仓库内 vendored v6.7.13 linux64。
+# trader_so = "/path/to/thosttraderapi_se.so"
+# md_so = "/path/to/thostmduserapi_se.so"
+# 流文件目录（柜台 API 流水文件落盘处）；缺省系统临时目录。
+# flow_path = "/var/lib/trading-service/ctp-flow"
+# 前置环境开关（生产/仿真）已下沉账户级：account.csv credentials JSON 的 is_production_mode。
+# 行情前置（交易/行情端口分离；空则不启动 CTP 行情线程）。
+md_front = "tcp://101.226.250.133:42213"
+# 行情登录用账户名（account.csv 中的 name；交易所级行情不随用户区分）。
+md_account = "ctp-simnow"
+# 行情登录形态：匿名（标准 CTP 行情前置形态，BrokerID/UserID/Password 全空）。
+md_anon = false
+# 行情密码填认证码（部分柜台行情鉴权形态；与 md_anon 二选一）。
+md_pass_is_authcode = false
+# SHFE 市价单转穿价限价时，开仓价相对对手价向外漂移的最小变动价位档数
+# （买开=ask+n、卖开=bid−n；平仓不漂移，取 best bid/ask）。缺省/注释=用内置默认 1，0=纯对手价。
+# 规则引擎与手动 API 共用；作用于 market_limit_exchanges 内的交易所。
+shfe_market_drift_ticks = 1
+# SHFE 平仓腿顺序：today_first=先平今（默认）/ yesterday_first=先平昨（旧行为，省平今费）。
+# 两腿的 ReqOrderInsert 实际下发顺序即由此决定；未知值启动期报错。
+shfe_close_priority = "today_first"
+# 哪些交易所的市价单要转对手价限价（这些交易所不支持 CTP AnyPrice）。
+# 默认 ["SHFE"]；CFFEX 不支持 AnyPrice，必须加入。
+market_limit_exchanges = ["SHFE", "CFFEX"]
+# 哪些交易所需要显式拆平今/平昨。默认 ["SHFE"]；CFFEX 绝不能加；INE 真机验证后可加。
+close_today_yesterday_exchanges = ["SHFE"]
+# 哪些交易所按合约单笔上限拆单（默认空 = 不拆）。
+# CFFEX 股指限价上限 20 手、国债 50 手，由柜台合约查询提供。
+split_max_volume_exchanges = ["CFFEX"]
+# 主力选举指标：volume=当日累计成交量 / open_interest=当日持仓量（默认）。
+main_contract_criteria = "open_interest"
+# 主力切换确认天数：同一候选连续 N 个有数据交易日胜出才切换（默认 3；1=当天生效）。
+main_contract_confirm_days = 3
+# 冷启动预设主力（品种:合约），用于盘中重启/未到 15:00 收盘选举窗口时，
+# 品种订阅（cu）立即只推该合约；当日收盘选举对该品种跳过。
+# 预设仅为「暂定」：下一交易日首轮真实选举（main_contract_criteria）无条件覆盖，
+# 避免错误/过期预设被单向月份守卫永久锁死。
+# 2026-11-05 收盘后按公开行情当日持仓量最大合约生成（同 open_interest 口径）；
+# 品种代码/合约号使用柜台原生大小写（SHFE/DCE/INE/GFEX 小写，CZCE/CFFEX 大写）。
+# 无当日行情数据的品种（GN/JR/LR/PM/RI/WH/WT/ZC）不预设，等真实选举自行产生。
+preset_dominants = [
+    "a:a2701", "ad:ad2701", "ag:ag2702", "al:al2612", "ao:ao2701", "AP:AP701",
+    "au:au2612", "b:b2701", "bb:bb2701", "bc:bc2612", "br:br2701", "bu:bu2701",
+    "bz:bz2612", "c:c2701", "CF:CF701", "CJ:CJ701", "cs:cs2701", "cu:cu2612",
+    "CY:CY701", "eb:eb2612", "ec:ec2612", "eg:eg2701", "fb:fb2701", "FG:FG701",
+    "fu:fu2701", "hc:hc2701", "i:i2701", "IC:IC2612", "IF:IF2612", "IH:IH2612",
+    "IM:IM2612", "j:j2701", "jd:jd2612", "jm:jm2701", "l:l2701", "lc:lc2701",
+    "lg:lg2701", "lh:lh2701", "lu:lu2701", "m:m2701", "MA:MA701", "ni:ni2612",
+    "nr:nr2701", "OI:OI701", "op:op2701", "p:p2701", "pb:pb2612", "pd:pd2612",
+    "PF:PF701", "pg:pg2612", "PK:PK612", "PL:PL701", "pp:pp2701", "PR:PR701",
+    "ps:ps2612", "pt:pt2612", "PX:PX701", "rb:rb2701", "RM:RM701", "rr:rr2612",
+    "RS:RS701", "ru:ru2701", "SA:SA701", "sc:sc2612", "SF:SF701", "SH:SH701",
+    "si:si2612", "SM:SM701", "sn:sn2612", "sp:sp2701", "SR:SR701", "ss:ss2612",
+    "T:T2612", "TA:TA701", "TF:TF2612", "TL:TL2612", "TS:TS2612", "UR:UR701",
+    "v:v2701", "wr:wr2701", "y:y2701", "zn:zn2612",
+]
+# 配置基线 K线品种：服务启动即默认采集这些品种（展开为全部在交易合约），
+# 与南向客户端运行时订阅取并集；客户端退订不会移除这里配置的品种。
+# 注意：品种匹配是大小写敏感的，必须使用柜台原生 product_id 大小写
+# （SHFE/DCE/INE/GFEX 小写，CZCE/CFFEX 大写）；写错大小写会静默不订阅。
+# 当前 90 个品种按 2026-11-05 合约表展开约 823 个在交易合约。
+kline_products = [
+    "a", "ad", "ag", "al", "ao", "AP", "au", "b",
+    "bb", "bc", "br", "bu", "bz", "c", "CF", "CJ",
+    "cs", "cu", "CY", "eb", "ec", "eg", "fb", "FG",
+    "fu", "GN", "hc", "i", "IC", "IF", "IH", "IM",
+    "j", "jd", "jm", "JR", "l", "lc", "lg", "lh",
+    "LR", "lu", "m", "MA", "ni", "nr", "OI", "op",
+    "p", "pb", "pd", "PF", "pg", "PK", "PL", "PM",
+    "pp", "PR", "ps", "pt", "PX", "rb", "RI", "RM",
+    "rr", "RS", "ru", "SA", "sc", "SF", "SH", "si",
+    "SM", "sn", "sp", "SR", "ss", "T", "TA", "TF",
+    "TL", "TS", "UR", "v", "WH", "wr", "WT", "y",
+    "ZC", "zn",
+]
