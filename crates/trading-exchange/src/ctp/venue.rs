@@ -344,6 +344,8 @@ enum ActiveQuery {
     FrontOrder {
         /// 合约代码（历史单查无收口为 Canceled 时回填 OrderState 用）。
         instrument: String,
+        /// 逻辑单 cid（多腿判定：expected_legs = registry 中该 cid 的 ref 数）。
+        client_order_id: String,
         /// 首选匹配值（OrderSysID / 受理态 OrderRef）。
         exchange_order_id: String,
         /// cid→registry 反查的 OrderRef 兜底。
@@ -430,19 +432,15 @@ fn issue_background_or_mailbox(
     }
 }
 
-/// 上期所交易所代码：只有 SHFE 强制显式平今/平昨。
-///
-/// 能源中心 INE 规则类似但首版不纳入（柜台实测后再扩成集合常量）。
-pub(crate) const SHFE_EXCHANGE_ID: &str = "SHFE";
-
 /// 一笔平仓单的物理路由决策（纯内核，不触 FFI/目录）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClosePlan {
-    /// 非上期所：单笔笼统 `Close`（柜台自动冲抵今/昨，行为与历史完全一致）。
+    /// 不在平今/平昨集合的交易所：单笔笼统 `Close`
+    /// （柜台自动冲抵今/昨，行为与历史完全一致）。
     GenericClose,
-    /// 上期所单笔显式腿（纯平今或纯平昨）。
+    /// 配置交易所单笔显式腿（纯平今或纯平昨）。
     ShfeSingle(crate::ctp::core::types::Offset, i32),
-    /// 上期所跨今昨一单两腿：`first` 为**先下发**的腿、`second` 为后下发腿。
+    /// 配置交易所跨今昨一单两腿：`first` 为**先下发**的腿、`second` 为后下发腿。
     /// 谁今谁昨由 [`crate::ctp::prep::ShfeClosePriority`] 决定；两物理报单共享同一 cid
     /// （成交/终态由 leg_table 按 cid 聚合）。
     ShfeTwo {
@@ -454,7 +452,7 @@ enum ClosePlan {
 /// 平仓路由决策失败原因（全部 fail-closed，绝不猜测发 Close）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClosePlanError {
-    /// SHFE 但今/昨路由表未就绪（刚重连/尚未对账）：推迟到下轮对账后重试。
+    /// 配置交易所但今/昨路由表未就绪（刚重连/尚未对账）：推迟到下轮对账后重试。
     SplitNotReady,
     /// 平仓量超过该方向今+昨总仓（prep 内核判不足）。
     InsufficientPosition,
@@ -462,9 +460,9 @@ enum ClosePlanError {
 
 /// 平仓纯路由内核：给定交易所、该持仓方向的 (今,昨) 分布与平仓优先级，决定物理腿。
 ///
-/// * `exchange != Some("SHFE")`（含目录未预热到的 None）→
-///   [`ClosePlan::GenericClose`]，保持非上期所路径零变化；
-/// * SHFE：`split=None`（路由表未就绪）→ [`ClosePlanError::SplitNotReady`]；
+/// * `exchange` 不在 `close_exchanges`（含目录未预热到的 None）→
+///   [`ClosePlan::GenericClose`]，保持非配置交易所路径零变化；
+/// * 配置交易所：`split=None`（路由表未就绪）→ [`ClosePlanError::SplitNotReady`]；
 ///   复用 [`prep::close_offsets`] 得 1~2 条**有序腿**——单腿即纯今或纯昨；
 ///   跨今昨→[`ClosePlan::ShfeTwo`]（`first`/`second` 顺序即实际下发顺序，
 ///   由 `priority` 决定先平今或先平昨）；总量不足→拒。
@@ -472,10 +470,13 @@ fn plan_close(
     volume: i32,
     exchange: Option<&str>,
     split: Option<(i32, i32)>,
+    close_exchanges: &[String],
     priority: crate::ctp::prep::ShfeClosePriority,
 ) -> Result<ClosePlan, ClosePlanError> {
     use crate::ctp::prep::{close_offsets, TodayYdSplit};
-    if exchange != Some(SHFE_EXCHANGE_ID) {
+    let is_close_split =
+        exchange.is_some_and(|ex| crate::ctp::config::exchange_in_set(ex, close_exchanges));
+    if !is_close_split {
         return Ok(ClosePlan::GenericClose);
     }
     let (today, yesterday) = split.ok_or(ClosePlanError::SplitNotReady)?;
@@ -501,7 +502,7 @@ fn run_command(h: &mut TraderHandle, ctx: &EventContext, req: crate::ctp::mailbo
     use crate::ctp::mailbox::SessionRequest;
     match req {
         SessionRequest::Insert(p) => {
-            // 受理码回执：SHFE 平仓路由（可能一单两腿）/校验/FFI 错误一并随 Result
+            // 受理码回执：平今/平昨与按上限拆腿路由（可能多腿）/校验/FFI 错误一并随 Result
             // 传回 async 侧；未发出腿的脏 OrderRef 映射由 submit_insert 按腿清理。
             let ret = submit_insert(h, ctx, &p.req, &p.order_ref);
             let _ = p.reply.send(ret);
@@ -537,6 +538,83 @@ enum RoutedInsert<'a> {
         /// 后下发的腿。
         second: crate::ctp::core::order::OrderRequest,
     },
+    /// 按合约单笔上限拆出的 ≥3 腿；顺序即实际下发顺序。
+    Multi(Vec<crate::ctp::core::order::OrderRequest>),
+}
+
+/// 按单笔上限把每条腿切成若干有序子腿；`max_volume <= 0` 或腿量不超限时原样返回。
+///
+/// 输入腿顺序（SHFE 先平昨/先平今）与每条腿的 offset 保持不变；同一腿的子腿
+/// 连续排列，避免打乱实际下发顺序。
+fn split_legs(
+    legs: Vec<(crate::ctp::core::types::Offset, i32)>,
+    max_volume: i32,
+) -> Vec<(crate::ctp::core::types::Offset, i32)> {
+    if max_volume <= 0 {
+        return legs;
+    }
+    let mut out = Vec::new();
+    for (offset, volume) in legs {
+        // 上游 build_open_or_close / close_offsets 已拒绝非正手数；此处仅作契约断言。
+        debug_assert!(volume > 0, "split_legs 只接受正手数腿");
+        if volume <= max_volume {
+            out.push((offset, volume));
+            continue;
+        }
+        let mut remaining = volume;
+        while remaining > 0 {
+            let n = remaining.min(max_volume);
+            out.push((offset, n));
+            remaining -= n;
+        }
+    }
+    out
+}
+
+/// 解析“按单笔上限拆单”的实际上限。
+///
+/// * 未配置拆单 → `Ok(None)`（不拆，路径零变化）；
+/// * 配置拆单但合约目录未预热 → `Indeterminate`（上限未知，暂不下单，待预热后重试）；
+/// * 配置拆单但柜台上限为 0/负 → `Rejected`（无法安全拆单，确定性拒单）。
+///
+/// 上限按报单价格条件选择：`AnyPrice` 用市价上限，其余用限价上限。
+fn resolve_split_max_volume(
+    ctx: &EventContext,
+    req: &crate::ctp::core::order::OrderRequest,
+    split_enabled: bool,
+) -> anyhow::Result<Option<i32>> {
+    if !split_enabled {
+        return Ok(None);
+    }
+    let Some(info) = ctx.instrument_dir.get(&req.instrument) else {
+        tracing::warn!(
+            account = %ctx.account, instrument = %req.instrument,
+            "拆单交易所但合约目录未预热：单笔上限未知，暂不下单"
+        );
+        return Err(crate::ctp::place_error::CtpPlaceError::indeterminate(
+            format!(
+                "CTP 拆单推迟：{} 的合约目录未预热，单笔上限未知",
+                req.instrument
+            ),
+        ));
+    };
+    let max = if req.price_type == crate::ctp::core::types::PriceType::AnyPrice {
+        info.max_market_volume
+    } else {
+        info.max_limit_volume
+    };
+    if max <= 0 {
+        tracing::warn!(
+            account = %ctx.account, instrument = %req.instrument,
+            price_type = ?req.price_type,
+            "拆单交易所但柜台未提供单笔上限：拒绝下单"
+        );
+        return Err(crate::ctp::place_error::CtpPlaceError::rejected(format!(
+            "CTP 拆单被拒：{} 的柜台单笔上限未知（0），无法安全拆单",
+            req.instrument
+        )));
+    }
+    Ok(Some(max))
 }
 
 /// 下单请求的平仓路由（纯函数）：开仓原样返回；平仓按交易所+今昨分布+优先级把
@@ -549,36 +627,54 @@ fn routed_insert<'a>(
     req: &'a crate::ctp::core::order::OrderRequest,
     exchange: Option<&str>,
     split: Option<(i32, i32)>,
+    close_exchanges: &[String],
     priority: crate::ctp::prep::ShfeClosePriority,
+    max_volume: Option<i32>,
+    split_enabled: bool,
 ) -> Result<RoutedInsert<'a>, ClosePlanError> {
     use crate::ctp::core::types::Offset;
     use std::borrow::Cow;
-    if req.offset != Offset::Close {
+
+    // 1) 先算基础腿：开仓 1 腿；平仓按交易所路由（非配置交易所笼统 Close）。
+    let base_legs: Vec<(Offset, i32)> = if req.offset != Offset::Close {
+        vec![(req.offset, req.volume)]
+    } else {
+        match plan_close(req.volume, exchange, split, close_exchanges, priority)? {
+            ClosePlan::GenericClose => vec![(Offset::Close, req.volume)],
+            ClosePlan::ShfeSingle(offset, n) => vec![(offset, n)],
+            ClosePlan::ShfeTwo { first, second } => vec![first, second],
+        }
+    };
+
+    // 2) 按合约单笔上限拆腿（仅配置交易所 + 上限有效时）。
+    let legs = match max_volume {
+        Some(max) if split_enabled && max > 0 => split_legs(base_legs, max),
+        _ => base_legs,
+    };
+
+    // 3) 单腿且 offset/volume 未变：保持零克隆借用原请求（DCE/CZCE 等快路径）。
+    if legs.len() == 1 && legs[0] == (req.offset, req.volume) {
         return Ok(RoutedInsert::Single(Cow::Borrowed(req)));
     }
-    match plan_close(req.volume, exchange, split, priority) {
-        Ok(ClosePlan::GenericClose) => Ok(RoutedInsert::Single(Cow::Borrowed(req))),
-        // 单腿必为全量（close_offsets 单腿时 n==volume），仅改写开平标志。
-        Ok(ClosePlan::ShfeSingle(offset, n)) => {
-            debug_assert_eq!(n, req.volume);
-            let mut routed = req.clone();
-            routed.offset = offset;
-            Ok(RoutedInsert::Single(Cow::Owned(routed)))
-        }
-        // 跨今昨两腿：同价/同方向，仅开平标志与手数不同；顺序沿用 prep 产出。
-        Ok(ClosePlan::ShfeTwo { first, second }) => {
-            let make_leg = |(offset, volume): (Offset, i32)| {
-                let mut leg = req.clone();
-                leg.offset = offset;
-                leg.volume = volume;
-                leg
-            };
-            Ok(RoutedInsert::Two {
-                first: make_leg(first),
-                second: make_leg(second),
-            })
-        }
-        Err(e) => Err(e),
+
+    let make_leg = |(offset, volume): (Offset, i32)| {
+        let mut leg = req.clone();
+        leg.offset = offset;
+        leg.volume = volume;
+        leg
+    };
+    match legs.as_slice() {
+        // 单腿改写（SHFE 纯平今/纯平昨）。
+        [(offset, n)] => Ok(RoutedInsert::Single(Cow::Owned(make_leg((*offset, *n))))),
+        // 两腿（SHFE 跨今昨，或两笔按上限拆出的腿）。
+        [first, second] => Ok(RoutedInsert::Two {
+            first: make_leg(*first),
+            second: make_leg(*second),
+        }),
+        // ≥3 腿：按单笔上限拆分。
+        _ => Ok(RoutedInsert::Multi(
+            legs.into_iter().map(make_leg).collect(),
+        )),
     }
 }
 
@@ -592,20 +688,20 @@ fn close_plan_error(
         // 今昨分布未就绪是可重试的临时态（重连/首轮对账未完成），判应答不确定，
         // 不终态拒绝——对账完成后规则/手动重试仍可下单。
         ClosePlanError::SplitNotReady => CtpPlaceError::indeterminate(format!(
-            "CTP SHFE 平仓推迟：{} 的今/昨仓分布尚未就绪（重连/首轮持仓对账未完成），\
+            "CTP 平仓推迟（今/昨拆腿）：{} 的今/昨仓分布尚未就绪（重连/首轮持仓对账未完成），\
              请待对账后重试",
             req.instrument
         )),
         // 平仓量超过今+昨总仓：确定性拒绝（订单未送达柜台）。
         ClosePlanError::InsufficientPosition => CtpPlaceError::rejected(format!(
-            "CTP SHFE 平仓被拒：{} 平仓量 {} 超过今+昨总仓",
+            "CTP 平仓被拒（今/昨拆腿）：{} 平仓量 {} 超过今+昨总仓",
             req.instrument, req.volume
         )),
     }
 }
 
-/// 下单提交：SHFE 平仓先经 [`routed_insert`] 把笼统 Close 改写成显式
-/// CloseToday/CloseYesterday（单腿）或跨今昨一单两腿；开仓与非上期所路径零变化。
+/// 下单提交：配置交易所的平仓先经 [`routed_insert`] 把笼统 Close 改写成显式
+/// CloseToday/CloseYesterday（单腿）或跨今昨一单两腿；开仓与非配置交易所路径零变化。
 ///
 /// 两腿受理语义：**两受理码皆 0 才整体 Ok**；任一非 0/校验错整体 Err（错误带两腿码），
 /// 已受理腿不再撤回（靠成交回报 + 持仓对账收敛，不静默）。未就绪/超量 fail-closed。
@@ -628,7 +724,33 @@ fn submit_insert(
     };
     let exchange = ctx.instrument_dir.exchange(&req.instrument);
     let split = ctx.position_dir.get(&req.instrument, holding);
-    let routed = match routed_insert(req, exchange.as_deref(), split, ctx.shfe_close_priority) {
+    // 仅显式配置的交易所才按单笔上限拆单；默认空 = 现有交易所路径零变化。
+    let split_enabled = exchange
+        .as_deref()
+        .is_some_and(|ex| crate::ctp::config::exchange_in_set(ex, &ctx.split_max_volume_exchanges));
+    if exchange.is_none() && !ctx.split_max_volume_exchanges.is_empty() {
+        tracing::warn!(
+            account = %ctx.account, instrument = %req.instrument,
+            "合约目录未预热：无法判断该交易所是否配置拆单，本次不拆"
+        );
+    }
+    let max_volume = match resolve_split_max_volume(ctx, req, split_enabled) {
+        Ok(v) => v,
+        Err(e) => {
+            // 配置拆单但上限未知：整单未发出，清理首腿预分配映射。
+            ctx.order_refs.remove(order_ref);
+            return Err(e);
+        }
+    };
+    let routed = match routed_insert(
+        req,
+        exchange.as_deref(),
+        split,
+        &ctx.close_today_yesterday_exchanges,
+        ctx.shfe_close_priority,
+        max_volume,
+        split_enabled,
+    ) {
         Ok(r) => r,
         Err(e) => {
             // 路由失败：整单未发出，首腿（投递前已分配）的映射是脏数据。
@@ -643,7 +765,7 @@ fn submit_insert(
                     account = %ctx.account, instrument = %req.instrument,
                     offset = ?effective.offset, volume = effective.volume,
                     priority = ctx.shfe_close_priority.as_str(),
-                    "CTP SHFE 平仓路由：Close → 显式开平标志"
+                    "CTP 平仓路由：Close → 显式开平标志"
                 );
             }
             insert_one_leg(h, ctx, &effective, order_ref, "单腿").map(|()| 0)
@@ -651,6 +773,7 @@ fn submit_insert(
         RoutedInsert::Two { first, second } => {
             submit_two_legs(h, ctx, req, order_ref, first, second)
         }
+        RoutedInsert::Multi(legs) => submit_many_legs(h, ctx, req, order_ref, legs),
     }
 }
 
@@ -708,7 +831,7 @@ fn submit_two_legs(
         first_offset = ?first.offset, first_volume = first.volume,
         second_offset = ?second.offset, second_volume = second.volume,
         first_ref, second_ref,
-        "CTP SHFE 平仓路由：Close → 一单两腿（按配置顺序下发）"
+        "CTP 平仓路由：Close → 一单两腿（按配置顺序下发）"
     );
     // 第一腿失败：第二腿未发，两个 ref 都是脏数据。
     if let Err(e) = insert_one_leg(h, ctx, &first, first_ref, "第一腿") {
@@ -725,6 +848,101 @@ fn submit_two_legs(
         ));
     }
     Ok(0)
+}
+
+/// 为 N 腿分配 OrderRef：首腿复用调用方已分配的 ref，其余从 registry 依次分配。
+fn allocate_leg_refs(
+    ctx: &EventContext,
+    cid: &str,
+    first_ref: &str,
+    leg_count: usize,
+) -> Vec<String> {
+    let mut refs = Vec::with_capacity(leg_count);
+    refs.push(first_ref.to_string());
+    for _ in 1..leg_count {
+        refs.push(ctx.order_refs.allocate(cid));
+    }
+    refs
+}
+
+/// N 腿提交前准备：解析 cid 并分配 N 个 OrderRef；短 cid（registry 无映射）fail-closed。
+fn prepare_multi_leg_refs(
+    ctx: &EventContext,
+    req: &crate::ctp::core::order::OrderRequest,
+    first_ref: &str,
+    leg_count: usize,
+) -> anyhow::Result<(String, Vec<String>)> {
+    let Some(cid) = ctx.order_refs.cid_of(first_ref) else {
+        ctx.order_refs.remove(first_ref);
+        return Err(crate::ctp::place_error::CtpPlaceError::rejected(format!(
+            "CTP 多腿拆单失败：{} 的 cid 未在 OrderRef 映射中（短 cid 不支持多腿）",
+            req.instrument
+        )));
+    };
+    let refs = allocate_leg_refs(ctx, &cid, first_ref, leg_count);
+    Ok((cid, refs))
+}
+
+/// N 腿顺序提交内核（可注入提交器，便于单测失败语义）。
+///
+/// 失败语义：首腿失败 = 整单未送达（确定性拒绝，清理全部 ref）；
+/// 第 k 腿失败 = 前 k-1 腿已受理，保留其 ref、清理失败/未发腿 ref，整体判应答不确定。
+fn submit_legs_in_order<F>(
+    ctx: &EventContext,
+    refs: &[String],
+    legs: &[crate::ctp::core::order::OrderRequest],
+    mut submit: F,
+) -> anyhow::Result<i32>
+where
+    F: FnMut(usize, &crate::ctp::core::order::OrderRequest, &str) -> anyhow::Result<()>,
+{
+    // 防御：refs/legs 数量必须一一对应，否则 zip 会静默截断未发腿。
+    if refs.len() != legs.len() {
+        for r in refs {
+            ctx.order_refs.remove(r);
+        }
+        return Err(crate::ctp::place_error::CtpPlaceError::rejected(
+            "CTP 多腿拆单：OrderRef 数量与腿数不一致",
+        ));
+    }
+    for (i, (leg, leg_ref)) in legs.iter().zip(refs.iter()).enumerate() {
+        if let Err(e) = submit(i, leg, leg_ref) {
+            // 失败腿与未下发腿的脏映射清理；已受理的前序腿保留（靠回报/对账收敛）。
+            for remaining in &refs[i..] {
+                ctx.order_refs.remove(remaining);
+            }
+            if i == 0 {
+                return Err(e);
+            }
+            return Err(crate::ctp::place_error::CtpPlaceError::indeterminate(
+                format!(
+                    "CTP 多腿拆单：前 {i} 腿已受理、第 {} 腿失败（{e}）；已受理腿靠成交回报/对账收敛",
+                    i + 1
+                ),
+            ));
+        }
+    }
+    Ok(0)
+}
+
+/// ≥3 腿提交：同 cid、N 个 OrderRef，**严格按 legs 顺序下发**。
+fn submit_many_legs(
+    h: &mut TraderHandle,
+    ctx: &EventContext,
+    req: &crate::ctp::core::order::OrderRequest,
+    first_ref: &str,
+    legs: Vec<crate::ctp::core::order::OrderRequest>,
+) -> anyhow::Result<i32> {
+    let (cid, refs) = prepare_multi_leg_refs(ctx, req, first_ref, legs.len())?;
+    tracing::info!(
+        account = %ctx.account, instrument = %req.instrument, cid = %cid,
+        legs = legs.len(),
+        volumes = ?legs.iter().map(|l| l.volume).collect::<Vec<_>>(),
+        "CTP 拆单路由：按单笔上限拆为多腿（顺序下发）"
+    );
+    submit_legs_in_order(ctx, &refs, &legs, |i, leg, leg_ref| {
+        insert_one_leg(h, ctx, leg, leg_ref, &format!("第{}腿", i + 1))
+    })
 }
 
 /// 一单两腿的撤单寻址（纯函数）：每个 OrderRef 各按当前会话
@@ -810,6 +1028,7 @@ fn issue_front_query(
     match req {
         SessionRequest::QueryOrder(QueryOrderJob {
             instrument,
+            client_order_id,
             exchange_order_id,
             order_ref_hint,
             reply,
@@ -819,6 +1038,7 @@ fn issue_front_query(
                 let trading_day = h.trading_day().to_string();
                 *active = Some(ActiveQuery::FrontOrder {
                     instrument,
+                    client_order_id,
                     exchange_order_id,
                     hint: order_ref_hint,
                     trading_day,
@@ -876,6 +1096,12 @@ pub(crate) struct EventContext {
     /// SHFE 平仓腿先后顺序（venue.toml `[ctp].shfe_close_priority`，进程配置）。
     /// 两腿的实际下发顺序完全由此决定（顺序即语义）。
     pub shfe_close_priority: crate::ctp::prep::ShfeClosePriority,
+    /// 哪些交易所需要显式拆平今/平昨（venue.toml
+    /// `[ctp].close_today_yesterday_exchanges`，默认 ["SHFE"]）。
+    pub close_today_yesterday_exchanges: Vec<String>,
+    /// 哪些交易所按合约单笔上限拆单（venue.toml `[ctp].split_max_volume_exchanges`）。
+    /// 默认空 = 不拆，现有交易所路径零变化。
+    pub split_max_volume_exchanges: Vec<String>,
     /// 事件桥发送端；随会话线程结束（EventContext drop）而关闭，消费任务随之退出。
     pub tx: tokio::sync::mpsc::Sender<BridgeEvent>,
     /// 线程内去抖器（复用跨所通用纯决策内核）。
@@ -1210,7 +1436,7 @@ fn project_terminal(ctx: &EventContext, handle: &Arc<CtpUserHandle>, cid: &str) 
         ctx.pending_terminal.remove(cid);
         return;
     };
-    let expected_legs = ctx.order_refs.order_refs_of_cid(cid).len().max(1);
+    let expected_legs = ctx.order_refs.count_of_cid(cid).max(1);
     let legs_complete = ctx.leg_table.leg_count(cid) == expected_legs;
     // 正常终态（腿齐全终态）取聚合终态 AllTraded/Cancelled…；理论上 project 只在
     // 终态或超时兜底时调用，腿表保留的是标记时的全成/终态快照，故此处恒为终态。
@@ -1257,7 +1483,7 @@ fn trade_completes_pending_terminal(ctx: &EventContext, cid: &str, cumulative_qt
     let Some(agg) = ctx.leg_table.aggregate_cid(cid) else {
         return false;
     };
-    let expected_legs = ctx.order_refs.order_refs_of_cid(cid).len().max(1);
+    let expected_legs = ctx.order_refs.count_of_cid(cid).max(1);
     let legs_complete = ctx.leg_table.leg_count(cid) == expected_legs;
     agg.all_terminal && legs_complete && cumulative_qty >= agg.filled as i64
 }
@@ -1402,25 +1628,35 @@ fn finish_active_query(ctx: &EventContext, active: &mut Option<ActiveQuery>) {
         ActiveQuery::Contracts => {}
         ActiveQuery::FrontOrder {
             instrument,
+            client_order_id,
             exchange_order_id,
             hint,
             trading_day,
             rows,
             reply,
         } => {
-            // 纯匹配：系统号优先，其次受理态 OrderRef，再次 registry 反查 hint。
-            let lookup = match select_order(&rows, &exchange_order_id, hint.as_deref()) {
-                Some(s) => crate::api::OrderLookup::Found(
-                    crate::ctp::mapping::order_state_from_snapshot(s),
-                ),
-                // 查无分流：CTP 只查当日报单——eid 交易日早于当前交易日的历史单查无是
-                // 确定的，收口 Found(Canceled)；其余（当日报单/无日期/参照日缺失）保持
-                // Unavailable，下轮再试，绝不把在途 UNKNOWN 单误判（也不返回 NotExists
-                // 以避免上层 REJECTED 语义）。
-                None if is_stale_historical_order(&exchange_order_id, &trading_day) => {
-                    canceled_historical_lookup(&instrument, &exchange_order_id)
+            // 多物理腿（跨今昨/按上限拆单）：当日委托查询只能命中单腿，不能把
+            // 单腿状态当整单终态；返回 Unavailable 让上层下轮再查，等全部腿终态
+            // 由 leg_table 聚合。单腿/短 cid（registry 无映射，expected_legs=0）
+            // 保持原有匹配与历史单收口行为。
+            let expected_legs = ctx.order_refs.count_of_cid(&client_order_id);
+            let lookup = if expected_legs > 1 {
+                crate::api::OrderLookup::Unavailable
+            } else {
+                // 纯匹配：系统号优先，其次受理态 OrderRef，再次 registry 反查 hint。
+                match select_order(&rows, &exchange_order_id, hint.as_deref()) {
+                    Some(s) => crate::api::OrderLookup::Found(
+                        crate::ctp::mapping::order_state_from_snapshot(s),
+                    ),
+                    // 查无分流：CTP 只查当日报单——eid 交易日早于当前交易日的历史单查无是
+                    // 确定的，收口 Found(Canceled)；其余（当日报单/无日期/参照日缺失）保持
+                    // Unavailable，下轮再试，绝不把在途 UNKNOWN 单误判（也不返回 NotExists
+                    // 以避免上层 REJECTED 语义）。
+                    None if is_stale_historical_order(&exchange_order_id, &trading_day) => {
+                        canceled_historical_lookup(&instrument, &exchange_order_id)
+                    }
+                    None => crate::api::OrderLookup::Unavailable,
                 }
-                None => crate::api::OrderLookup::Unavailable,
             };
             if let Some(reply) = reply {
                 let _ = reply.send(lookup);
@@ -2292,6 +2528,8 @@ mod tests {
                 is_trading: true,
                 volume_multiple: 10,
                 price_tick: 1.0,
+                max_limit_volume: 0,
+                max_market_volume: 0,
                 long_margin_ratio: 0.0,
                 short_margin_ratio: 0.0,
             });
@@ -2453,13 +2691,13 @@ mod tests {
         // 大商所/郑商所等：柜台自动冲抵今昨，笼统 Close 行为零变化（优先级不参与）。
         for p in [TODAY_FIRST, YESTERDAY_FIRST] {
             assert_eq!(
-                plan_close(3, Some("DCE"), Some((2, 3)), p).unwrap(),
+                plan_close(3, Some("DCE"), Some((2, 3)), &shfe_close_set(), p).unwrap(),
                 ClosePlan::GenericClose
             );
             // 交易所目录尚未预热到该合约（None）：同样按笼统 Close（≠SHFE 分支），
             // SHFE 单会被柜台拒，不会发错显式标志。
             assert_eq!(
-                plan_close(3, None, None, p).unwrap(),
+                plan_close(3, None, None, &shfe_close_set(), p).unwrap(),
                 ClosePlan::GenericClose
             );
         }
@@ -2469,7 +2707,14 @@ mod tests {
     fn close_route_shfe_yesterday_first_within_yesterday_is_single_close_yesterday() {
         // 先平昨：今 5 昨 3，平 3 ≤ 昨仓 → 单笔平昨，完全不碰今仓。
         assert_eq!(
-            plan_close(3, Some("SHFE"), Some((5, 3)), YESTERDAY_FIRST).unwrap(),
+            plan_close(
+                3,
+                Some("SHFE"),
+                Some((5, 3)),
+                &shfe_close_set(),
+                YESTERDAY_FIRST
+            )
+            .unwrap(),
             ClosePlan::ShfeSingle(Offset::CloseYesterday, 3)
         );
     }
@@ -2478,7 +2723,14 @@ mod tests {
     fn close_route_shfe_yesterday_first_no_yesterday_is_single_close_today() {
         // 昨 0 今 2，平 2 → 退化为单笔平今。
         assert_eq!(
-            plan_close(2, Some("SHFE"), Some((2, 0)), YESTERDAY_FIRST).unwrap(),
+            plan_close(
+                2,
+                Some("SHFE"),
+                Some((2, 0)),
+                &shfe_close_set(),
+                YESTERDAY_FIRST
+            )
+            .unwrap(),
             ClosePlan::ShfeSingle(Offset::CloseToday, 2)
         );
     }
@@ -2487,7 +2739,14 @@ mod tests {
     fn close_route_shfe_yesterday_first_cross_split_is_two_legs_yesterday_then_today() {
         // 今 2 昨 3，平 4 → 一单两腿：先平昨 3、再平今 1。
         assert_eq!(
-            plan_close(4, Some("SHFE"), Some((2, 3)), YESTERDAY_FIRST).unwrap(),
+            plan_close(
+                4,
+                Some("SHFE"),
+                Some((2, 3)),
+                &shfe_close_set(),
+                YESTERDAY_FIRST
+            )
+            .unwrap(),
             ClosePlan::ShfeTwo {
                 first: (Offset::CloseYesterday, 3),
                 second: (Offset::CloseToday, 1),
@@ -2499,7 +2758,14 @@ mod tests {
     fn close_route_shfe_today_first_within_today_is_single_close_today() {
         // 默认先平今：今 5 昨 3，平 3 ≤ 今仓 → 单笔平今，完全不碰昨仓。
         assert_eq!(
-            plan_close(3, Some("SHFE"), Some((5, 3)), TODAY_FIRST).unwrap(),
+            plan_close(
+                3,
+                Some("SHFE"),
+                Some((5, 3)),
+                &shfe_close_set(),
+                TODAY_FIRST
+            )
+            .unwrap(),
             ClosePlan::ShfeSingle(Offset::CloseToday, 3)
         );
     }
@@ -2508,7 +2774,14 @@ mod tests {
     fn close_route_shfe_today_first_no_today_is_single_close_yesterday() {
         // 今 0 昨 2，平 2 → 退化为单笔平昨。
         assert_eq!(
-            plan_close(2, Some("SHFE"), Some((0, 2)), TODAY_FIRST).unwrap(),
+            plan_close(
+                2,
+                Some("SHFE"),
+                Some((0, 2)),
+                &shfe_close_set(),
+                TODAY_FIRST
+            )
+            .unwrap(),
             ClosePlan::ShfeSingle(Offset::CloseYesterday, 2)
         );
     }
@@ -2517,7 +2790,14 @@ mod tests {
     fn close_route_shfe_today_first_cross_split_is_two_legs_today_then_yesterday() {
         // 今 2 昨 3，平 4 → 一单两腿：先平今 2、再平昨 2（顺序即实际下发顺序）。
         assert_eq!(
-            plan_close(4, Some("SHFE"), Some((2, 3)), TODAY_FIRST).unwrap(),
+            plan_close(
+                4,
+                Some("SHFE"),
+                Some((2, 3)),
+                &shfe_close_set(),
+                TODAY_FIRST
+            )
+            .unwrap(),
             ClosePlan::ShfeTwo {
                 first: (Offset::CloseToday, 2),
                 second: (Offset::CloseYesterday, 2),
@@ -2530,7 +2810,7 @@ mod tests {
         // 平仓量超过今+昨总仓：拒单（不下半截单，与优先级无关）。
         for p in [TODAY_FIRST, YESTERDAY_FIRST] {
             assert_eq!(
-                plan_close(6, Some("SHFE"), Some((2, 3)), p),
+                plan_close(6, Some("SHFE"), Some((2, 3)), &shfe_close_set(), p),
                 Err(ClosePlanError::InsufficientPosition)
             );
         }
@@ -2541,7 +2821,7 @@ mod tests {
         // SHFE 但路由表无该方向今昨（刚重连/首轮对账未完成）：明确错误，绝不猜测发 Close。
         for p in [TODAY_FIRST, YESTERDAY_FIRST] {
             assert_eq!(
-                plan_close(1, Some("SHFE"), None, p),
+                plan_close(1, Some("SHFE"), None, &shfe_close_set(), p),
                 Err(ClosePlanError::SplitNotReady)
             );
         }
@@ -2556,19 +2836,34 @@ mod tests {
         OrderRequest::limit("rb2510", direction, Offset::Close, 3300.0, volume)
     }
 
+    /// 默认“平今/平昨”交易所集合（仅 SHFE）。
+    fn shfe_close_set() -> Vec<String> {
+        vec!["SHFE".into()]
+    }
+
     /// 取单笔路由结果（panic 于两腿，便于单腿用例断言）。
     fn single_routed<'a>(out: &'a RoutedInsert) -> &'a crate::ctp::core::order::OrderRequest {
         match out {
             RoutedInsert::Single(Cow::Borrowed(r)) => r,
             RoutedInsert::Single(Cow::Owned(r)) => r,
             RoutedInsert::Two { .. } => panic!("期望单笔，实际两腿"),
+            RoutedInsert::Multi(_) => panic!("期望单笔，实际多腿"),
         }
     }
 
     #[test]
     fn routed_insert_non_shfe_close_passes_through_unchanged() {
         let req = close_req(Direction::Sell, 3);
-        let out = routed_insert(&req, Some("DCE"), Some((2, 3)), TODAY_FIRST).unwrap();
+        let out = routed_insert(
+            &req,
+            Some("DCE"),
+            Some((2, 3)),
+            &shfe_close_set(),
+            TODAY_FIRST,
+            None,
+            false,
+        )
+        .unwrap();
         let r = single_routed(&out);
         assert_eq!(r.offset, Offset::Close, "非上期所保持笼统 Close");
         assert_eq!(r.volume, 3);
@@ -2582,7 +2877,16 @@ mod tests {
     fn routed_insert_shfe_yesterday_first_within_yesterday_rewrites_to_close_yesterday() {
         // 先平昨、卖平多头、平量 ≤ 昨仓：Close → CloseYesterday，量/价/方向不变。
         let req = close_req(Direction::Sell, 3);
-        let out = routed_insert(&req, Some("SHFE"), Some((5, 3)), YESTERDAY_FIRST).unwrap();
+        let out = routed_insert(
+            &req,
+            Some("SHFE"),
+            Some((5, 3)),
+            &shfe_close_set(),
+            YESTERDAY_FIRST,
+            None,
+            false,
+        )
+        .unwrap();
         let r = single_routed(&out);
         assert_eq!(r.offset, Offset::CloseYesterday);
         assert_eq!(r.volume, 3);
@@ -2596,7 +2900,16 @@ mod tests {
     fn routed_insert_shfe_today_first_within_today_rewrites_to_close_today() {
         // 默认先平今、平量 ≤ 今仓：Close → CloseToday，完全不碰昨仓。
         let req = close_req(Direction::Buy, 2);
-        let out = routed_insert(&req, Some("SHFE"), Some((4, 1)), TODAY_FIRST).unwrap();
+        let out = routed_insert(
+            &req,
+            Some("SHFE"),
+            Some((4, 1)),
+            &shfe_close_set(),
+            TODAY_FIRST,
+            None,
+            false,
+        )
+        .unwrap();
         let r = single_routed(&out);
         assert_eq!(r.offset, Offset::CloseToday);
         assert_eq!(r.volume, 2);
@@ -2607,7 +2920,16 @@ mod tests {
     fn routed_insert_shfe_yesterday_first_close_today_when_no_yesterday() {
         // 昨仓为 0：退化为单笔平今。
         let req = close_req(Direction::Buy, 2);
-        let out = routed_insert(&req, Some("SHFE"), Some((4, 0)), YESTERDAY_FIRST).unwrap();
+        let out = routed_insert(
+            &req,
+            Some("SHFE"),
+            Some((4, 0)),
+            &shfe_close_set(),
+            YESTERDAY_FIRST,
+            None,
+            false,
+        )
+        .unwrap();
         let r = single_routed(&out);
         assert_eq!(r.offset, Offset::CloseToday);
         assert_eq!(r.volume, 2);
@@ -2617,7 +2939,16 @@ mod tests {
     fn routed_insert_open_is_untouched_even_on_shfe() {
         // 开仓不读交易所/路由表/优先级，原样借用提交。
         let req = OrderRequest::limit("rb2510", Direction::Buy, Offset::Open, 3300.0, 2);
-        let out = routed_insert(&req, Some("SHFE"), None, YESTERDAY_FIRST).unwrap();
+        let out = routed_insert(
+            &req,
+            Some("SHFE"),
+            None,
+            &shfe_close_set(),
+            YESTERDAY_FIRST,
+            None,
+            false,
+        )
+        .unwrap();
         let r = single_routed(&out);
         assert_eq!(r.offset, Offset::Open);
         assert_eq!(r.volume, 2);
@@ -2627,7 +2958,16 @@ mod tests {
     fn routed_insert_shfe_yesterday_first_two_legs_yesterday_then_today() {
         // 先平昨：今 2 昨 3 平 4 → 先平昨 3、再平今 1，同价同方向。
         let req = close_req(Direction::Sell, 4);
-        let out = routed_insert(&req, Some("SHFE"), Some((2, 3)), YESTERDAY_FIRST).unwrap();
+        let out = routed_insert(
+            &req,
+            Some("SHFE"),
+            Some((2, 3)),
+            &shfe_close_set(),
+            YESTERDAY_FIRST,
+            None,
+            false,
+        )
+        .unwrap();
         match out {
             RoutedInsert::Two { first, second } => {
                 assert_eq!(first.offset, Offset::CloseYesterday);
@@ -2646,7 +2986,16 @@ mod tests {
     fn routed_insert_shfe_today_first_two_legs_today_then_yesterday() {
         // 默认先平今：今 2 昨 3 平 4 → 先平今 2、再平昨 2（顺序即下发顺序）。
         let req = close_req(Direction::Sell, 4);
-        let out = routed_insert(&req, Some("SHFE"), Some((2, 3)), TODAY_FIRST).unwrap();
+        let out = routed_insert(
+            &req,
+            Some("SHFE"),
+            Some((2, 3)),
+            &shfe_close_set(),
+            TODAY_FIRST,
+            None,
+            false,
+        )
+        .unwrap();
         match out {
             RoutedInsert::Two { first, second } => {
                 assert_eq!(first.offset, Offset::CloseToday);
@@ -2667,13 +3016,399 @@ mod tests {
         // 未就绪 / 超量都原样冒泡，调用方据此回执明确错误（与优先级无关）。
         for p in [TODAY_FIRST, YESTERDAY_FIRST] {
             assert_eq!(
-                routed_insert(&req, Some("SHFE"), None, p).unwrap_err(),
+                routed_insert(&req, Some("SHFE"), None, &shfe_close_set(), p, None, false)
+                    .unwrap_err(),
                 ClosePlanError::SplitNotReady
             );
             assert_eq!(
-                routed_insert(&req, Some("SHFE"), Some((1, 1)), p).unwrap_err(),
+                routed_insert(
+                    &req,
+                    Some("SHFE"),
+                    Some((1, 1)),
+                    &shfe_close_set(),
+                    p,
+                    None,
+                    false
+                )
+                .unwrap_err(),
                 ClosePlanError::InsufficientPosition
             );
+        }
+    }
+
+    // ---- 按合约单笔上限拆腿（Phase 2）----
+
+    #[test]
+    fn split_legs_chunks_single_leg_in_order() {
+        let out = split_legs(vec![(Offset::Close, 81)], 20);
+        assert_eq!(
+            out,
+            vec![
+                (Offset::Close, 20),
+                (Offset::Close, 20),
+                (Offset::Close, 20),
+                (Offset::Close, 20),
+                (Offset::Close, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_legs_keeps_legs_within_limit() {
+        let legs = vec![(Offset::CloseToday, 5), (Offset::CloseYesterday, 7)];
+        assert_eq!(split_legs(legs.clone(), 20), legs);
+    }
+
+    #[test]
+    fn split_legs_zero_max_is_noop() {
+        let legs = vec![(Offset::Close, 81)];
+        assert_eq!(split_legs(legs.clone(), 0), legs);
+    }
+
+    #[test]
+    fn split_legs_chunks_today_and_yesterday_independently() {
+        // 今 25 / 昨 25，max 20 → 今 20+5、昨 20+5（顺序保持）。
+        let out = split_legs(
+            vec![(Offset::CloseToday, 25), (Offset::CloseYesterday, 25)],
+            20,
+        );
+        assert_eq!(
+            out,
+            vec![
+                (Offset::CloseToday, 20),
+                (Offset::CloseToday, 5),
+                (Offset::CloseYesterday, 20),
+                (Offset::CloseYesterday, 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn routed_insert_cffex_close_81_splits_into_five_legs() {
+        let req = close_req(Direction::Buy, 81);
+        let out = routed_insert(
+            &req,
+            Some("CFFEX"),
+            None,
+            &shfe_close_set(),
+            TODAY_FIRST,
+            Some(20),
+            true,
+        )
+        .unwrap();
+        match out {
+            RoutedInsert::Multi(legs) => {
+                assert_eq!(
+                    legs.iter().map(|l| l.volume).collect::<Vec<_>>(),
+                    vec![20, 20, 20, 20, 1]
+                );
+                assert!(legs.iter().all(|l| l.offset == Offset::Close));
+                assert!(legs.iter().all(|l| l.direction == Direction::Buy));
+            }
+            _ => panic!("期望多腿"),
+        }
+    }
+
+    #[test]
+    fn routed_insert_cffex_close_48_splits_into_three_legs() {
+        let req = close_req(Direction::Buy, 48);
+        let out = routed_insert(
+            &req,
+            Some("CFFEX"),
+            None,
+            &shfe_close_set(),
+            TODAY_FIRST,
+            Some(20),
+            true,
+        )
+        .unwrap();
+        match out {
+            RoutedInsert::Multi(legs) => {
+                assert_eq!(
+                    legs.iter().map(|l| l.volume).collect::<Vec<_>>(),
+                    vec![20, 20, 8]
+                );
+            }
+            _ => panic!("期望多腿"),
+        }
+    }
+
+    #[test]
+    fn routed_insert_split_disabled_keeps_single_leg() {
+        // 交易所未配置拆单：81 手原样单腿（由柜台拒单收敛，不擅自拆）。
+        let req = close_req(Direction::Buy, 81);
+        let out = routed_insert(
+            &req,
+            Some("CFFEX"),
+            None,
+            &shfe_close_set(),
+            TODAY_FIRST,
+            Some(20),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(out, RoutedInsert::Single(Cow::Borrowed(_))));
+    }
+
+    #[test]
+    fn routed_insert_shfe_today_yesterday_then_size_split() {
+        // 今 25 / 昨 25 平 50，max 20 → 4 腿：今 20/5、昨 20/5。
+        let req = close_req(Direction::Sell, 50);
+        let out = routed_insert(
+            &req,
+            Some("SHFE"),
+            Some((25, 25)),
+            &shfe_close_set(),
+            TODAY_FIRST,
+            Some(20),
+            true,
+        )
+        .unwrap();
+        match out {
+            RoutedInsert::Multi(legs) => {
+                assert_eq!(
+                    legs.iter()
+                        .map(|l| (l.offset, l.volume))
+                        .collect::<Vec<_>>(),
+                    vec![
+                        (Offset::CloseToday, 20),
+                        (Offset::CloseToday, 5),
+                        (Offset::CloseYesterday, 20),
+                        (Offset::CloseYesterday, 5),
+                    ]
+                );
+            }
+            _ => panic!("期望多腿"),
+        }
+    }
+
+    #[test]
+    fn allocate_leg_refs_reuses_first_and_allocates_rest() {
+        let (ctx, _rx) = ctx_and_rx();
+        let cid = long_cid("S");
+        let first = ctx.order_refs.allocate(&cid);
+        let refs = allocate_leg_refs(&ctx, &cid, &first, 5);
+        assert_eq!(refs.len(), 5);
+        assert_eq!(refs[0], first);
+        assert_eq!(
+            refs.iter().collect::<std::collections::HashSet<_>>().len(),
+            5
+        );
+        for r in &refs {
+            assert_eq!(ctx.order_refs.cid_of(r).as_deref(), Some(cid.as_str()));
+        }
+    }
+
+    // ---- 平今/平昨交易所配置化（Phase 3）----
+
+    #[test]
+    fn routed_insert_cffex_close_is_generic_with_shfe_only_set() {
+        // CFFEX 不在平今/平昨集合：即使有今昨分布也走笼统 Close。
+        let req = close_req(Direction::Buy, 10);
+        let out = routed_insert(
+            &req,
+            Some("CFFEX"),
+            Some((0, 10)),
+            &shfe_close_set(),
+            TODAY_FIRST,
+            None,
+            false,
+        )
+        .unwrap();
+        let r = single_routed(&out);
+        assert_eq!(r.offset, Offset::Close);
+        assert_eq!(r.volume, 10);
+    }
+
+    #[test]
+    fn routed_insert_empty_close_set_is_generic_even_for_shfe() {
+        // 空集合 = 所有交易所都不拆今昨（含 SHFE）。
+        let req = close_req(Direction::Sell, 3);
+        let empty: Vec<String> = Vec::new();
+        let out = routed_insert(
+            &req,
+            Some("SHFE"),
+            Some((2, 3)),
+            &empty,
+            TODAY_FIRST,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(out, RoutedInsert::Single(Cow::Borrowed(_))));
+    }
+
+    #[test]
+    fn routed_insert_close_set_is_case_insensitive() {
+        // 配置大小写/空白容错： " shfe " 仍命中 SHFE。
+        let req = close_req(Direction::Sell, 3);
+        let set = vec![" shfe ".to_string()];
+        let out = routed_insert(
+            &req,
+            Some("SHFE"),
+            Some((5, 3)),
+            &set,
+            YESTERDAY_FIRST,
+            None,
+            false,
+        )
+        .unwrap();
+        let r = single_routed(&out);
+        assert_eq!(r.offset, Offset::CloseYesterday);
+    }
+
+    // ---- N 腿提交失败语义 / 5 腿撤单 ----
+
+    fn multi_leg_req(volume: i32) -> OrderRequest {
+        OrderRequest::limit("rb2510", Direction::Buy, Offset::Close, 3300.0, volume)
+    }
+
+    #[test]
+    fn prepare_multi_leg_refs_short_cid_fails_closed() {
+        let (ctx, _rx) = ctx_and_rx();
+        let req = multi_leg_req(81);
+        // 未登记的短 cid：cid_of 返回 None → 确定性拒绝，首腿映射被清理。
+        let err = prepare_multi_leg_refs(&ctx, &req, "shortcid", 5).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<crate::ctp::place_error::CtpPlaceError>(),
+            Some(crate::ctp::place_error::CtpPlaceError::Rejected(_))
+        ));
+        assert!(ctx.order_refs.cid_of("shortcid").is_none());
+    }
+
+    fn info_with_limits(
+        max_limit: i32,
+        max_market: i32,
+    ) -> crate::ctp::core::event::InstrumentInfo {
+        crate::ctp::core::event::InstrumentInfo {
+            instrument: "rb2510".into(),
+            exchange_id: "CFFEX".into(),
+            product_id: "rb".into(),
+            is_trading: true,
+            volume_multiple: 10,
+            price_tick: 1.0,
+            max_limit_volume: max_limit,
+            max_market_volume: max_market,
+            long_margin_ratio: 0.0,
+            short_margin_ratio: 0.0,
+        }
+    }
+
+    #[test]
+    fn resolve_split_max_volume_fails_closed_on_unknown_limit() {
+        let (ctx, _rx) = ctx_and_rx();
+        let req = multi_leg_req(81); // LimitPrice
+                                     // 未配置拆单：Ok(None)，不关心目录。
+        assert_eq!(resolve_split_max_volume(&ctx, &req, false).unwrap(), None);
+        // 配置拆单但目录未预热：Indeterminate（待预热后重试）。
+        let err = resolve_split_max_volume(&ctx, &req, true).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<crate::ctp::place_error::CtpPlaceError>(),
+            Some(crate::ctp::place_error::CtpPlaceError::Indeterminate(_))
+        ));
+        // 柜台上限 0：Rejected（无法安全拆单）。
+        ctx.instrument_dir.remember(info_with_limits(0, 0));
+        let err = resolve_split_max_volume(&ctx, &req, true).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<crate::ctp::place_error::CtpPlaceError>(),
+            Some(crate::ctp::place_error::CtpPlaceError::Rejected(_))
+        ));
+        // 上限 20：Ok(Some(20))。
+        ctx.instrument_dir.remember(info_with_limits(20, 10));
+        assert_eq!(
+            resolve_split_max_volume(&ctx, &req, true).unwrap(),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn submit_legs_in_order_first_failure_rejects_and_cleans_all_refs() {
+        let (ctx, _rx) = ctx_and_rx();
+        let cid = long_cid("M");
+        let first = ctx.order_refs.allocate(&cid);
+        let legs = vec![multi_leg_req(20), multi_leg_req(20), multi_leg_req(20)];
+        let refs = allocate_leg_refs(&ctx, &cid, &first, legs.len());
+        let err = submit_legs_in_order(&ctx, &refs, &legs, |i, _, _| {
+            if i == 0 {
+                Err(crate::ctp::place_error::CtpPlaceError::rejected("boom"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<crate::ctp::place_error::CtpPlaceError>(),
+            Some(crate::ctp::place_error::CtpPlaceError::Rejected(_))
+        ));
+        for r in &refs {
+            assert!(ctx.order_refs.cid_of(r).is_none(), "首腿失败应清理全部 ref");
+        }
+    }
+
+    #[test]
+    fn submit_legs_in_order_middle_failure_keeps_accepted_refs_and_is_indeterminate() {
+        let (ctx, _rx) = ctx_and_rx();
+        let cid = long_cid("M");
+        let first = ctx.order_refs.allocate(&cid);
+        let legs = vec![multi_leg_req(20), multi_leg_req(20), multi_leg_req(20)];
+        let refs = allocate_leg_refs(&ctx, &cid, &first, legs.len());
+        let err = submit_legs_in_order(&ctx, &refs, &legs, |i, _, _| {
+            if i == 1 {
+                Err(anyhow::anyhow!("boom"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<crate::ctp::place_error::CtpPlaceError>(),
+            Some(crate::ctp::place_error::CtpPlaceError::Indeterminate(_))
+        ));
+        // 第 0 腿已受理：ref 保留；第 1/2 腿 ref 清理。
+        assert_eq!(
+            ctx.order_refs.cid_of(&refs[0]).as_deref(),
+            Some(cid.as_str())
+        );
+        assert!(ctx.order_refs.cid_of(&refs[1]).is_none());
+        assert!(ctx.order_refs.cid_of(&refs[2]).is_none());
+    }
+
+    #[test]
+    fn submit_legs_in_order_rejects_ref_leg_count_mismatch() {
+        // 防御：refs 少于 legs 时不得静默截断，必须拒绝并清理全部 ref。
+        let (ctx, _rx) = ctx_and_rx();
+        let cid = long_cid("M");
+        let first = ctx.order_refs.allocate(&cid);
+        let legs = vec![multi_leg_req(20), multi_leg_req(20), multi_leg_req(20)];
+        let refs = allocate_leg_refs(&ctx, &cid, &first, 2);
+        let err = submit_legs_in_order(&ctx, &refs, &legs, |_, _, _| Ok(())).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<crate::ctp::place_error::CtpPlaceError>(),
+            Some(crate::ctp::place_error::CtpPlaceError::Rejected(_))
+        ));
+        for r in &refs {
+            assert!(ctx.order_refs.cid_of(r).is_none());
+        }
+    }
+
+    #[test]
+    fn cancel_targets_address_all_five_legs() {
+        let refs: Vec<String> = (1..=5).map(|i| format!("r{i}")).collect();
+        let targets = two_leg_cancel_targets(&refs, 7, 9001);
+        assert_eq!(targets.len(), 5);
+        use crate::ctp::mailbox::CancelTarget;
+        for (orig, target) in &targets {
+            match target {
+                CancelTarget::ByOrderRef {
+                    front_id,
+                    session_id,
+                    order_ref,
+                } => {
+                    assert_eq!((*front_id, *session_id), (7, 9001));
+                    assert_eq!(order_ref, orig);
+                }
+                _ => panic!("本会话腿应走三元组"),
+            }
         }
     }
 
@@ -2694,6 +3429,8 @@ mod tests {
             leg_table: Arc::new(crate::ctp::leg_table::LegTable::new()),
             pending_terminal: Arc::new(crate::ctp::pending_terminal::PendingTerminalTable::new()),
             shfe_close_priority: ShfeClosePriority::default(),
+            close_today_yesterday_exchanges: vec!["SHFE".into()],
+            split_max_volume_exchanges: Vec::new(),
             tx,
             debouncer: Arc::new(Mutex::new(crate::reconcile::ReconcileDebouncer::new(
                 500, 60_000,
@@ -2725,6 +3462,8 @@ mod tests {
             is_trading: true,
             volume_multiple: 10,
             price_tick: 1.0,
+            max_limit_volume: 0,
+            max_market_volume: 0,
             long_margin_ratio: 0.0,
             short_margin_ratio: 0.0,
         });
@@ -2734,11 +3473,13 @@ mod tests {
         eid: &str,
         hint: Option<&str>,
         trading_day: &str,
+        cid: &str,
     ) -> (Option<ActiveQuery>, OneRx<crate::api::OrderLookup>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (
             Some(ActiveQuery::FrontOrder {
                 instrument: "rb2510".into(),
+                client_order_id: cid.into(),
                 exchange_order_id: eid.into(),
                 hint: hint.map(str::to_string),
                 trading_day: trading_day.into(),
@@ -2754,7 +3495,8 @@ mod tests {
         // Arrange：前台查单在途，喂一行系统号匹配的查询行。
         let (ctx, mut bridge_rx) = ctx_and_rx();
         let h = handle();
-        let (mut active, mut lookup_rx) = front_order_active("20260101-2", None, "20260101");
+        let (mut active, mut lookup_rx) =
+            front_order_active("20260101-2", None, "20260101", &long_cid("Q"));
         dispatch_event(
             CtpEvent::OrderQuery(qrow("101", "20260101-2", "SHFE", "rb2510")),
             &h,
@@ -2773,6 +3515,33 @@ mod tests {
             }
             other => panic!("期望 Found，实际 {other:?}"),
         }
+        assert!(active.is_none(), "QueryEnd 必须清空在途闸门");
+    }
+
+    #[test]
+    fn front_order_query_with_multiple_expected_legs_returns_unavailable() {
+        // Arrange：同一 cid 已登记 2 条物理腿；当日委托查询喂一行系统号匹配的单腿。
+        let (ctx, _bridge_rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("Q");
+        ctx.order_refs.allocate(&cid);
+        ctx.order_refs.allocate(&cid);
+        let (mut active, mut lookup_rx) = front_order_active("20260101-2", None, "20260101", &cid);
+        dispatch_event(
+            CtpEvent::OrderQuery(qrow("101", "20260101-2", "SHFE", "rb2510")),
+            &h,
+            &ctx,
+            &mut active,
+        );
+
+        // Act：QueryEnd 收尾。
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+
+        // Assert：多腿不得返回单腿 Found，必须 Unavailable 让上层下轮再查。
+        assert!(matches!(
+            lookup_rx.try_recv(),
+            Ok(crate::api::OrderLookup::Unavailable)
+        ));
         assert!(active.is_none(), "QueryEnd 必须清空在途闸门");
     }
 
@@ -2808,7 +3577,8 @@ mod tests {
         // Arrange：查询返回的行无一匹配。
         let (ctx, _rx) = ctx_and_rx();
         let h = handle();
-        let (mut active, mut lookup_rx) = front_order_active("missing", None, "20260101");
+        let (mut active, mut lookup_rx) =
+            front_order_active("missing", None, "20260101", &long_cid("Q"));
         dispatch_event(
             CtpEvent::OrderQuery(qrow("101", "20260101-9", "SHFE", "rb2510")),
             &h,
@@ -2831,7 +3601,8 @@ mod tests {
         // Arrange：eid 交易日(20260901) ≠ 当前登录交易日(20261021)，当日委托簿查无此历史单。
         let (ctx, _rx) = ctx_and_rx();
         let h = handle();
-        let (mut active, mut lookup_rx) = front_order_active("20260901-2", None, "20261021");
+        let (mut active, mut lookup_rx) =
+            front_order_active("20260901-2", None, "20261021", &long_cid("Q"));
         // 柜台只回当日报单，无一匹配该历史系统号。
         dispatch_event(
             CtpEvent::OrderQuery(qrow("101", "20261021-9", "SHFE", "rb2510")),
@@ -2860,7 +3631,8 @@ mod tests {
         // Arrange：即便 eid 非今日，只要当日簿里确实匹配到行，就以真实行为准（select 优先）。
         let (ctx, _rx) = ctx_and_rx();
         let h = handle();
-        let (mut active, mut lookup_rx) = front_order_active("20260901-2", None, "20261021");
+        let (mut active, mut lookup_rx) =
+            front_order_active("20260901-2", None, "20261021", &long_cid("Q"));
         dispatch_event(
             CtpEvent::OrderQuery(qrow("101", "20260901-2", "SHFE", "rb2510")),
             &h,
@@ -2943,6 +3715,8 @@ mod tests {
                 is_trading: true,
                 volume_multiple: 10,
                 price_tick: 1.0,
+                max_limit_volume: 0,
+                max_market_volume: 0,
                 long_margin_ratio: 0.0,
                 short_margin_ratio: 0.0,
             }),
@@ -3081,6 +3855,8 @@ mod tests {
             is_trading: true,
             volume_multiple: 10,
             price_tick: 1.0,
+            max_limit_volume: 0,
+            max_market_volume: 0,
             long_margin_ratio: 0.07,
             short_margin_ratio: 0.07,
         });
@@ -3264,7 +4040,8 @@ mod tests {
         // Arrange：前台查单在途（查询行进缓冲），此时来一帧**实时**委托回报。
         let (ctx, mut bridge_rx) = ctx_and_rx();
         let h = handle();
-        let (mut active, _lookup_rx) = front_order_active("20260101-2", None, "20260101");
+        let (mut active, _lookup_rx) =
+            front_order_active("20260101-2", None, "20260101", &long_cid("Q"));
 
         // Act：先发查询行（被缓冲），再发实时回报（必须透传）。
         dispatch_event(
@@ -3289,7 +4066,8 @@ mod tests {
         // Arrange：前台查单在途，持有未回执 oneshot。
         let (ctx, _rx) = ctx_and_rx();
         let h = handle();
-        let (active, mut lookup_rx) = front_order_active("20260101-2", None, "20260101");
+        let (active, mut lookup_rx) =
+            front_order_active("20260101-2", None, "20260101", &long_cid("Q"));
 
         // Act：模拟断线/循环退出——inner_loop return 时 active 被 drop（发送端关闭）。
         drop(active);

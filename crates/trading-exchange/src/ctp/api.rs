@@ -60,6 +60,8 @@ pub struct CtpApi {
     quotes: std::sync::Arc<trading_core::quote::QuoteTable>,
     /// SHFE 市价开仓穿价漂移档数（CTP 独立配置）。
     shfe_drift_ticks: i64,
+    /// 哪些交易所的市价单转对手价限价（默认 SHFE；CFFEX 需加入）。
+    market_limit_exchanges: Vec<String>,
 }
 
 impl CtpApi {
@@ -71,6 +73,7 @@ impl CtpApi {
         instrument_dir: std::sync::Arc<crate::ctp::instrument_dir::InstrumentDir>,
         quotes: std::sync::Arc<trading_core::quote::QuoteTable>,
         shfe_drift_ticks: i64,
+        market_limit_exchanges: Vec<String>,
     ) -> Self {
         Self {
             account,
@@ -79,6 +82,7 @@ impl CtpApi {
             instrument_dir,
             quotes,
             shfe_drift_ticks,
+            market_limit_exchanges,
         }
     }
 }
@@ -101,6 +105,7 @@ impl ExchangeApi for CtpApi {
             &self.instrument_dir,
             &self.quotes,
             self.shfe_drift_ticks,
+            &self.market_limit_exchanges,
             req.clone(),
         ) {
             Ok(prepared) => prepared,
@@ -227,6 +232,7 @@ impl ExchangeApi for CtpApi {
         self.mailbox
             .submit(SessionRequest::QueryOrder(QueryOrderJob {
                 instrument: instrument.to_string(),
+                client_order_id: order.client_order_id.clone(),
                 exchange_order_id: order.exchange_order_id.clone().unwrap_or_default(),
                 order_ref_hint: hint,
                 reply: reply_tx,
@@ -324,6 +330,7 @@ mod tests {
             instrument_dir,
             quotes,
             1,
+            vec!["SHFE".into()],
         )
     }
 
@@ -347,6 +354,8 @@ mod tests {
             is_trading: true,
             volume_multiple: 10,
             price_tick: 1.0,
+            max_limit_volume: 0,
+            max_market_volume: 0,
             long_margin_ratio: 0.0,
             short_margin_ratio: 0.0,
         });
@@ -450,6 +459,8 @@ mod tests {
             is_trading: true,
             volume_multiple: 100,
             price_tick: 0.5,
+            max_limit_volume: 0,
+            max_market_volume: 0,
             long_margin_ratio: 0.0,
             short_margin_ratio: 0.0,
         });
@@ -503,6 +514,8 @@ mod tests {
             is_trading: true,
             volume_multiple: 10,
             price_tick: 1.0,
+            max_limit_volume: 0,
+            max_market_volume: 0,
             long_margin_ratio: 0.0,
             short_margin_ratio: 0.0,
         });

@@ -185,6 +185,22 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_five_legs_partial_fill_and_partial_cancel() {
+        // 5 腿：2 腿全成、3 腿撤销 → 终态部分成交，成交量求和、总量 81。
+        let legs = vec![
+            leg("1", OrderStatus::AllTraded, 20, 20, "s1"),
+            leg("2", OrderStatus::AllTraded, 20, 20, "s2"),
+            leg("3", OrderStatus::Cancelled, 20, 0, "s3"),
+            leg("4", OrderStatus::Cancelled, 20, 0, "s4"),
+            leg("5", OrderStatus::Cancelled, 1, 0, "s5"),
+        ];
+        let agg = aggregate(&legs).unwrap();
+        assert_eq!((agg.filled, agg.total), (40, 81));
+        assert!(agg.all_terminal);
+        assert_eq!(agg.status, OrderStatus::PartTradedNotQueueing);
+    }
+
+    #[test]
     fn aggregate_not_terminal_until_every_leg_terminal() {
         // 一腿全成终态、另一腿仍排队：逻辑单不得提前 Filled。
         let legs = vec![

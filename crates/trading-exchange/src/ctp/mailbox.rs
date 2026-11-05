@@ -74,6 +74,9 @@ pub struct CancelJob {
 pub struct QueryOrderJob {
     /// 合约代码（空串查全部）。
     pub instrument: String,
+    /// 逻辑单 cid（同一 cid 可对应多物理腿；会话线程据此判断 expected_legs，
+    /// 多腿时 REST 查单不能把单腿状态当整单终态）。
+    pub client_order_id: String,
     /// 首选匹配值：受理后升级的 OrderSysID（OrderRef.exchange_order_id，可空）。
     pub exchange_order_id: String,
     /// 兜底匹配值：同进程 cid→registry 反查出的本会话 OrderRef（重启后为 None）。
@@ -249,6 +252,7 @@ mod tests {
         std::mem::forget(rx); // 模拟调用方仍在等待回执（接收端保活）。
         SessionRequest::QueryOrder(QueryOrderJob {
             instrument: "rb2510".into(),
+            client_order_id: "0xcid".into(),
             exchange_order_id: "20260101-7".into(),
             order_ref_hint: None,
             reply: tx,

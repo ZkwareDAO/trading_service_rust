@@ -285,14 +285,16 @@ pub(crate) fn read_ctp_book(
 /// CTP 市价单的统一预检（**规则引擎与手动 API 共用同一组件**）：
 /// 非市价原样透传；合约静态信息未预热 → `DataNotReady`。
 ///
-/// * **非 SHFE**（DCE 等）：走原生 `AnyPrice+IOC`，但先按委托方向预检对手盘
-///   （`Buy` 需 ask、`Sell` 需 bid）；缺失 → `DataNotReady`，规则保活下轮重试，
-///   避免柜台无对手盘立即全撤、0 成交被收敛为终态；
-/// * **SHFE**：读盘口 + 最小变动价位，交 [`prepare_shfe_market_limit`] 转穿价限价 GFD。
+/// * **不在 `market_limit_exchanges` 内**（DCE/CZCE 等）：走原生 `AnyPrice+IOC`，
+///   但先按委托方向预检对手盘（`Buy` 需 ask、`Sell` 需 bid）；缺失 →
+///   `DataNotReady`，规则保活下轮重试，避免柜台无对手盘立即全撤、0 成交被收敛为终态；
+/// * **在 `market_limit_exchanges` 内**（默认 SHFE；CFFEX 不支持 AnyPrice 需加入）：
+///   读盘口 + 最小变动价位，交 [`prepare_shfe_market_limit`] 转穿价限价 GFD。
 pub(crate) fn prepare_ctp_market(
     dir: &crate::ctp::instrument_dir::InstrumentDir,
     quotes: &trading_core::quote::QuoteTable,
     drift_ticks: i64,
+    market_limit_exchanges: &[String],
     request: PlaceOrderRequest,
 ) -> Result<PlaceOrderRequest, PlaceDefer> {
     if request.order_type != OrderType::Market {
@@ -302,8 +304,10 @@ pub(crate) fn prepare_ctp_market(
         return Err(PlaceDefer::DataNotReady);
     };
     let book = read_ctp_book(quotes, &request.instrument);
-    if info.exchange_id.trim() != crate::ctp::venue::SHFE_EXCHANGE_ID {
-        // 非 SHFE 不转限价，只校验对手侧是否存在（开平一致：Buy 吃卖一、Sell 吃买一）。
+    let should_limit =
+        crate::ctp::config::exchange_in_set(&info.exchange_id, market_limit_exchanges);
+    if !should_limit {
+        // 不转限价，只校验对手侧是否存在（开平一致：Buy 吃卖一、Sell 吃买一）。
         if book.and_then(|b| b.opposite(request.side)).is_none() {
             return Err(PlaceDefer::DataNotReady);
         }
@@ -885,6 +889,8 @@ mod tests {
             is_trading: true,
             volume_multiple: 10,
             price_tick: 1.0,
+            max_limit_volume: 0,
+            max_market_volume: 0,
             long_margin_ratio: 0.0,
             short_margin_ratio: 0.0,
         });
@@ -899,6 +905,11 @@ mod tests {
             reduce_only,
             ..place_req()
         }
+    }
+
+    /// 默认“市价转限价”交易所集合（保持现有 SHFE 行为）。
+    fn shfe_only() -> Vec<String> {
+        vec!["SHFE".into()]
     }
 
     /// 构造 CTP 期货行情表；`None` 表示该侧无报价（涨停/跌停/未订阅）。
@@ -918,6 +929,7 @@ mod tests {
             &non_shfe_dir(),
             &quotes_with(Some(600.0), None),
             1,
+            &shfe_only(),
             non_shfe_market_req(Side::Buy, false),
         );
         assert_eq!(got.unwrap_err(), PlaceDefer::DataNotReady);
@@ -930,6 +942,7 @@ mod tests {
             &non_shfe_dir(),
             &quotes_with(None, Some(601.0)),
             1,
+            &shfe_only(),
             non_shfe_market_req(Side::Sell, true),
         );
         assert_eq!(got.unwrap_err(), PlaceDefer::DataNotReady);
@@ -942,6 +955,7 @@ mod tests {
             &non_shfe_dir(),
             &quotes_with(None, Some(601.0)),
             1,
+            &shfe_only(),
             non_shfe_market_req(Side::Buy, false),
         )
         .unwrap();
@@ -956,6 +970,7 @@ mod tests {
             &non_shfe_dir(),
             &quotes_with(Some(600.0), None),
             1,
+            &shfe_only(),
             non_shfe_market_req(Side::Sell, true),
         )
         .unwrap();
@@ -969,6 +984,7 @@ mod tests {
             &non_shfe_dir(),
             &QuoteTable::new(),
             1,
+            &shfe_only(),
             non_shfe_market_req(Side::Buy, false),
         );
         assert_eq!(got.unwrap_err(), PlaceDefer::DataNotReady);
@@ -977,9 +993,71 @@ mod tests {
     #[test]
     fn non_shfe_limit_passes_without_book() {
         // 限价单不读盘口，无行情也放行。
-        let out = prepare_ctp_market(&non_shfe_dir(), &QuoteTable::new(), 1, place_req()).unwrap();
+        let out = prepare_ctp_market(
+            &non_shfe_dir(),
+            &QuoteTable::new(),
+            1,
+            &shfe_only(),
+            place_req(),
+        )
+        .unwrap();
         assert_eq!(out.order_type, OrderType::Limit);
         assert_eq!(out.price, Some(d(3205.0)));
+    }
+
+    // ---- CFFEX 市价单：配置后转对手价限价（CFFEX 不支持 AnyPrice）----
+
+    /// CFFEX 合约目录（与 `place_req` 同合约号，交易所改为 CFFEX）。
+    fn cffex_dir() -> InstrumentDir {
+        let dir = InstrumentDir::new();
+        dir.remember(InstrumentInfo {
+            instrument: "rb2510".into(),
+            exchange_id: "CFFEX".into(),
+            product_id: "rb".into(),
+            is_trading: true,
+            volume_multiple: 10,
+            price_tick: 0.2,
+            max_limit_volume: 0,
+            max_market_volume: 0,
+            long_margin_ratio: 0.0,
+            short_margin_ratio: 0.0,
+        });
+        dir
+    }
+
+    fn shfe_and_cffex() -> Vec<String> {
+        vec!["SHFE".into(), "CFFEX".into()]
+    }
+
+    #[test]
+    fn cffex_market_is_converted_to_limit_when_configured() {
+        // CFFEX 不支持 AnyPrice：配置后市价买平（reduce_only）转对手价（卖一）
+        // 限价 GFD；平仓不漂移，价格即卖一 601。
+        let out = prepare_ctp_market(
+            &cffex_dir(),
+            &quotes_with(Some(600.0), Some(601.0)),
+            1,
+            &shfe_and_cffex(),
+            non_shfe_market_req(Side::Buy, true),
+        )
+        .unwrap();
+        assert_eq!(out.order_type, OrderType::Limit);
+        assert_eq!(out.price, Some(d(601.0)));
+    }
+
+    #[test]
+    fn cffex_market_stays_market_when_not_configured() {
+        // 未配置 CFFEX：保持原有 AnyPrice+IOC 行为（回归保护）。
+        let out = prepare_ctp_market(
+            &cffex_dir(),
+            &quotes_with(Some(600.0), Some(601.0)),
+            1,
+            &shfe_only(),
+            non_shfe_market_req(Side::Buy, false),
+        )
+        .unwrap();
+        assert_eq!(out.order_type, OrderType::Market);
+        assert_eq!(out.price, None);
     }
 
     // ---- read_ctp_book 边界：零/负价过滤、无行/无 book ----

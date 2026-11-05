@@ -233,6 +233,8 @@ impl CtpVenueConnector {
             leg_table: Arc::new(crate::ctp::leg_table::LegTable::new()),
             pending_terminal: Arc::new(crate::ctp::pending_terminal::PendingTerminalTable::new()),
             shfe_close_priority: self.config.shfe_close_priority,
+            close_today_yesterday_exchanges: self.config.close_today_yesterday_exchanges.clone(),
+            split_max_volume_exchanges: self.config.split_max_volume_exchanges.clone(),
             tx,
             debouncer: Arc::new(Mutex::new(crate::reconcile::ReconcileDebouncer::new(
                 account_stream_millis(self.debounce),

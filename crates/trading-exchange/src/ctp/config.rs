@@ -35,6 +35,14 @@ pub struct CtpConfig {
     /// SHFE 平仓腿先后顺序：`today_first`（默认，先平今）/ `yesterday_first`
     /// （旧行为，先平昨）。两腿的实际 `ReqOrderInsert` 调用顺序即由此决定。
     pub shfe_close_priority: ShfeClosePriority,
+    /// 哪些交易所的市价单必须转对手价限价（这些交易所不支持 CTP `AnyPrice`）。
+    /// 默认 `["SHFE"]`；CFFEX 不支持 AnyPrice，需显式加入。
+    pub market_limit_exchanges: Vec<String>,
+    /// 哪些交易所需要显式拆平今/平昨（复用 SHFE 平仓路由逻辑）。
+    /// 默认 `["SHFE"]`；CFFEX 不需要；INE 真机验证后可加入。
+    pub close_today_yesterday_exchanges: Vec<String>,
+    /// 哪些交易所按合约单笔上限拆单。默认空 = 完全不拆（现有行为不变）。
+    pub split_max_volume_exchanges: Vec<String>,
     /// 主力选举指标：`volume`=当日累计成交量 / `open_interest`=当日持仓量（默认）。
     pub main_contract_criteria: DominantMetric,
     /// 主力切换确认天数：同一候选连续 N 个有数据交易日胜出才切换（默认 3；1=当天生效）。
@@ -61,6 +69,38 @@ pub const DEFAULT_SHFE_MARKET_DRIFT_TICKS: i64 = 1;
 /// 主力切换确认天数缺省值（连续 3 个有数据交易日胜出才切换）。
 pub const DEFAULT_MAIN_CONTRACT_CONFIRM_DAYS: u32 = 3;
 
+/// 默认需要“市价转限价”的交易所（SHFE/INE 柜台不支持 CTP `AnyPrice`）。
+pub const DEFAULT_MARKET_LIMIT_EXCHANGES: &[&str] = &["SHFE"];
+
+/// 默认需要显式拆平今/平昨的交易所。
+pub const DEFAULT_CLOSE_TODAY_YESTERDAY_EXCHANGES: &[&str] = &["SHFE"];
+
+/// 交易所代码归一：trim + ASCII 大写 + 去空 + 去重（保持首次出现顺序）。
+pub fn normalize_exchange_codes(codes: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(codes.len());
+    for code in codes {
+        let code = code.trim().to_ascii_uppercase();
+        if !code.is_empty() && !out.iter().any(|c| c == &code) {
+            out.push(code);
+        }
+    }
+    out
+}
+
+/// 交易所代码是否在配置集合内（双方 trim + ASCII 大小写不敏感）。
+///
+/// 配置加载时已归一化，但规则/API 路径也可能直接构造集合（测试、热加载），
+/// 这里统一兜底，避免各处重复实现容错口径。
+pub fn exchange_in_set(exchange: &str, set: &[String]) -> bool {
+    let exchange = exchange.trim();
+    set.iter().any(|e| e.trim().eq_ignore_ascii_case(exchange))
+}
+
+/// 常量列表 → `Vec<String>` 缺省值。
+fn default_exchanges(codes: &[&str]) -> Vec<String> {
+    codes.iter().map(|s| (*s).to_string()).collect()
+}
+
 impl CtpConfig {
     /// vendored 缺省：仓库内 v6.7.13 linux64 动态库 + 系统临时流目录。
     pub fn vendored() -> Self {
@@ -78,6 +118,11 @@ impl CtpConfig {
             md_pass_is_authcode: false,
             shfe_market_drift_ticks: DEFAULT_SHFE_MARKET_DRIFT_TICKS,
             shfe_close_priority: ShfeClosePriority::default(),
+            market_limit_exchanges: default_exchanges(DEFAULT_MARKET_LIMIT_EXCHANGES),
+            close_today_yesterday_exchanges: default_exchanges(
+                DEFAULT_CLOSE_TODAY_YESTERDAY_EXCHANGES,
+            ),
+            split_max_volume_exchanges: Vec::new(),
             main_contract_criteria: DominantMetric::default(),
             main_contract_confirm_days: DEFAULT_MAIN_CONTRACT_CONFIRM_DAYS,
             preset_dominants: Vec::new(),
@@ -98,6 +143,24 @@ impl CtpConfig {
         self
     }
 
+    /// 覆盖“市价转限价”交易所集合（builder 风格；自动归一）。
+    pub fn with_market_limit_exchanges(mut self, exchanges: Vec<String>) -> Self {
+        self.market_limit_exchanges = normalize_exchange_codes(exchanges);
+        self
+    }
+
+    /// 覆盖“平今/平昨”交易所集合（builder 风格；自动归一）。
+    pub fn with_close_today_yesterday_exchanges(mut self, exchanges: Vec<String>) -> Self {
+        self.close_today_yesterday_exchanges = normalize_exchange_codes(exchanges);
+        self
+    }
+
+    /// 覆盖“按单笔上限拆单”交易所集合（builder 风格；自动归一）。
+    pub fn with_split_max_volume_exchanges(mut self, exchanges: Vec<String>) -> Self {
+        self.split_max_volume_exchanges = normalize_exchange_codes(exchanges);
+        self
+    }
+
     /// 测试用：不存在的库路径（只跑纯逻辑路径，不触碰 FFI）。
     pub fn for_tests() -> Self {
         Self {
@@ -110,6 +173,11 @@ impl CtpConfig {
             md_pass_is_authcode: false,
             shfe_market_drift_ticks: DEFAULT_SHFE_MARKET_DRIFT_TICKS,
             shfe_close_priority: ShfeClosePriority::default(),
+            market_limit_exchanges: default_exchanges(DEFAULT_MARKET_LIMIT_EXCHANGES),
+            close_today_yesterday_exchanges: default_exchanges(
+                DEFAULT_CLOSE_TODAY_YESTERDAY_EXCHANGES,
+            ),
+            split_max_volume_exchanges: Vec::new(),
             main_contract_criteria: DominantMetric::default(),
             main_contract_confirm_days: DEFAULT_MAIN_CONTRACT_CONFIRM_DAYS,
             preset_dominants: Vec::new(),
@@ -178,6 +246,9 @@ pub fn from_values(
             .unwrap_or(base.shfe_market_drift_ticks)
             .max(0),
         shfe_close_priority: shfe_close_priority.unwrap_or(base.shfe_close_priority),
+        market_limit_exchanges: base.market_limit_exchanges,
+        close_today_yesterday_exchanges: base.close_today_yesterday_exchanges,
+        split_max_volume_exchanges: base.split_max_volume_exchanges,
         main_contract_criteria: main_contract_criteria.unwrap_or(base.main_contract_criteria),
         main_contract_confirm_days: main_contract_confirm_days
             .unwrap_or(base.main_contract_confirm_days)
@@ -389,6 +460,38 @@ mod tests {
                 .shfe_close_priority,
             ShfeClosePriority::YesterdayFirst
         );
+    }
+
+    #[test]
+    fn exchange_sets_are_configurable_and_default_to_shfe() {
+        // 默认：市价转限价/平今平昨均为 ["SHFE"]，拆单为空。
+        let dflt = all_none();
+        assert_eq!(dflt.market_limit_exchanges, vec!["SHFE".to_string()]);
+        assert_eq!(
+            dflt.close_today_yesterday_exchanges,
+            vec!["SHFE".to_string()]
+        );
+        assert!(dflt.split_max_volume_exchanges.is_empty());
+
+        // 归一：trim/大写/去空/去重；CFFEX 只加入市价转限价与拆单。
+        let cfg = CtpConfig::for_tests()
+            .with_market_limit_exchanges(vec![
+                " shfe ".into(),
+                "cffex".into(),
+                "CFFEX".into(),
+                "".into(),
+            ])
+            .with_close_today_yesterday_exchanges(vec!["SHFE".into()])
+            .with_split_max_volume_exchanges(vec!["CFFEX".into()]);
+        assert_eq!(
+            cfg.market_limit_exchanges,
+            vec!["SHFE".to_string(), "CFFEX".to_string()]
+        );
+        assert_eq!(
+            cfg.close_today_yesterday_exchanges,
+            vec!["SHFE".to_string()]
+        );
+        assert_eq!(cfg.split_max_volume_exchanges, vec!["CFFEX".to_string()]);
     }
 
     #[test]

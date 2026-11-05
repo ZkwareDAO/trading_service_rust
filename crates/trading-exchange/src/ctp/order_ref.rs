@@ -96,6 +96,19 @@ impl OrderRefRegistry {
             .collect()
     }
 
+    /// 本会话为某 cid 登记的 OrderRef 数量（只计数，不 clone String）。
+    ///
+    /// 多腿判定用：`> 1` 表示该逻辑单有多个物理腿，REST 查单不能把单腿状态
+    /// 当作整单终态。表项规模 = 在途物理腿数，遍历成本可忽略。
+    pub fn count_of_cid(&self, cid: &str) -> usize {
+        self.map
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|mapped_cid| mapped_cid.as_str() == cid)
+            .count()
+    }
+
     /// 移除映射（柜台受理失败时清脏表：未受理的 OrderRef 不会有回报）。
     pub fn remove(&self, order_ref: &str) {
         self.map.lock().unwrap().remove(order_ref);
@@ -217,6 +230,20 @@ mod tests {
         let only = r.allocate(&cid);
         assert_eq!(r.order_refs_of_cid(&cid), vec![only]);
         assert!(r.order_refs_of_cid(&long_cid("Z")).is_empty());
+    }
+
+    #[test]
+    fn count_of_cid_counts_without_materializing() {
+        // 多腿判定只计数：同 cid 两次 allocate → 2；不同 cid/未知短号互不影响。
+        let r = OrderRefRegistry::new();
+        let cid = long_cid("C");
+        assert_eq!(r.count_of_cid(&cid), 0);
+        r.allocate(&cid);
+        r.allocate(&cid);
+        assert_eq!(r.count_of_cid(&cid), 2);
+        r.allocate(&long_cid("D"));
+        assert_eq!(r.count_of_cid(&cid), 2);
+        assert_eq!(r.count_of_cid("short"), 0);
     }
 
     #[test]

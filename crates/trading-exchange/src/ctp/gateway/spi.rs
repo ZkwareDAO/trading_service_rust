@@ -141,6 +141,9 @@ impl TraderSpi for EventTraderSpi {
                 volume_multiple: i.VolumeMultiple,
                 // 最小变动价位（SHFE 市价转穿价限价取整用）；柜台缺省 0.0 时预检判未就绪。
                 price_tick: i.PriceTick,
+                // 单笔报单上限（按合约由柜台下发；0=未知，拆单层不拆）。
+                max_limit_volume: i.MaxLimitOrderVolume,
+                max_market_volume: i.MaxMarketOrderVolume,
                 // 多/空保证金率（合约级静态）：持仓回报 UseMargin=0 时按成本×比率兜底。
                 long_margin_ratio: i.LongMarginRatio,
                 short_margin_ratio: i.ShortMarginRatio,

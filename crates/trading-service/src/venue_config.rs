@@ -275,6 +275,12 @@ struct CtpSection {
     shfe_market_drift_ticks: Option<i64>,
     /// SHFE 平仓腿顺序：`today_first`（默认）/ `yesterday_first`；未知值启动报错。
     shfe_close_priority: Option<String>,
+    /// 哪些交易所的市价单转对手价限价（缺省 ["SHFE"]；CFFEX 需加入）。
+    market_limit_exchanges: Option<Vec<String>>,
+    /// 哪些交易所需要显式拆平今/平昨（缺省 ["SHFE"]；CFFEX 不加）。
+    close_today_yesterday_exchanges: Option<Vec<String>>,
+    /// 哪些交易所按合约单笔上限拆单（缺省空 = 不拆）。
+    split_max_volume_exchanges: Option<Vec<String>>,
     /// 主力选举指标：`volume` / `open_interest`（默认）；未知值启动报错。
     main_contract_criteria: Option<String>,
     /// 主力切换确认天数（默认 3；<1 启动报错）。
@@ -324,6 +330,12 @@ pub fn load(path: &Path) -> anyhow::Result<LoadedVenueConfigs> {
             );
         }
     }
+    #[cfg(feature = "ctp")]
+    let market_limit_exchanges = parsed.ctp.market_limit_exchanges.clone();
+    #[cfg(feature = "ctp")]
+    let close_today_yesterday_exchanges = parsed.ctp.close_today_yesterday_exchanges.clone();
+    #[cfg(feature = "ctp")]
+    let split_max_volume_exchanges = parsed.ctp.split_max_volume_exchanges.clone();
     Ok(LoadedVenueConfigs {
         deribit: PrepConfig {
             drift_ticks: parsed.deribit.open_drift_ticks,
@@ -337,25 +349,37 @@ pub fn load(path: &Path) -> anyhow::Result<LoadedVenueConfigs> {
         },
         kline: KlineConfig { backfill },
         #[cfg(feature = "ctp")]
-        ctp: trading_exchange::ctp::from_values(
-            parsed.ctp.trader_so,
-            parsed.ctp.md_so,
-            parsed.ctp.flow_path,
-            parsed.ctp.md_front,
-            parsed.ctp.md_account,
-            parsed.ctp.md_anon,
-            parsed.ctp.md_pass_is_authcode,
-            parsed.ctp.shfe_market_drift_ticks,
-            shfe_close_priority,
-            main_contract_criteria,
-            parsed.ctp.main_contract_confirm_days,
-            parsed.ctp.preset_dominants,
-            parsed.ctp.kline_products,
-            parsed
-                .ctp
-                .instrument_specs_path
-                .map(std::path::PathBuf::from),
-        ),
+        ctp: {
+            let mut cfg = trading_exchange::ctp::from_values(
+                parsed.ctp.trader_so,
+                parsed.ctp.md_so,
+                parsed.ctp.flow_path,
+                parsed.ctp.md_front,
+                parsed.ctp.md_account,
+                parsed.ctp.md_anon,
+                parsed.ctp.md_pass_is_authcode,
+                parsed.ctp.shfe_market_drift_ticks,
+                shfe_close_priority,
+                main_contract_criteria,
+                parsed.ctp.main_contract_confirm_days,
+                parsed.ctp.preset_dominants,
+                parsed.ctp.kline_products,
+                parsed
+                    .ctp
+                    .instrument_specs_path
+                    .map(std::path::PathBuf::from),
+            );
+            if let Some(v) = market_limit_exchanges {
+                cfg = cfg.with_market_limit_exchanges(v);
+            }
+            if let Some(v) = close_today_yesterday_exchanges {
+                cfg = cfg.with_close_today_yesterday_exchanges(v);
+            }
+            if let Some(v) = split_max_volume_exchanges {
+                cfg = cfg.with_split_max_volume_exchanges(v);
+            }
+            cfg
+        },
     })
 }
 
@@ -447,6 +471,59 @@ mod tests {
             cfg.ctp.shfe_market_drift_ticks,
             trading_exchange::ctp::DEFAULT_SHFE_MARKET_DRIFT_TICKS
         );
+    }
+
+    #[cfg(feature = "ctp")]
+    #[test]
+    fn ctp_exchange_sets_are_parsed_and_normalized() {
+        // Arrange：三个交易所集合均显式配置，含空白/大小写噪音。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("venue.toml");
+        std::fs::write(
+            &path,
+            "[ctp]\n\
+             market_limit_exchanges = [\" shfe \", \"cffex\"]\n\
+             close_today_yesterday_exchanges = [\"SHFE\"]\n\
+             split_max_volume_exchanges = [\"CFFEX\"]\n",
+        )
+        .unwrap();
+
+        // Act
+        let cfg = load(&path).expect("ok");
+
+        // Assert：trim + 大写归一；CFFEX 只进市价转限价与拆单，不进平今平昨。
+        assert_eq!(
+            cfg.ctp.market_limit_exchanges,
+            vec!["SHFE".to_string(), "CFFEX".to_string()]
+        );
+        assert_eq!(
+            cfg.ctp.close_today_yesterday_exchanges,
+            vec!["SHFE".to_string()]
+        );
+        assert_eq!(
+            cfg.ctp.split_max_volume_exchanges,
+            vec!["CFFEX".to_string()]
+        );
+    }
+
+    #[cfg(feature = "ctp")]
+    #[test]
+    fn ctp_exchange_sets_default_when_absent() {
+        // Arrange：只写空的 [ctp] 段。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("venue.toml");
+        std::fs::write(&path, "[ctp]\n").unwrap();
+
+        // Act
+        let cfg = load(&path).expect("ok");
+
+        // Assert：市价转限价/平今平昨默认 SHFE，拆单默认关闭。
+        assert_eq!(cfg.ctp.market_limit_exchanges, vec!["SHFE".to_string()]);
+        assert_eq!(
+            cfg.ctp.close_today_yesterday_exchanges,
+            vec!["SHFE".to_string()]
+        );
+        assert!(cfg.ctp.split_max_volume_exchanges.is_empty());
     }
 
     #[cfg(feature = "ctp")]

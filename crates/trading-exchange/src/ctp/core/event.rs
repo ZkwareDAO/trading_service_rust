@@ -145,6 +145,10 @@ pub struct InstrumentInfo {
     pub volume_multiple: i32,
     /// 最小变动价位（SHFE 市价单转穿价限价时按其取整；缺失/非正为 0.0）。
     pub price_tick: f64,
+    /// 单笔限价报单上限（CTP `MaxLimitOrderVolume`；0/缺失 = 未知，不拆单）。
+    pub max_limit_volume: i32,
+    /// 单笔市价报单上限（CTP `MaxMarketOrderVolume`；0/缺失 = 未知/不支持市价）。
+    pub max_market_volume: i32,
     /// 多头保证金率（占用保证金/成交额；柜台持仓回报 UseMargin=0 时按
     /// 持仓成本×该比率估算多头占用保证金）。合约级静态属性，缺失/非正为 0.0。
     pub long_margin_ratio: f64,

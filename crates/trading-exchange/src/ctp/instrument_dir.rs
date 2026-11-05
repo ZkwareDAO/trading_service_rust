@@ -191,6 +191,8 @@ fn parse_instrument_csv_row(line: &str) -> Option<InstrumentInfo> {
         is_trading: true,
         volume_multiple: parse_i32(f[5]),
         price_tick: parse_f64(f[6]),
+        max_limit_volume: parse_i32(f[8]),
+        max_market_volume: parse_i32(f[10]),
         long_margin_ratio: parse_f64(f[11]),
         short_margin_ratio: parse_f64(f[12]),
     })
@@ -208,6 +210,8 @@ mod tests {
             is_trading: true,
             volume_multiple: multiple,
             price_tick: tick,
+            max_limit_volume: 0,
+            max_market_volume: 0,
             long_margin_ratio: 0.0,
             short_margin_ratio: 0.0,
         }
@@ -288,6 +292,8 @@ zz9999,XXXX,zz,zz9999,3,1,1,1,10,1,10,0,0,1,20260101,20261231\n";
         assert!(cu2611.is_trading);
         assert_eq!(cu2611.volume_multiple, 5);
         assert_eq!(cu2611.price_tick as i64, 10);
+        assert_eq!(cu2611.max_limit_volume, 500);
+        assert_eq!(cu2611.max_market_volume, 60);
         assert!((cu2611.long_margin_ratio - 0.1).abs() < 1e-12);
         assert!(dir.get("cu2612C146000").is_none(), "期权不入内存表");
         assert!(dir.get("zz9999").is_none(), "非期货不入内存表");

@@ -678,6 +678,8 @@ mod tests {
             is_trading: trading,
             volume_multiple: 5,
             price_tick: 10.0,
+            max_limit_volume: 0,
+            max_market_volume: 0,
             long_margin_ratio: 0.0,
             short_margin_ratio: 0.0,
         }

@@ -198,6 +198,8 @@ pub fn to_trading_futures_dir_rows(snapshot: &SpecSnapshot) -> Vec<InstrumentInf
             is_trading: true,
             volume_multiple: i.volume_multiple,
             price_tick: i.price_tick,
+            max_limit_volume: i.max_limit_volume,
+            max_market_volume: i.max_market_volume,
             long_margin_ratio: i.long_margin_ratio,
             short_margin_ratio: i.short_margin_ratio,
         })

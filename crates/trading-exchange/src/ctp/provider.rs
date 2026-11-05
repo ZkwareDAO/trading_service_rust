@@ -285,6 +285,7 @@ impl VenueProvider for CtpProvider {
             &self.instrument_dir,
             &self.deps.quotes,
             self.config.shfe_market_drift_ticks,
+            &self.config.market_limit_exchanges,
             request,
         )
     }
@@ -306,6 +307,7 @@ impl VenueProvider for CtpProvider {
             Arc::clone(&self.instrument_dir),
             Arc::clone(&self.deps.quotes),
             self.config.shfe_market_drift_ticks,
+            self.config.market_limit_exchanges.clone(),
         )))
     }
 
@@ -737,6 +739,8 @@ mod tests {
             is_trading: true,
             volume_multiple: 10,
             price_tick: tick,
+            max_limit_volume: 0,
+            max_market_volume: 0,
             long_margin_ratio: 0.0,
             short_margin_ratio: 0.0,
         });
