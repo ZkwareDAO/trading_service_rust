@@ -22,6 +22,82 @@ pub use create::{build_rule, RuleCreateInput, RulePositionLookup};
 pub use engine::{RuleAccount, RuleAccountLookup, RuleEngine, RuleOrderPlacer, RuleOrderQuerier};
 pub use placer::{ExchangeRuleOrderQuerier, ExchangeRulePlacer};
 
+use crate::rules::order::terminal_rule_id;
+use trading_models::Order;
+use trading_store::RuleRepo;
+
+/// 订单终态后按 `rule_id` 退休规则，但先校验归属。
+///
+/// 规则 id 由 `Table::next_id` 分配、跨日 purge 后会复用；订单里的 `rule_id`
+/// 是裸数字且订单不随日切清理。若不校验，旧订单的迟到终态会把复用同一 id 的
+/// 新规则误置终态（2026-11-05 HL 订单 2096 / CTP rule 51 事故）。
+///
+/// 校验顺序：账户 → 交易所（规则 exchange 非空时）→ 规则创建时间不晚于订单。
+/// 任一不匹配只 warn 跳过，绝不动规则状态；规则不存在/已终态按幂等处理。
+pub fn retire_rule_for_order(rules: &RuleRepo, order: &Order, reason: &str) {
+    // 统一判定：仅"订单已终态且由规则单产生"才需要 retire。
+    let Some(rule_id) = terminal_rule_id(order) else {
+        return;
+    };
+    let Some(rule) = rules.get_including_deleted(rule_id) else {
+        tracing::debug!(
+            rule_id,
+            client_order_id = %order.client_order_id,
+            reason,
+            "订单终态：规则不存在，跳过 retire"
+        );
+        return;
+    };
+    if rule.account_id != order.account_id {
+        tracing::warn!(
+            rule_id,
+            client_order_id = %order.client_order_id,
+            rule_account = rule.account_id,
+            order_account = order.account_id,
+            reason,
+            "订单与规则归属账户不匹配，拒绝 retire（防 rule_id 复用误杀）"
+        );
+        return;
+    }
+    if !rule.exchange.is_empty() && !rule.exchange.eq_ignore_ascii_case(&order.exchange) {
+        tracing::warn!(
+            rule_id,
+            client_order_id = %order.client_order_id,
+            rule_exchange = %rule.exchange,
+            order_exchange = %order.exchange,
+            reason,
+            "订单与规则归属交易所不匹配，拒绝 retire"
+        );
+        return;
+    }
+    if rule.created_at > order.created_at {
+        tracing::warn!(
+            rule_id,
+            client_order_id = %order.client_order_id,
+            rule_created_at = rule.created_at,
+            order_created_at = order.created_at,
+            reason,
+            "规则创建时间晚于订单，判定为 rule_id 复用，拒绝 retire"
+        );
+        return;
+    }
+    match rules.retire(rule_id) {
+        Ok(()) => tracing::debug!(
+            rule_id,
+            client_order_id = %order.client_order_id,
+            reason,
+            "订单终态：规则已 retire"
+        ),
+        Err(e) => tracing::warn!(
+            rule_id,
+            client_order_id = %order.client_order_id,
+            error = %e,
+            reason,
+            "订单终态 retire 规则失败"
+        ),
+    }
+}
+
 /// 生产仓位查询端口：trading-store 的 PositionRepo 直接适配建规则校验。
 impl RulePositionLookup for trading_store::PositionRepo {
     fn find_active_by_id(

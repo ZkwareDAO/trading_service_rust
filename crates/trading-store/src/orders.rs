@@ -217,6 +217,45 @@ impl OrderRepo {
         self.get_required(client_order_id)
     }
 
+    /// 交易所已明确终态、但 [`Self::apply_event`] 因成交量差一个精度单位把
+    /// FILLED 降级为 PARTIAL 时，由 REST 对账路径强制收敛到交易所终态并软删。
+    ///
+    /// * 成交量保持真实值（绝不补成委托量）；
+    /// * 已是终态则幂等返回；
+    /// * 软删后退出 `list_active`，避免对账无限重试。
+    pub fn force_terminal(
+        &self,
+        client_order_id: &str,
+        status: OrderStatus,
+    ) -> Result<Order, OrderRepoError> {
+        debug_assert!(status.is_terminal(), "force_terminal 只接受终态");
+        let current = self.get_required(client_order_id)?;
+        if current.status.is_terminal() {
+            return Ok(current);
+        }
+        let id = current.id;
+        self.table.update(id, |o| {
+            if o.status.is_terminal() {
+                return;
+            }
+            if o.filled_quantity < o.order_quantity {
+                tracing::warn!(
+                    client_order_id = %o.client_order_id,
+                    order_quantity = %o.order_quantity,
+                    filled_quantity = %o.filled_quantity,
+                    status = ?status,
+                    "交易所已明确终态但成交量不足，强制收敛（成交量保持真实值）"
+                );
+            }
+            o.status = status;
+            o.exchange_update_time = store_core::SystemClock::now_ms();
+            Self::apply_terminal_lifecycle(o);
+        })?;
+        let updated = self.get_required(client_order_id)?;
+        self.release_signal_if_terminal(&updated);
+        Ok(updated)
+    }
+
     /// 回写"实际挂出的委托要素"（如 deribit 把市价开仓转成限价漂移单）：
     /// 仅在非终结态（PLACING/NEW）单上更新类型/价/量；终态单不回退、原样返回。
     /// 任一字段为 None 表示该要素未被改写、保留现值。
@@ -382,7 +421,15 @@ impl OrderRepo {
                 }
                 OrderStatus::Partial => OrderStatus::Partial,
                 // 回报 FILLED 但成交量不足（超仓等）：如实标 PARTIAL。
-                OrderStatus::Filled => OrderStatus::Partial,
+                OrderStatus::Filled => {
+                    tracing::debug!(
+                        client_order_id = %o.client_order_id,
+                        order_quantity = %order_qty,
+                        filled_quantity = %o.filled_quantity,
+                        "FILLED 回报成交量不足，降级 PARTIAL"
+                    );
+                    OrderStatus::Partial
+                }
                 other => other,
             };
             // 与状态变更同锁收口：归一化后若为终态即软删（唯一软删规则点）。
@@ -823,5 +870,48 @@ mod tests {
 
         // Assert：fallback 返回 None（调用方首查已命中，不需要改写）。
         assert!(got.is_none());
+    }
+
+    // ---- force_terminal：交易所明确终态但成交量差一个精度单位 ----
+
+    #[test]
+    fn force_terminal_converges_short_filled_partial_keeping_true_quantity() {
+        let repo = repo();
+        let cid = seed(&repo); // order_quantity = 2
+                               // 交易所回报 FILLED 但只成交 1 → 状态机降级 PARTIAL。
+        let partial = repo
+            .apply_event(&event(
+                &cid,
+                Some(OrderStatus::Filled),
+                Some(80_000),
+                Some(1),
+            ))
+            .unwrap();
+        assert_eq!(partial.status, OrderStatus::Partial);
+
+        // 对账路径强制收敛到交易所终态：成交量保持 1，软删退出活动集合。
+        let forced = repo.force_terminal(&cid, OrderStatus::Filled).unwrap();
+        assert_eq!(forced.status, OrderStatus::Filled);
+        assert_eq!(forced.filled_quantity, Decimal::from(1));
+        assert!(forced.deleted);
+        assert!(repo.list_active().is_empty());
+    }
+
+    #[test]
+    fn force_terminal_is_idempotent_on_terminal_order() {
+        let repo = repo();
+        let cid = seed(&repo);
+        repo.apply_event(&event(
+            &cid,
+            Some(OrderStatus::Filled),
+            Some(80_000),
+            Some(2),
+        ))
+        .unwrap();
+
+        // 已终态再强制收敛：幂等返回，不报错、不改状态。
+        let again = repo.force_terminal(&cid, OrderStatus::Canceled).unwrap();
+        assert_eq!(again.status, OrderStatus::Filled);
+        assert!(again.deleted);
     }
 }

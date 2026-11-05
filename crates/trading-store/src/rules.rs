@@ -28,6 +28,16 @@ pub enum RuleRepoError {
     /// 链式目标规则不存在或已软删。
     #[error("chain target rule `{0}` not found")]
     TargetMissing(u64),
+    /// 链式目标规则与当前规则不属于同一账户（rule id 复用防护）。
+    #[error(
+        "chain target rule `{target}` account {target_account} != current rule `{current}` account {current_account}"
+    )]
+    CrossAccount {
+        current: u64,
+        current_account: u64,
+        target: u64,
+        target_account: u64,
+    },
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -119,6 +129,23 @@ impl RuleRepo {
             .ok_or(RuleRepoError::TargetMissing(target_id))?;
         if target.status != WatchRuleStatus::Pending {
             return Err(RuleRepoError::TargetNotPending(target_id, target.status));
+        }
+        // 规则 id 复用后 action 里的裸 id 可能指向另一账户的规则：跨账户拒绝，
+        // 且不改动任何一行（与其它前置失败同语义）。
+        if current.account_id != target.account_id {
+            tracing::warn!(
+                current = current_id,
+                current_account = current.account_id,
+                target = target_id,
+                target_account = target.account_id,
+                "链式目标与当前规则账户不一致，拒绝链式激活"
+            );
+            return Err(RuleRepoError::CrossAccount {
+                current: current_id,
+                current_account: current.account_id,
+                target: target_id,
+                target_account: target.account_id,
+            });
         }
 
         // —— 成对落库：闭包内再判一次源状态，防 chain_lock 之外的 claim 抢先 ——
@@ -404,6 +431,40 @@ mod tests {
             repo.chain_fire(404, cur.id).unwrap_err(),
             RuleRepoError::NotFound(404)
         ));
+    }
+
+    /// 跨账户链式目标必须被拒：规则 id 复用后，action 里的裸 id 可能指向
+    /// 另一个账户的规则，不能误激活它。
+    #[test]
+    fn chain_fire_rejects_cross_account_target_and_changes_nothing() {
+        let repo = repo();
+        // 当前规则属于 account 7。
+        let cur = risk_rule(&repo, 100);
+        // 目标规则属于另一个账户（account 8），其余前置都满足。
+        let mut next = WatchRule::new_risk(
+            8,
+            100,
+            WatchConditionKind::Price,
+            None,
+            "<=",
+            Decimal::from(90_000),
+            WatchRuleAction::UseSelf,
+            OrderType::Market,
+            Decimal::ZERO, // risk 平仓限价：测试夹具沿用旧硬编码 ZERO
+            Decimal::ZERO,
+            Decimal::ONE,
+        );
+        next.status = WatchRuleStatus::Pending;
+        let next = repo.insert(next).unwrap();
+
+        let err = repo.chain_fire(cur.id, next.id).unwrap_err();
+        assert!(
+            matches!(err, RuleRepoError::CrossAccount { .. }),
+            "跨账户 chain 必须被拒，实际 {err:?}"
+        );
+        // 两规则状态都不变。
+        assert_eq!(repo.get(cur.id).unwrap().status, WatchRuleStatus::Active);
+        assert_eq!(repo.get(next.id).unwrap().status, WatchRuleStatus::Pending);
     }
 
     #[test]

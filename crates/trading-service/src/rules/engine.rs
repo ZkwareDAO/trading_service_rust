@@ -202,10 +202,30 @@ impl RuleEngine {
         Some(total)
     }
 
-    /// 按 position_id 取活跃持仓快照。
-    fn find_position(&self, position_id: u64) -> Option<Position> {
-        // 按主键直取（O(1)）；get 自动过滤已软删行，语义与“list_active 再找 id”一致。
-        self.positions.get_active(position_id)
+    /// 按规则绑定的 position_id 取活跃持仓快照，并校验账户归属。
+    ///
+    /// 规则/仓位 id 都是可回收的裸数字：position_id 复用后可能指向别的账户的
+    /// 仓位。不匹配时按"绑定失效"返回 None，由调用方走现有 retire 分支，
+    /// 避免规则去读/平别的账户仓位。
+    fn find_position(&self, rule: &WatchRule) -> Option<Position> {
+        // 按主键直取（O(1)）；get 自动过滤已软删行。
+        let position = self.positions.get_active(rule.position_id)?;
+        // 规则账户未知（尚未热加载）是暂时状态：保留现有"跳过、不 retire"语义；
+        // 只有账户可解析时，才把归属不一致判定为 id 复用/绑定失效。
+        // 仅在账户不一致（罕见）时才解析账户，避免热路径上的无谓分配。
+        if position.account_id != rule.account_id
+            && self.accounts.account_by_id(rule.account_id).is_some()
+        {
+            tracing::warn!(
+                rule_id = rule.id,
+                rule_account = rule.account_id,
+                position_id = rule.position_id,
+                position_account = position.account_id,
+                "规则绑定仓位归属账户不匹配，按绑定失效处理"
+            );
+            return None;
+        }
+        Some(position)
     }
 
     /// new 规则现金口径：未给 quantity、给了 order_cash 时，按命中瞬间的
@@ -308,7 +328,7 @@ impl RuleEngine {
                 // new 的 pending 规则 position_id 可合法为 0，不能误杀。
                 continue;
             }
-            if self.find_position(rule.position_id).is_none() {
+            if self.find_position(&rule).is_none() {
                 tracing::info!(
                     rule_id = rule.id,
                     position_id = rule.position_id,
@@ -333,7 +353,7 @@ impl RuleEngine {
             //   链式 new 规则可携带「信号仓位」id（如被激活后按该仓位 roi 决定是否开仓），
             //   该仓位只提供指标上下文，new 命中后的下单要素仍全部取规则行。
             let position = match rule.rule_type {
-                WatchRuleType::Risk => match self.find_position(rule.position_id) {
+                WatchRuleType::Risk => match self.find_position(&rule) {
                     Some(p) => Some(p),
                     None => {
                         tracing::info!(
@@ -347,7 +367,7 @@ impl RuleEngine {
                         continue;
                     }
                 },
-                WatchRuleType::New => self.find_position(rule.position_id),
+                WatchRuleType::New => self.find_position(&rule),
             };
             let account_id = rule.account_id;
             // 指标上下文与跨标的查询作用域一并按 position 取：
@@ -490,15 +510,47 @@ impl RuleEngine {
             tracing::info!(cid = %order.client_order_id, reason, "REST 兜底：策略单终态已收敛");
             return;
         }
-        match self.rules.retire(order.rule_id) {
-            Ok(()) => tracing::info!(
-                cid = %order.client_order_id, rule_id = order.rule_id, reason,
-                "REST 兜底：终态已收敛、规则 retired"
-            ),
-            Err(e) => tracing::warn!(
-                rule_id = order.rule_id, cid = %order.client_order_id, error = %e, reason,
-                "REST 兜底收敛后 retire 规则失败"
-            ),
+        // 归属校验与 WS 路径统一收口，防止 rule_id 复用误杀新规则。
+        crate::rules::retire_rule_for_order(&self.rules, order, reason);
+    }
+
+    /// 交易所已明确终态、但本地被 `apply_event` 降级为 PARTIAL 时强制收敛；
+    /// 已是终态原样返回。返回 None 表示强制收敛失败（下轮重试）。
+    fn converge_terminal(
+        &self,
+        order: &Order,
+        updated: Order,
+        exchange_status: OrderStatus,
+        account_name: &str,
+    ) -> Option<Order> {
+        if updated.status.is_terminal() {
+            return Some(updated);
+        }
+        match self
+            .orders
+            .force_terminal(&order.client_order_id, exchange_status)
+        {
+            Ok(forced) => {
+                tracing::warn!(
+                    cid = %order.client_order_id,
+                    rule_id = order.rule_id,
+                    account = account_name,
+                    local_status = ?updated.status,
+                    exchange_status = ?exchange_status,
+                    filled = %updated.filled_quantity,
+                    order_qty = %updated.order_quantity,
+                    "REST 兜底：交易所终态但本地被降级，强制收敛"
+                );
+                Some(forced)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    cid = %order.client_order_id,
+                    error = %e,
+                    "REST 兜底：强制收敛失败，下轮重试"
+                );
+                None
+            }
         }
     }
 
@@ -539,8 +591,13 @@ impl RuleEngine {
                         tracing::warn!(cid = %order.client_order_id, error = %e, "REST 兜底：查无收敛 REJECTED 失败");
                         continue;
                     }
+                    // retire 判定要求订单已终态：取收敛后的行，而非收敛前快照。
+                    let converged_order = self
+                        .orders
+                        .peek_by_cid(&order.client_order_id)
+                        .unwrap_or_else(|| order.clone());
                     self.retire_after_converged(
-                        &order,
+                        &converged_order,
                         &format!("查无且过宽限({age}ms)，收敛 REJECTED"),
                     );
                     converged += 1;
@@ -563,12 +620,23 @@ impl RuleEngine {
                     };
                     match self.orders.apply_event(&input) {
                         Ok(updated) => {
+                            // 交易所已明确终态，但 apply_event 可能因成交量差一个
+                            // 精度单位把 FILLED 降级为 PARTIAL；以交易所终态强制收敛，
+                            // 否则该单永远非终态、每分钟重试（HL 订单 2096 事故）。
+                            let Some(updated) = self.converge_terminal(
+                                &order,
+                                updated,
+                                state.status,
+                                &account.name,
+                            ) else {
+                                continue;
+                            };
                             // 成交通知（纯通知、fire-and-forget），与 WS 回报同一收口。
                             if let Some(notify) = &self.notify {
                                 notify.on_order_filled(&updated);
                             }
                             self.retire_after_converged(
-                                &order,
+                                &updated,
                                 &format!("查到终态 {:?}", state.status),
                             );
                             converged += 1;
@@ -615,8 +683,15 @@ mod tests {
     struct FixedAccounts;
     impl RuleAccountLookup for FixedAccounts {
         fn account_by_id(&self, id: u64) -> Option<RuleAccount> {
-            (id == 7).then(|| RuleAccount {
-                name: "alice".to_string(),
+            // 7=alice、8=bob（P3a 跨账户测试需要一个"已知但不同"的账户）；
+            // 其余（如 999）视为未知账户，用于热加载场景。
+            let name = match id {
+                7 => "alice",
+                8 => "bob",
+                _ => return None,
+            };
+            Some(RuleAccount {
+                name: name.to_string(),
                 is_testnet: false,
                 position_mode: trading_models::PositionMode::OneWay,
             })
@@ -1665,5 +1740,189 @@ mod tests {
         let order = h.orders.peek_by_cid(cid).unwrap();
         assert_eq!(order.status, OrderStatus::Rejected);
         assert!(order.deleted);
+    }
+
+    // —— P1：订单终态 retire 的归属校验 ——
+
+    /// 构造一笔引用该规则、指定账户/交易所的订单；默认订单晚于规则创建。
+    fn order_for_rule(rule: &WatchRule, account_id: u64, exchange: &str) -> Order {
+        let mut o = Order::new(
+            account_id,
+            format!("0x{:032x}", rule.id),
+            exchange,
+            "BTCUSDT",
+            Side::Buy,
+        );
+        o.rule_id = rule.id;
+        // helper 统一要求"订单已终态且 rule_id != 0"。
+        o.status = OrderStatus::Filled;
+        o.created_at = rule.created_at + 1;
+        o
+    }
+
+    #[test]
+    fn retire_rule_for_order_skips_cross_account() {
+        let h = Harness::new(false);
+        let rule = roi_rule(&h, 1, ">=", "0.1");
+        let order = order_for_rule(&rule, 8, "binance");
+        crate::rules::retire_rule_for_order(&h.rules, &order, "test");
+        assert_eq!(
+            h.rules.get(rule.id).unwrap().status,
+            WatchRuleStatus::Active,
+            "跨账户订单不得 retire 本账户规则"
+        );
+    }
+
+    #[test]
+    fn retire_rule_for_order_skips_rule_created_after_order() {
+        let h = Harness::new(false);
+        let rule = roi_rule(&h, 1, ">=", "0.1");
+        let mut order = order_for_rule(&rule, 7, "binance");
+        // 订单早于规则：说明 rule_id 是回收后复用的，不能 retire。
+        order.created_at = rule.created_at.saturating_sub(1);
+        crate::rules::retire_rule_for_order(&h.rules, &order, "test");
+        assert_eq!(
+            h.rules.get(rule.id).unwrap().status,
+            WatchRuleStatus::Active
+        );
+    }
+
+    #[test]
+    fn retire_rule_for_order_skips_exchange_mismatch() {
+        let h = Harness::new(false);
+        // 非空 exchange（new 规则形态）；risk 规则通常为空，空则跳过该校验。
+        let mut rule = WatchRule::new_risk(
+            7,
+            1,
+            WatchConditionKind::Roi,
+            None,
+            ">=",
+            dec("0.1"),
+            WatchRuleAction::UseSelf,
+            OrderType::Market,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ONE,
+        );
+        rule.exchange = "ctp".to_string();
+        let rule = h.rules.insert(rule).unwrap();
+        let order = order_for_rule(&rule, 7, "binance");
+        crate::rules::retire_rule_for_order(&h.rules, &order, "test");
+        assert_eq!(
+            h.rules.get(rule.id).unwrap().status,
+            WatchRuleStatus::Active
+        );
+    }
+
+    #[test]
+    fn retire_rule_for_order_retires_matching_owner() {
+        let h = Harness::new(false);
+        let rule = roi_rule(&h, 1, ">=", "0.1");
+        let order = order_for_rule(&rule, 7, "binance");
+        crate::rules::retire_rule_for_order(&h.rules, &order, "test");
+        assert!(h.rules.get(rule.id).is_none());
+        assert_eq!(
+            h.rules.get_including_deleted(rule.id).unwrap().status,
+            WatchRuleStatus::Retired
+        );
+    }
+
+    // —— P2：交易所已终态但成交量差一个精度单位 → 强制收敛 ——
+
+    /// REST 查单口：交易所明确 FILLED，但成交量比委托量少一个精度单位。
+    /// `apply_event` 会因此把终态降级为 PARTIAL，订单永远不收敛。
+    struct ShortFilledQuerier {
+        cid: String,
+    }
+    #[async_trait]
+    impl RuleOrderQuerier for ShortFilledQuerier {
+        async fn query(&self, order: &Order, _account_name: &str) -> OrderLookup {
+            if order.client_order_id != self.cid {
+                return OrderLookup::Unavailable;
+            }
+            OrderLookup::Found(OrderState {
+                client_order_id: Some(order.client_order_id.clone()),
+                exchange_order_id: Some("EX-SHORT".into()),
+                instrument: order.instrument.clone(),
+                status: OrderStatus::Filled,
+                filled_quantity: order.order_quantity - dec("0.000005"),
+                average_price: Some(dec("60700")),
+                position_side: trading_exchange::api::OrderPositionSide::Both,
+                venue_extra: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_reconcile_forces_terminal_when_exchange_filled_but_quantity_short() {
+        let h = Harness::new(false);
+        let pos = seed_lev_position(&h, "BTCUSDT", "1", "60000", "60700", 3);
+        let rule = roi_rule(&h, pos.id, ">=", "0");
+        h.engine.run_scan().await;
+        let cid = h.sent()[0].0.clone();
+
+        let engine = RuleEngine::new(
+            h.rules.clone(),
+            h.orders.clone(),
+            h.positions.clone(),
+            Arc::clone(&h.quotes),
+            Arc::new(FixedAccounts),
+            h.placer.clone(),
+            empty_registry(),
+        )
+        .with_order_querier(Arc::new(ShortFilledQuerier { cid: cid.clone() }));
+
+        assert_eq!(engine.reconcile_terminal_orders().await, 1);
+        let order = h.orders.peek_by_cid(&cid).unwrap();
+        assert_eq!(
+            order.status,
+            OrderStatus::Filled,
+            "交易所已明确终态，不能被成交量降级卡在 PARTIAL"
+        );
+        assert!(order.deleted, "终态必须软删，退出对账集合");
+        assert!(
+            order.filled_quantity < order.order_quantity,
+            "成交量必须保持交易所回报的真实值，不得补成委托量"
+        );
+        assert_eq!(
+            h.rules.get_including_deleted(rule.id).unwrap().status,
+            WatchRuleStatus::Retired
+        );
+        // 已收敛：下一轮不再重试。
+        assert_eq!(engine.reconcile_terminal_orders().await, 0);
+    }
+
+    // —— P3a：规则绑定到别的账户仓位 → 按绑定失效 retire ——
+
+    #[tokio::test]
+    async fn risk_rule_bound_to_other_account_position_is_retired_without_action() {
+        let h = Harness::new(false);
+        let pos = seed_long_position(&h); // account 7
+                                          // 规则声明属于 account 8，却绑定 account 7 的仓位。
+        let rule = h
+            .rules
+            .insert(WatchRule::new_risk(
+                8,
+                pos.id,
+                WatchConditionKind::Roi,
+                None,
+                ">=",
+                dec("0.1"),
+                WatchRuleAction::UseSelf,
+                OrderType::Market,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ONE,
+            ))
+            .unwrap();
+
+        let report = h.engine.run_scan().await;
+        assert_eq!(report.fired, 0, "跨账户仓位不得被评估/下单");
+        assert!(h.sent().is_empty());
+        assert_eq!(
+            h.rules.get_including_deleted(rule.id).unwrap().status,
+            WatchRuleStatus::Retired,
+            "绑定仓位归属不匹配应按绑定失效 retire"
+        );
     }
 }

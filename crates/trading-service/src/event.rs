@@ -10,25 +10,17 @@ use trading_core::{
 };
 use trading_store::OrderEventInput;
 
-use crate::rules::order::terminal_rule_id;
 use crate::state::AppState;
 
 /// 订单被推进到终态（WS 回报或 REST 拉单补偿，任一途径）后，若它由规则单产生，
 /// 把关联规则 in_use → retired（+deleted=1）。retire 幂等，重复/迟到终态安全。
 ///
 /// 规则单没有 strategy_name 也要执行，故放在路由策略连接之前、对所有终态统一调用。
+/// 归属校验（account/exchange/created_at）统一收口在
+/// [`crate::rules::retire_rule_for_order`]，防止 rule_id 复用误杀新规则。
 pub fn retire_rule_for_terminal_order(state: &AppState, order: &trading_models::Order) {
-    if let Some(rule_id) = terminal_rule_id(order) {
-        let watch_rules = state.store.rule_repo().expect("rule repo after recover");
-        if let Err(e) = watch_rules.retire(rule_id) {
-            tracing::warn!(
-                rule_id,
-                client_order_id = %order.client_order_id,
-                error = %e,
-                "cannot retire rule after terminal order"
-            );
-        }
-    }
+    let watch_rules = state.store.rule_repo().expect("rule repo after recover");
+    crate::rules::retire_rule_for_order(&watch_rules, order, "terminal order event");
 }
 
 /// 协议回报 -> 仓储输入：状态串宽松解析、RFC3339 时间转毫秒。
