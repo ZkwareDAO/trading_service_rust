@@ -202,6 +202,11 @@ pub struct CtpUserHandle {
     /// 配套，用于在每笔成交回报上算成交均价（VWAP=成交额÷成交量）带给上游。
     /// 生存期/回收与成交量表完全一致。
     pub(crate) filled_amount_by_cid: Arc<Mutex<std::collections::HashMap<String, f64>>>,
+    /// OrderRef → 累计成交量（**腿级**，仅供通知层一单两腿各自独立播报数量）。
+    /// 生命周期与 cid 累计一致：腿所属 cid 终态回收时随 `release_terminal_cid` 清理。
+    pub(crate) filled_by_leg: Arc<Mutex<std::collections::HashMap<String, i64>>>,
+    /// OrderRef → 累计成交额（腿级，与 [`Self::filled_by_leg`] 配套算腿级 VWAP）。
+    pub(crate) filled_amount_by_leg: Arc<Mutex<std::collections::HashMap<String, f64>>>,
     /// 会话请求信箱（下单/撤单/查询；async 侧投递 → 本线程消费；provider 级共享）。
     pub(crate) mailbox: Arc<crate::ctp::mailbox::SessionMailbox>,
 }
@@ -227,6 +232,14 @@ impl CtpUserHandle {
         self.filled_by_cid
             .lock()
             .map(|m| m.get(cid).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// 读某物理腿（OrderRef）的累计成交量（无记录返回 0）。
+    pub fn filled_of_leg(&self, order_ref: &str) -> i64 {
+        self.filled_by_leg
+            .lock()
+            .map(|m| m.get(order_ref).copied().unwrap_or(0))
             .unwrap_or(0)
     }
 }
@@ -324,7 +337,8 @@ fn inner_loop(h: &mut TraderHandle, handle: &Arc<CtpUserHandle>, ctx: &EventCont
                         grace_ms = TERMINAL_TRADE_GRACE_MS,
                         "CTP 终态对齐超时：成交回报未在宽限内到齐，按快照兜底投影终态"
                     );
-                    project_terminal(ctx, handle, &pending_cid);
+                    // 超时兜底源自实时快照，不属于查询重放。
+                    project_terminal(ctx, handle, &pending_cid, false);
                 }
                 if active.is_none() && ctx.debouncer.lock().unwrap().poll(now_ms()).is_some() {
                     issue_back_positions(h, &mut active);
@@ -1074,9 +1088,30 @@ fn issue_front_query(
 #[derive(Debug)]
 pub(crate) enum BridgeEvent {
     /// 委托/成交回报映射出的订单事件（Box 压平变体尺寸差）。
-    Order(Box<trading_core::protocol::OrderEvent>),
+    ///
+    /// `source` 决定消费者投递语义（业务 `apply_and_route` 对前三种照常执行）：
+    /// * `"ctp"`：单腿逻辑单（业务 + 通知）；
+    /// * `"ctp-agg"`：一单两腿的聚合逻辑事件（业务；通知层无档案 → 不播，
+    ///   各物理腿已通过 `"ctp-leg"` 单独播报）；
+    /// * `"ctp-leg"`：物理腿通知专用事件（只播报，**不进订单状态机**）；
+    /// * `"ctp-replay"`：当日报单查询重放（只恢复业务状态，不播）。
+    Order {
+        event: Box<trading_core::protocol::OrderEvent>,
+        source: &'static str,
+    },
     /// 一次查询收齐的持仓快照。
     Positions(Vec<crate::api::PositionInfo>),
+}
+
+/// 逻辑订单事件的来源：重放、两腿聚合、普通单腿。
+fn logical_event_source(replay: bool, expected_legs: usize) -> &'static str {
+    if replay {
+        "ctp-replay"
+    } else if expected_legs > 1 {
+        "ctp-agg"
+    } else {
+        "ctp"
+    }
 }
 
 /// 事件分发的共享上下文（事件桥发送端 + 去抖器），由连接器构造后传入线程。
@@ -1164,13 +1199,14 @@ fn dispatch_event(
         // 合约静态信息（含交易所）由建连后最高优先的合约预热统一写入共享 InstrumentDir，
         // 这里不再用回报单独喂交易所目录（回报缺乘数/最小变动价位，无法构成完整静态信息）。
         CtpEvent::Order(s) => {
-            forward_order_snapshot(ctx, handle, s);
+            forward_order_snapshot(ctx, handle, s, false);
         }
         // 当日报单查询行：按在途闸门分流——前台查单缓冲，后台重放走订单桥。
         CtpEvent::OrderQuery(s) => match active {
             Some(ActiveQuery::FrontOrder { rows, .. }) => rows.push(s),
-            // 后台重放（或无在途查询的防御情形）：与实时回报同路径透传。
-            _ => forward_order_snapshot(ctx, handle, s),
+            // 后台重放（或无在途查询的防御情形）：与实时回报同路径透传，
+            // 但标记 replay=true，通知层据此不播（只恢复业务状态）。
+            _ => forward_order_snapshot(ctx, handle, s, true),
         },
         CtpEvent::Trade(t) => {
             // 回报反查：OrderRef → 本地长 cid（未命中保留原值，宿主 fallback 兜底）。
@@ -1188,6 +1224,15 @@ fn dispatch_event(
                 let avg = if *q > 0 { *a / (*q as f64) } else { 0.0 };
                 (*q, avg)
             };
+            // 腿级累计（仅通知）：一单两腿时每张物理单各播各的数量/成交均价。
+            // 孤儿/重放 cid 无 registry 映射 → 不建腿级项，避免永久泄漏。
+            if ctx.order_refs.cid_of(&t.order_ref).is_some() {
+                let mut qty = handle.filled_by_leg.lock().unwrap();
+                let mut amt = handle.filled_amount_by_leg.lock().unwrap();
+                *qty.entry(t.order_ref.clone()).or_insert(0) += t.volume.max(0) as i64;
+                *amt.entry(t.order_ref.clone()).or_insert(0.0) +=
+                    t.price.max(0.0) * t.volume.max(0) as f64;
+            }
             // 今/昨路由表的成交增量（主数据仍由周期持仓快照整批覆盖）：
             // 开仓增减方向=成交方向；平仓=反向（卖平多/买平空）；笼统 Close 不分今昨，
             // apply_trade 内部跳过，等快照收敛。未知开平标志（None）同样不动表。
@@ -1205,7 +1250,8 @@ fn dispatch_event(
             // 经唯一收口投影带真实 VWAP 的终态，不再单独发成交 PARTIAL（终态事件
             // 已含相同累计成交量/均价）。未补齐（分批成交）则照常发带价 PARTIAL。
             if trade_completes_pending_terminal(ctx, &cid, cum) {
-                project_terminal(ctx, handle, &cid);
+                // 成交回报属实时路径。
+                project_terminal(ctx, handle, &cid, false);
                 return;
             }
             let state = crate::ctp::mapping::order_state_from_trade(
@@ -1217,7 +1263,10 @@ fn dispatch_event(
             let mut event = crate::translate::order_event(&state);
             event.client_order_id = cid;
             // 阻塞线程 → async 端口经有界队列投递（满则阻塞背压，不丢单）。
-            if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Order(Box::new(event))) {
+            if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Order {
+                event: Box::new(event),
+                source: "ctp",
+            }) {
                 tracing::warn!(account = %ctx.account, "事件桥已关闭，成交回报丢弃：{e}");
             }
             ctx.debouncer.lock().unwrap().note_dirty(
@@ -1294,12 +1343,22 @@ fn forward_order_snapshot(
     ctx: &EventContext,
     handle: &Arc<CtpUserHandle>,
     s: crate::ctp::core::event::OrderSnapshot,
+    replay: bool,
 ) {
     use crate::ctp::core::types::OrderStatus as CtpStatus;
     use crate::ctp::mapping::order_state_from_snapshot;
     // 回报反查：OrderRef → 本地长 cid（两腿共享同一 cid；未命中保留原值）。
     let cid = resolve_event_cid(ctx, &s.order_ref);
     let instrument = s.instrument.clone();
+    // 预期腿数取 registry 中该 cid 登记的 OrderRef 数（下单时已登记，终态回收前都在）：
+    // 首腿 AllTraded 可能先于次腿首报到达，仅凭已收腿会误判整单终态而过早回收。
+    // 透传/孤儿 cid 无映射，按单腿处理。
+    let expected_legs = ctx.order_refs.order_refs_of_cid(&cid).len().max(1);
+    // 一单两腿：每张物理单独立播报（用户视角是两笔订单，各播各的数量/成交价）；
+    // 聚合事件只走业务状态机（source="ctp-agg"），避免与腿事件重复播报。
+    if !replay && expected_legs > 1 {
+        emit_leg_notification(ctx, handle, &cid, &s);
+    }
     // 柜台在委托快照里回填的状态/原因（GB18030 已在 FFI 层解码）。注意「受理后被柜台
     // 撤/拒」不一定伴随 OnErrRtnOrderInsert（真机：SHFE 涨停板拒单只来 OnRtnOrder
     // Cancelled + StatusMsg），只看错误帧会丢原因（#5/C11 排查关键）。正常态 StatusMsg
@@ -1324,10 +1383,6 @@ fn forward_order_snapshot(
     let Some(agg) = ctx.leg_table.aggregate_cid(&cid) else {
         return;
     };
-    // 预期腿数取 registry 中该 cid 登记的 OrderRef 数（下单时已登记，终态回收前都在）：
-    // 首腿 AllTraded 可能先于次腿首报到达，仅凭已收腿会误判整单终态而过早回收。
-    // 透传/孤儿 cid 无映射，按单腿处理。
-    let expected_legs = ctx.order_refs.order_refs_of_cid(&cid).len().max(1);
     let received_legs = ctx.leg_table.leg_count(&cid);
     if received_legs > expected_legs {
         // 同一 cid 收到超出登记数的腿：可能是重连重放/OrderRef 冲突，告警但不静默吞掉。
@@ -1362,7 +1417,7 @@ fn forward_order_snapshot(
 
     if is_terminal {
         // 零成交终态（撤/拒），或成交回报已先到齐：经唯一收口投影带 VWAP 的终态并回收。
-        project_terminal(ctx, handle, &cid);
+        project_terminal(ctx, handle, &cid, replay);
         return;
     }
 
@@ -1381,10 +1436,45 @@ fn forward_order_snapshot(
     let mut event = crate::translate::order_event(&state);
     event.client_order_id = cid.clone();
     // 阻塞线程 → async 端口经有界队列投递（满则阻塞背压，不丢单）。
-    if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Order(Box::new(event))) {
+    if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Order {
+        event: Box::new(event),
+        source: logical_event_source(replay, expected_legs),
+    }) {
         tracing::warn!(account = %ctx.account, "事件桥已关闭，订单事件丢弃：{e}");
     }
     note_order_dirty(ctx, &instrument);
+}
+
+/// 物理腿通知专用事件：`cid#OrderRef` 区分同一逻辑单的各腿，仅通知层消费。
+///
+/// 腿级数量/方向/开平来自本腿快照；成交价用**腿级 VWAP**。快照常先于成交回报
+/// 到达，此时腿级 VWAP 尚不可用 → 暂不播（避免成交价 0），由
+/// [`project_terminal`] 在成交齐/超时兜底时补播。
+fn emit_leg_notification(
+    ctx: &EventContext,
+    handle: &Arc<CtpUserHandle>,
+    cid: &str,
+    leg: &crate::ctp::core::event::OrderSnapshot,
+) {
+    let filled = leg.volume_traded.max(0);
+    let vwap = if filled > 0 {
+        vwap_of_leg(handle, &leg.order_ref)
+    } else {
+        None
+    };
+    if filled > 0 && vwap.is_none() {
+        return;
+    }
+    let mut state = crate::ctp::mapping::order_state_from_snapshot(leg);
+    state.average_price = vwap;
+    let mut event = crate::translate::order_event(&state);
+    event.client_order_id = format!("{cid}#{}", leg.order_ref);
+    if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Order {
+        event: Box::new(event),
+        source: "ctp-leg",
+    }) {
+        tracing::warn!(account = %ctx.account, "事件桥已关闭，腿级通知事件丢弃：{e}");
+    }
 }
 
 /// 全成委托快照是否需要**暂缓终态**等成交回报：
@@ -1424,12 +1514,29 @@ fn vwap_of_cid(handle: &Arc<CtpUserHandle>, cid: &str) -> Option<rust_decimal::D
         .filter(|p| *p > rust_decimal::Decimal::ZERO)
 }
 
+/// 读某物理腿（OrderRef）截至当前的成交均价；无成交返回 None。
+fn vwap_of_leg(handle: &Arc<CtpUserHandle>, order_ref: &str) -> Option<rust_decimal::Decimal> {
+    let qty = handle.filled_of_leg(order_ref);
+    if qty <= 0 {
+        return None;
+    }
+    let amount = handle
+        .filled_amount_by_leg
+        .lock()
+        .ok()?
+        .get(order_ref)
+        .copied()
+        .unwrap_or(0.0);
+    rust_decimal::Decimal::from_f64_retain(amount / qty as f64)
+        .filter(|p| *p > rust_decimal::Decimal::ZERO)
+}
+
 /// 终态唯一投影收口：从腿表聚合终态、附成交回报累计的真实 VWAP，向上游发**一条**
 /// 终态订单事件，随后回收待对齐标记 / cid↔OrderRef 映射 / 成交累计 / 腿表。
 ///
 /// 幂等：投影即清腿表，重复调用（成交到齐与超时兜底竞争）因腿表已空直接返回，
 /// 保证终态只发一次。VWAP 在回收成交累计**之前**读取。
-fn project_terminal(ctx: &EventContext, handle: &Arc<CtpUserHandle>, cid: &str) {
+fn project_terminal(ctx: &EventContext, handle: &Arc<CtpUserHandle>, cid: &str, replay: bool) {
     use crate::ctp::core::types::OrderStatus as CtpStatus;
     // 重新聚合（投影前不允许清腿表）；已回收则 no-op。
     let Some(agg) = ctx.leg_table.aggregate_cid(cid) else {
@@ -1438,6 +1545,14 @@ fn project_terminal(ctx: &EventContext, handle: &Arc<CtpUserHandle>, cid: &str) 
     };
     let expected_legs = ctx.order_refs.count_of_cid(cid).max(1);
     let legs_complete = ctx.leg_table.leg_count(cid) == expected_legs;
+    // 两腿单：补播此前因腿级 VWAP 未到而延后的成交腿（服务端按腿去重，不重复）。
+    if !replay && expected_legs > 1 {
+        for leg in ctx.leg_table.legs_of(cid) {
+            if leg.volume_traded > 0 && leg.is_terminal() {
+                emit_leg_notification(ctx, handle, cid, &leg);
+            }
+        }
+    }
     // 正常终态（腿齐全终态）取聚合终态 AllTraded/Cancelled…；理论上 project 只在
     // 终态或超时兜底时调用，腿表保留的是标记时的全成/终态快照，故此处恒为终态。
     let reported = if agg.all_terminal && legs_complete {
@@ -1463,7 +1578,10 @@ fn project_terminal(ctx: &EventContext, handle: &Arc<CtpUserHandle>, cid: &str) 
     state.average_price = vwap;
     let mut event = crate::translate::order_event(&state);
     event.client_order_id = cid.to_string();
-    if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Order(Box::new(event))) {
+    if let Err(e) = ctx.tx.blocking_send(BridgeEvent::Order {
+        event: Box::new(event),
+        source: logical_event_source(replay, expected_legs),
+    }) {
         tracing::warn!(account = %ctx.account, "事件桥已关闭，终态订单事件丢弃：{e}");
     }
     // 先发后回收（VWAP 已在上方读取）。
@@ -1504,6 +1622,12 @@ fn note_order_dirty(ctx: &EventContext, instrument: &str) {
 /// 不构成泄漏——成交表只在首笔成交时建项。
 fn release_terminal_cid(ctx: &EventContext, handle: &Arc<CtpUserHandle>, cid: &str) {
     for order_ref in ctx.order_refs.order_refs_of_cid(cid) {
+        handle.filled_by_leg.lock().unwrap().remove(&order_ref);
+        handle
+            .filled_amount_by_leg
+            .lock()
+            .unwrap()
+            .remove(&order_ref);
         ctx.order_refs.remove(&order_ref);
     }
     let removed_cum = handle.filled_by_cid.lock().unwrap().remove(cid).is_some();
@@ -1857,6 +1981,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             filled_by_cid: Arc::new(Mutex::new(std::collections::HashMap::new())),
             filled_amount_by_cid: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            filled_by_leg: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            filled_amount_by_leg: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -1916,6 +2042,7 @@ mod tests {
             order_sys_id: sys_id.to_string(),
             insert_time: "09:30:00".to_string(),
             direction: Direction::Sell,
+            offset: Some(Offset::Open),
             status,
             limit_price: 3500.0,
             volume_total: total,
@@ -1931,7 +2058,7 @@ mod tests {
         rx: &mut mpsc::Receiver<BridgeEvent>,
     ) -> (String, String, Option<rust_decimal::Decimal>) {
         match rx.try_recv().expect("应有一条订单事件") {
-            BridgeEvent::Order(e) => (
+            BridgeEvent::Order { event: e, .. } => (
                 e.client_order_id.clone(),
                 e.status.clone(),
                 e.filled_quantity,
@@ -1990,7 +2117,7 @@ mod tests {
         // 收集桥上所有订单事件，最后一条聚合事件应是整单 FILLED、filled=3。
         let mut events = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            if let BridgeEvent::Order(e) = ev {
+            if let BridgeEvent::Order { event: e, .. } = ev {
                 events.push((
                     e.client_order_id.clone(),
                     e.status.clone(),
@@ -2008,6 +2135,106 @@ mod tests {
         assert!(ctx.order_refs.cid_of(&r2).is_none());
         assert!(!ctx.leg_table.contains(&cid));
         assert_eq!(h.filled_of_cid(&cid), 0);
+    }
+
+    #[test]
+    fn two_leg_new_emits_one_leg_notification_per_physical_order() {
+        // 两腿各 5 手均为 NEW：用户视角是两笔物理订单，各播一条（cid#OrderRef 区分）；
+        // 聚合逻辑事件 source="ctp-agg" 只走业务状态机、不播。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("N");
+        let r1 = ctx.order_refs.allocate(&cid);
+        let r2 = ctx.order_refs.allocate(&cid);
+
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r1, OrderStatus::NoTradeQueueing, 5, 0, "s1")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r2, OrderStatus::NoTradeQueueing, 5, 0, "s2")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+
+        let mut leg_events = Vec::new();
+        let mut agg_count = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let BridgeEvent::Order { event, source } = ev {
+                match source {
+                    "ctp-leg" => leg_events.push(*event),
+                    "ctp-agg" => agg_count += 1,
+                    other => panic!("两腿单不应出现 source={other}"),
+                }
+            }
+        }
+        assert_eq!(agg_count, 2, "两条聚合逻辑事件只走业务");
+        assert_eq!(leg_events.len(), 2, "两张物理单各一条通知");
+        assert_eq!(leg_events[0].client_order_id, format!("{cid}#{r1}"));
+        assert_eq!(leg_events[1].client_order_id, format!("{cid}#{r2}"));
+        for ev in &leg_events {
+            assert_eq!(ev.status, "NEW");
+            assert_eq!(
+                ev.amount,
+                Some(rust_decimal::Decimal::from(5)),
+                "每条腿的数量必须是自己的 5 手"
+            );
+        }
+    }
+
+    #[test]
+    fn two_leg_filled_uses_leg_vwap_and_leg_quantity() {
+        // 腿 1 成交 5 手 @3500（先收到成交回报，再收到全成快照）。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("F");
+        let r1 = ctx.order_refs.allocate(&cid);
+        let r2 = ctx.order_refs.allocate(&cid);
+        h.filled_by_leg.lock().unwrap().insert(r1.clone(), 5);
+        h.filled_amount_by_leg
+            .lock()
+            .unwrap()
+            .insert(r1.clone(), 3500.0 * 5.0);
+        h.filled_by_cid.lock().unwrap().insert(cid.clone(), 5);
+        h.filled_amount_by_cid
+            .lock()
+            .unwrap()
+            .insert(cid.clone(), 3500.0 * 5.0);
+
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r1, OrderStatus::AllTraded, 5, 5, "s1")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r2, OrderStatus::NoTradeQueueing, 5, 0, "s2")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+
+        let leg = {
+            let mut found = None;
+            while let Ok(ev) = rx.try_recv() {
+                if let BridgeEvent::Order { event, source } = ev {
+                    if source == "ctp-leg" && event.client_order_id == format!("{cid}#{r1}") {
+                        found = Some(*event);
+                    }
+                }
+            }
+            found.expect("成交腿应单独播报")
+        };
+        assert_eq!(leg.filled_quantity, Some(rust_decimal::Decimal::from(5)));
+        assert_eq!(leg.amount, Some(rust_decimal::Decimal::from(5)));
+        assert_eq!(
+            leg.filled_price,
+            Some(rust_decimal::Decimal::from(3500)),
+            "成交价取该腿自己的 VWAP"
+        );
     }
 
     /// 构造成交回报（ref/价/量；买开），供「终态快照 × 成交回报对齐」用例。
@@ -2031,7 +2258,8 @@ mod tests {
         }
     }
 
-    /// 排干桥上全部订单事件，收集 (状态, 成交量, 成交价)，按发出顺序。
+    /// 排干桥上全部**业务**订单事件，收集 (状态, 成交量, 成交价)，按发出顺序。
+    /// 腿级通知事件（source="ctp-leg"）不参与逻辑单断言。
     fn drain_all_orders(
         rx: &mut mpsc::Receiver<BridgeEvent>,
     ) -> Vec<(
@@ -2041,7 +2269,10 @@ mod tests {
     )> {
         let mut out = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            if let BridgeEvent::Order(e) = ev {
+            if let BridgeEvent::Order { event: e, source } = ev {
+                if source == "ctp-leg" {
+                    continue;
+                }
                 out.push((e.status.clone(), e.filled_quantity, e.filled_price));
             }
         }
@@ -2069,7 +2300,7 @@ mod tests {
         // 此刻不得提前抛终态 FILLED；把桥上订单事件排干，最后一条也不能是终态。
         let mut saw_terminal = false;
         while let Ok(ev) = rx.try_recv() {
-            if let BridgeEvent::Order(e) = ev {
+            if let BridgeEvent::Order { event: e, .. } = ev {
                 if matches!(e.status.as_str(), "FILLED" | "CANCELED" | "REJECTED") {
                     saw_terminal = true;
                 }
@@ -2093,7 +2324,7 @@ mod tests {
         // 终态：恰好一条 FILLED，filled=2、成交价=3972（VWAP，非 0）。
         let mut finals = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            if let BridgeEvent::Order(e) = ev {
+            if let BridgeEvent::Order { event: e, .. } = ev {
                 finals.push((e.status.clone(), e.filled_quantity, e.filled_price));
             }
         }
@@ -2285,7 +2516,7 @@ mod tests {
         let due = ctx.pending_terminal.take_due(now_ms(), 0);
         assert_eq!(due, vec![(cid.clone(), 2)]);
         assert!(!ctx.pending_terminal.contains(&cid), "take_due 已移除");
-        project_terminal(&ctx, &h, &cid);
+        project_terminal(&ctx, &h, &cid, false);
 
         let evs = drain_all_orders(&mut rx);
         let filled: Vec<_> = evs.iter().filter(|(s, _, _)| s == "FILLED").collect();
@@ -2507,6 +2738,7 @@ mod tests {
             order_sys_id: sys_id.into(),
             insert_time: String::new(),
             direction: Direction::Buy,
+            offset: Some(Offset::Open),
             status: OrderStatus::NoTradeQueueing,
             limit_price: 3500.0,
             volume_total: 1,
@@ -3744,9 +3976,15 @@ mod tests {
             &mut active,
         );
 
-        // Assert：订单桥收到一帧；闸门仍在（等 QueryEnd）。交易所目录由合约预热
-        // 负责（见 contracts_query_warms_*），委托回报不再喂目录。
-        assert!(matches!(bridge_rx.try_recv(), Ok(BridgeEvent::Order(_))));
+        // Assert：订单桥收到一帧且标记为重放（通知层据此不播）；闸门仍在（等
+        // QueryEnd）。交易所目录由合约预热负责（见 contracts_query_warms_*）。
+        assert!(matches!(
+            bridge_rx.try_recv(),
+            Ok(BridgeEvent::Order {
+                source: "ctp-replay",
+                ..
+            })
+        ));
         assert!(active.is_some());
         dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
         assert!(active.is_none(), "重放 QueryEnd 释放闸门");
@@ -4058,7 +4296,10 @@ mod tests {
         );
 
         // Assert：实时回报未被查询缓冲吞掉，订单桥收到。
-        assert!(matches!(bridge_rx.try_recv(), Ok(BridgeEvent::Order(_))));
+        assert!(matches!(
+            bridge_rx.try_recv(),
+            Ok(BridgeEvent::Order { source: "ctp", .. })
+        ));
     }
 
     #[test]

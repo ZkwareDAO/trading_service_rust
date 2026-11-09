@@ -133,7 +133,7 @@ impl LegTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ctp::core::types::Direction;
+    use crate::ctp::core::types::{Direction, Offset};
 
     fn leg(
         order_ref: &str,
@@ -149,6 +149,7 @@ mod tests {
             order_sys_id: sys_id.into(),
             insert_time: "09:30:00".into(),
             direction: Direction::Sell,
+            offset: Some(Offset::Open),
             status,
             limit_price: 3300.0,
             volume_total: total,

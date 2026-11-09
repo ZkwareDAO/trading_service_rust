@@ -116,9 +116,9 @@ pub struct OrderAck {
 /// venue 私有订单流的「原生委托要素」（仅特定 venue 的订单播报需要）。
 ///
 /// 现有 [`OrderState`] 通用字段不含订单方向 / reduce_only / 委托总量 / 委托价，
-/// 而 Deribit 订单事件播报（通知 A）要据此拼「开/减买仓/卖仓、委托价量」。
-/// 故把这些要素收口为本结构：**仅 Deribit 映射层填充**，其余 venue 恒为 [`None`]，
-/// 不污染 binance / hyperliquid 的通用映射。
+/// 而订单事件播报（通知 A）要据此拼「开/减买仓/卖仓、委托价量」。
+/// 故把这些要素收口为本结构：**Deribit 与 CTP 映射层填充**，其余 venue 恒为
+/// [`None`]，不污染 binance / hyperliquid 的通用映射。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VenueOrderExtra {
     /// 订单原生方向（buy/sell）；播报时 reduce_only 需再取反得仓位方向。

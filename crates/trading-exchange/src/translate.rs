@@ -88,8 +88,9 @@ pub fn position_snapshot(account: &str, exchange: &str, p: &PositionInfo) -> Pos
 /// 私有流订单事件 → 推进订单状态机用的 `OrderEvent`。
 /// 零成交均价/累计量映射为 None，避免覆盖内存中的有效数据（与旧帧映射语义一致）。
 ///
-/// venue 原生委托要素（[`OrderState::venue_extra`]）仅 Deribit 填充：透传到
-/// direction/reduce_only/amount/limit_price，供订单事件播报使用；其余 venue 为 None。
+/// venue 原生委托要素（[`OrderState::venue_extra`]）由 Deribit 与 CTP 映射层填充：
+/// 透传到 direction/reduce_only/amount/limit_price，供订单事件播报使用；
+/// 其余 venue 为 None。
 pub fn order_event(state: &OrderState) -> OrderEvent {
     let extra = state.venue_extra;
     OrderEvent {
@@ -106,7 +107,7 @@ pub fn order_event(state: &OrderState) -> OrderEvent {
         message: None,
         // 合约名透传：供通知 A 在本地无 order 时展示。
         instrument: state.instrument.clone(),
-        // venue 委托要素：仅 Deribit 透传。
+        // venue 委托要素：Deribit / CTP 透传。
         direction: extra.map(|e| {
             match e.direction {
                 Side::Buy => "buy",

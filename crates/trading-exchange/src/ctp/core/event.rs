@@ -20,6 +20,11 @@ pub struct OrderSnapshot {
     pub insert_time: String,
     /// 买卖方向。
     pub direction: Direction,
+    /// 开平标志（开仓/平仓/平今/平昨）；未知字符为 None。
+    ///
+    /// 只读透传给通知层（`VenueOrderExtra.reduce_only`）；缺失时不播订单事件，
+    /// 不把平仓误标成开仓。业务状态机不读取本字段。
+    pub offset: Option<Offset>,
     /// 委托状态。
     pub status: OrderStatus,
     /// 委托价。
@@ -182,6 +187,7 @@ mod tests {
             order_sys_id: "    1".into(),
             insert_time: "13:30:00".into(),
             direction: Direction::Buy,
+            offset: Some(Offset::Open),
             status,
             limit_price: 3205.0,
             volume_total: total,

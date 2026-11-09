@@ -19,6 +19,8 @@ pub fn order_snapshot(order: &CThostFtdcOrderField) -> OrderSnapshot {
         order_sys_id: decode_fixed(&order.OrderSysID),
         insert_time: decode_fixed(&order.InsertTime),
         direction: Direction::from_code(order.Direction as u8 as char).unwrap_or(Direction::Buy),
+        // 开平标志未知字符容错为 None（Offset 无安全默认值，宁缺勿错）。
+        offset: Offset::from_code(order.CombOffsetFlag[0] as u8 as char),
         status: OrderStatus::from_code(order.OrderStatus as u8 as char)
             .unwrap_or(OrderStatus::Unknown),
         limit_price: order.LimitPrice,
@@ -118,6 +120,17 @@ mod tests {
         let mut o = sample_order();
         o.OrderStatus = '9' as c_char;
         assert_eq!(order_snapshot(&o).status, OrderStatus::Unknown);
+    }
+
+    #[test]
+    fn maps_comb_offset_flag() {
+        // CombOffsetFlag[0]：'1'=平仓，'9'=未知 → None。
+        let mut o = sample_order();
+        o.CombOffsetFlag[0] = '1' as c_char;
+        assert_eq!(order_snapshot(&o).offset, Some(Offset::Close));
+
+        o.CombOffsetFlag[0] = '9' as c_char;
+        assert_eq!(order_snapshot(&o).offset, None);
     }
 
     fn sample_trade() -> CThostFtdcTradeField {

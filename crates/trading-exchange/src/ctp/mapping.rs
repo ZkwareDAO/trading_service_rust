@@ -8,7 +8,7 @@ use rust_decimal::Decimal;
 
 use crate::api::{OrderPositionSide, PositionInfo};
 use crate::ctp::core::event::{OrderSnapshot, PositionSnapshot, TradeSnapshot};
-use crate::ctp::core::types::Direction;
+use crate::ctp::core::types::{Direction, Offset};
 use trading_models::{InstrumentType, OrderStatus};
 
 /// 保证金补齐差额日志的相对容差：避免浮点尾差（如 5527.2 vs 5527.200000001）刷日志。
@@ -81,7 +81,16 @@ pub fn order_state_from_snapshot(s: &OrderSnapshot) -> crate::api::OrderState {
         filled_quantity: Decimal::from(s.volume_traded.max(0)),
         average_price: None,
         position_side: OrderPositionSide::Both,
-        venue_extra: None,
+        // 开平标志已知才透传（缺失 → None，通知层据此不播，避免误标开/平）。
+        venue_extra: s.offset.map(|offset| crate::api::VenueOrderExtra {
+            direction: match s.direction {
+                Direction::Buy => trading_models::Side::Buy,
+                Direction::Sell => trading_models::Side::Sell,
+            },
+            reduce_only: offset != Offset::Open,
+            amount: Decimal::from(s.volume_total.max(0)),
+            limit_price: Decimal::from_f64_retain(s.limit_price).unwrap_or_default(),
+        }),
     }
 }
 
@@ -396,6 +405,8 @@ mod tests {
             order_sys_id: String::new(),
             insert_time: String::new(),
             direction: Direction::Buy,
+            // 模板默认开仓；平仓/@未知由各测试显式覆盖。
+            offset: Some(crate::ctp::core::types::Offset::Open),
             status: CtpStatus::NoTradeQueueing,
             limit_price: 0.0,
             volume_total: 1,
@@ -429,6 +440,89 @@ mod tests {
         let st = order_state_from_snapshot(&s);
         assert!(st.exchange_order_id.is_none());
         assert_eq!(st.status, OrderStatus::New);
+    }
+
+    // ---- Task 5：委托快照开平标志 → venue_extra ----
+
+    #[test]
+    fn order_snapshot_fills_venue_extra_from_offset_and_direction() {
+        use crate::ctp::core::types::Offset;
+        // 卖方向 + 笼统平仓 → 平仓单；amount/limit_price 取委托总量/委托价。
+        let s = OrderSnapshot {
+            direction: Direction::Sell,
+            limit_price: 3205.0,
+            volume_total: 5,
+            offset: Some(Offset::Close),
+            ..order_snapshot_template()
+        };
+        let extra = order_state_from_snapshot(&s)
+            .venue_extra
+            .expect("CTP 委托快照应填充 venue_extra");
+        assert_eq!(extra.direction, Side::Sell);
+        assert!(
+            extra.reduce_only,
+            "Close/CloseToday/CloseYesterday 均为平仓"
+        );
+        assert_eq!(extra.amount, Decimal::from(5));
+        assert_eq!(extra.limit_price, Decimal::from(3205));
+    }
+
+    #[test]
+    fn order_snapshot_open_offset_is_not_reduce_only() {
+        use crate::ctp::core::types::Offset;
+        let s = OrderSnapshot {
+            offset: Some(Offset::Open),
+            ..order_snapshot_template()
+        };
+        let extra = order_state_from_snapshot(&s).venue_extra.unwrap();
+        assert!(!extra.reduce_only);
+    }
+
+    #[test]
+    fn order_snapshot_close_today_and_yesterday_are_reduce_only() {
+        use crate::ctp::core::types::Offset;
+        for offset in [Offset::CloseToday, Offset::CloseYesterday] {
+            let s = OrderSnapshot {
+                offset: Some(offset),
+                ..order_snapshot_template()
+            };
+            assert!(
+                order_state_from_snapshot(&s)
+                    .venue_extra
+                    .unwrap()
+                    .reduce_only
+            );
+        }
+    }
+
+    #[test]
+    fn order_snapshot_missing_offset_leaves_venue_extra_none() {
+        // 未知/缺失开平标志：不播（宁缺勿错，避免把平仓误标成开仓）。
+        let s = OrderSnapshot {
+            offset: None,
+            ..order_snapshot_template()
+        };
+        assert!(order_state_from_snapshot(&s).venue_extra.is_none());
+    }
+
+    #[test]
+    fn trade_state_keeps_venue_extra_none() {
+        // 成交回报是逐笔增量，不单独播报：venue_extra 恒为 None。
+        let t = crate::ctp::core::event::TradeSnapshot {
+            order_ref: "1".into(),
+            trade_id: "55".into(),
+            instrument: "rb2510".into(),
+            exchange_id: "SHFE".into(),
+            order_sys_id: "9001".into(),
+            direction: Direction::Buy,
+            offset: Some(crate::ctp::core::types::Offset::Open),
+            price: 3205.0,
+            volume: 1,
+            trade_date: "20261009".into(),
+            trade_time: "10:30:00".into(),
+        };
+        let st = order_state_from_trade(&t, Decimal::from(1), 3205.0);
+        assert!(st.venue_extra.is_none());
     }
 
     /// rb 螺纹：乘数 10 吨/手，开仓单价 3205，3 手 →

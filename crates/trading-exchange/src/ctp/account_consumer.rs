@@ -113,7 +113,11 @@ pub(crate) async fn run_event_consumer(
 ) {
     while let Some(ev) = rx.recv().await {
         match ev {
-            BridgeEvent::Order(e) => sink.on_order_event(&e, "ctp", &account).await,
+            // source 由会话线程决定（ctp / ctp-agg / ctp-leg / ctp-replay），
+            // 消费者原样透传：业务照常，通知层按档案分派。
+            BridgeEvent::Order { event, source } => {
+                sink.on_order_event(&event, source, &account).await
+            }
             BridgeEvent::Positions(ps) => {
                 position_sink
                     .on_position_snapshot("ctp", &account, &ps)
@@ -198,6 +202,8 @@ impl CtpVenueConnector {
             shutdown,
             filled_by_cid: Arc::new(Mutex::new(std::collections::HashMap::new())),
             filled_amount_by_cid: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            filled_by_leg: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            filled_amount_by_leg: Arc::new(Mutex::new(std::collections::HashMap::new())),
             mailbox: Arc::clone(&session.mailbox),
         });
         // 事件桥：有界队列 + 常驻消费任务（Sender 随会话线程退出而 drop）。
@@ -318,23 +324,25 @@ mod tests {
 
     // ---- 事件桥（有界队列 + 每账户常驻消费任务）----
 
-    /// 记录 (种类, client_order_id) 调用序列的假接收口。
+    /// 记录 (种类, client_order_id) 调用序列与订单事件来源的假接收口。
     #[derive(Default)]
     struct RecordingSink {
         calls: Mutex<Vec<(&'static str, String)>>,
+        sources: Mutex<Vec<String>>,
     }
     #[async_trait]
     impl OrderEventSink for RecordingSink {
         async fn on_order_event(
             &self,
             ev: &trading_core::protocol::OrderEvent,
-            _source: &str,
+            source: &str,
             _account: &str,
         ) {
             self.calls
                 .lock()
                 .unwrap()
                 .push(("order", ev.client_order_id.clone()));
+            self.sources.lock().unwrap().push(source.to_string());
         }
     }
     #[async_trait]
@@ -415,13 +423,19 @@ mod tests {
         ));
 
         // Act：o1 → 快照 → o2（同一队列，FIFO）。
-        tx.send(BridgeEvent::Order(Box::new(order_event("o1"))))
-            .await
-            .unwrap();
+        tx.send(BridgeEvent::Order {
+            event: Box::new(order_event("o1")),
+            source: "ctp",
+        })
+        .await
+        .unwrap();
         tx.send(BridgeEvent::Positions(Vec::new())).await.unwrap();
-        tx.send(BridgeEvent::Order(Box::new(order_event("o2"))))
-            .await
-            .unwrap();
+        tx.send(BridgeEvent::Order {
+            event: Box::new(order_event("o2")),
+            source: "ctp",
+        })
+        .await
+        .unwrap();
         drop(tx); // 会话线程退出 → Sender drop → 消费任务 drain 后结束。
 
         handle.await.unwrap();
@@ -435,6 +449,39 @@ mod tests {
                 ("positions", String::new()),
                 ("order", "o2".into())
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_flag_routes_ctp_replay_source() {
+        // 重放行 source="ctp-replay"（通知层据此不播），实时行为 "ctp"。
+        let sink = Arc::new(RecordingSink::default());
+        let (tx, rx) = tokio::sync::mpsc::channel::<BridgeEvent>(4);
+        let handle = tokio::spawn(run_event_consumer(
+            "acct".into(),
+            rx,
+            Arc::clone(&sink) as Arc<dyn OrderEventSink>,
+            Arc::clone(&sink) as Arc<dyn crate::port::PositionSnapshotSink>,
+        ));
+
+        tx.send(BridgeEvent::Order {
+            event: Box::new(order_event("replay-1")),
+            source: "ctp-replay",
+        })
+        .await
+        .unwrap();
+        tx.send(BridgeEvent::Order {
+            event: Box::new(order_event("live-1")),
+            source: "ctp",
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        assert_eq!(
+            *sink.sources.lock().unwrap(),
+            vec!["ctp-replay".to_string(), "ctp".to_string()]
         );
     }
 }
