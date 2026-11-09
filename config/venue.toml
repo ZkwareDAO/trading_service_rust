@@ -47,7 +47,7 @@ concurrency = 2
 # flow_path = "/var/lib/trading-service/ctp-flow"
 # 前置环境开关（生产/仿真）已下沉账户级：account.csv credentials JSON 的 is_production_mode。
 # 行情前置（交易/行情端口分离；空则不启动 CTP 行情线程）。
-md_front = "tcp://101.226.250.133:42213"
+md_front = "tcp://REPLACE_WITH_CTP_MD_FRONT:PORT"
 # 行情登录用账户名（account.csv 中的 name；交易所级行情不随用户区分）。
 md_account = "ctp-simnow"
 # 行情登录形态：匿名（标准 CTP 行情前置形态，BrokerID/UserID/Password 全空）。
@@ -62,8 +62,8 @@ shfe_market_drift_ticks = 1
 # 两腿的 ReqOrderInsert 实际下发顺序即由此决定；未知值启动期报错。
 shfe_close_priority = "today_first"
 # 哪些交易所的市价单要转对手价限价（这些交易所不支持 CTP AnyPrice）。
-# 默认 ["SHFE"]；CFFEX 不支持 AnyPrice，必须加入。
-market_limit_exchanges = ["SHFE", "CFFEX"]
+# 默认 ["SHFE"]；CFFEX 不支持 AnyPrice，必须加入；CZCE 按业务要求同样转限价。
+market_limit_exchanges = ["SHFE", "CFFEX", "CZCE"]
 # 哪些交易所需要显式拆平今/平昨。默认 ["SHFE"]；CFFEX 绝不能加；INE 真机验证后可加。
 close_today_yesterday_exchanges = ["SHFE"]
 # 哪些交易所按合约单笔上限拆单（默认空 = 不拆）。
@@ -87,3 +87,9 @@ preset_dominants = ["cu:cu2612", "rb:rb2701", "i:i2701", "au:au2612", "ag:ag2612
 # （SHFE/DCE/INE/GFEX 小写，CZCE/CFFEX 大写）；写错大小写会静默不订阅。
 # 当前 90 个品种按 2026-11-05 合约表展开约 823 个在交易合约。
 kline_products = ["cu", "rb", "i", "au", "ag", "ru"]
+
+# ---- 通知阈值 ----
+# ROI 告警阈值（百分数，-20 = ROI ≤ -20% 告警）；比率 = 该值 / 100。
+[notify]
+deribit_roi_alert_threshold_pct = -20
+ctp_roi_alert_threshold_pct = -20
