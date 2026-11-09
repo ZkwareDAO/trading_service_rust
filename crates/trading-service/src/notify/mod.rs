@@ -6,6 +6,7 @@
 
 mod channel;
 mod message;
+pub mod profile;
 pub mod report;
 
 pub use channel::{ChannelUrls, NotifyChannel};
@@ -15,7 +16,7 @@ use std::sync::Arc;
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::Serialize;
-use trading_models::{Order, Position, WatchConditionKind};
+use trading_models::{Order, Position, Side, WatchConditionKind};
 use trading_store::{PositionRepo, RuleRepo};
 
 use crate::rules::{RuleAccount, RuleAccountLookup};
@@ -44,12 +45,19 @@ pub struct NotifyHub {
     rules: RuleRepo,
     accounts: Arc<dyn RuleAccountLookup>,
     channels: ChannelUrls,
+    /// 各交易所通知差异档案（唯一扩展点，启动期构造后只读）。
+    profiles: Arc<profile::NotifyProfiles>,
     /// 价差告警每 symbol 上次发送时间（连接期临时态，非业务数据）。
     spread_last_sent: Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    /// 订单事件播报去重表：`account:cid` → (status, filled)（通知临时态，仅 CTP 档案启用）。
+    order_event_dedup: Arc<tokio::sync::Mutex<std::collections::HashMap<String, (String, String)>>>,
 }
 
 /// 价差告警冷却：持续超阈值时每 symbol 每 60s 最多发一次。
 pub const SPREAD_ALERT_COOLDOWN_MS: i64 = 60_000;
+
+/// 订单事件去重表容量上限：超限整体清空（通知临时态，不做精确 LRU）。
+const ORDER_EVENT_DEDUP_CAP: usize = 10_000;
 
 /// 冷却判定（纯函数）：首次（last=None）必发；距上次 ≥ cooldown 才再发。
 pub fn should_send_spread_alert(now_ms: i64, last_sent: Option<i64>, cooldown_ms: i64) -> bool {
@@ -59,6 +67,39 @@ pub fn should_send_spread_alert(now_ms: i64, last_sent: Option<i64>, cooldown_ms
     }
 }
 
+/// 平仓通知 ROI（纯函数）：盈利值始终按实际成交价重算，分母由档案决定。
+///
+/// * [`profile::CloseRoiBasis::Cost`]：名义成本口径（`profit / cost`，旧行为）；
+/// * [`profile::CloseRoiBasis::Margin`]：占用保证金口径，按平仓量/持仓量摊分保证金。
+///
+/// 保证金缺失（`margin <= 0`）、持仓量非正或摊分后非正时**回退成本口径**，
+/// 绝不除零；平仓量超过持仓量时按持仓量摊分，避免保证金分母被放大。
+fn close_pnl_ratio(
+    pos: &Position,
+    close_price: Decimal,
+    close_qty: Decimal,
+    basis: profile::CloseRoiBasis,
+) -> (Decimal, Decimal) {
+    let (profit, cost_ratio) = pos.realized_close_pnl(close_price, close_qty);
+    if basis == profile::CloseRoiBasis::Cost {
+        return (profit, cost_ratio);
+    }
+    if pos.margin <= Decimal::ZERO || pos.quantity <= Decimal::ZERO {
+        return (profit, cost_ratio);
+    }
+    // 平仓量按持仓量封顶；摊分保证金 = margin × (平仓量 / 持仓量)。
+    let qty = std::cmp::min(close_qty, pos.quantity);
+    let margin_part = qty
+        .checked_div(pos.quantity)
+        .and_then(|ratio| pos.margin.checked_mul(ratio))
+        .unwrap_or(Decimal::ZERO);
+    if margin_part <= Decimal::ZERO {
+        return (profit, cost_ratio);
+    }
+    let ratio = profit.checked_div(margin_part).unwrap_or(cost_ratio);
+    (profit, ratio)
+}
+
 impl NotifyHub {
     pub fn new(
         http: Client,
@@ -66,6 +107,7 @@ impl NotifyHub {
         rules: RuleRepo,
         accounts: Arc<dyn RuleAccountLookup>,
         channels: ChannelUrls,
+        profiles: Arc<profile::NotifyProfiles>,
     ) -> Self {
         Self {
             http,
@@ -73,8 +115,15 @@ impl NotifyHub {
             rules,
             accounts,
             channels,
+            profiles,
             spread_last_sent: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            order_event_dedup: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// 取交易所通知档案；未登记交易所返回默认档案（与改造前行为一致）。
+    pub fn profile(&self, exchange: &str) -> profile::VenueNotifyProfile {
+        self.profiles.get(exchange)
     }
 
     /// Deribit 平仓价差过宽时调用：按每 symbol 60s 冷却决定是否发人工平仓告警。
@@ -125,24 +174,72 @@ impl NotifyHub {
         });
     }
 
-    /// 通知 A 触发点：deribit 订单流**任何状态变化**（挂单/成交/部分成交/撤单/失败）
-    /// 都播报，且不依赖本地是否有 order。
+    /// 通知 A 触发点：档案启用了订单事件播报的交易所，**任何状态变化**
+    /// （挂单/成交/部分成交/撤单/失败）都播报，且不依赖本地是否有 order
+    /// （柜台/其他终端手工单同样播）。
     ///
     /// **业务隔离**：本方法只做一次 `spawn`、立即返回，调用点不 await；查询、渲染、
     /// HTTP 全部在异步任务内，超时/失败只 `warn!`，绝不影响订单状态机与策略路由。
-    pub fn announce_deribit_position(
+    ///
+    /// 去重仅在 `profile.dedup_order_events` 时生效（CTP 同一状态会重复推送），
+    /// 键为 `(account, cid, status, filled)`；deribit 不去重，行为与改造前一致。
+    pub fn announce_order_event(
         &self,
+        profile: profile::VenueNotifyProfile,
         ev: &trading_core::protocol::OrderEvent,
         account: &str,
         account_id: Option<u64>,
     ) {
+        if profile.order_events.is_none() {
+            return;
+        }
+        if profile.dedup_order_events && self.is_duplicate_order_event(account, ev) {
+            tracing::debug!(
+                cid = %ev.client_order_id,
+                status = %ev.status,
+                "订单事件重复，跳过播报"
+            );
+            return;
+        }
         let this = self.clone();
         let ev = ev.clone();
         let account = account.to_string();
         tokio::spawn(async move {
-            this.deliver_deribit_position(&ev, &account, account_id)
+            this.deliver_order_event(profile, &ev, &account, account_id)
                 .await;
         });
+    }
+
+    /// 订单事件去重判定：同一 `(account, cid, status, filled)` 只播一次。
+    ///
+    /// 键必须带账户：柜台手工单的 cid 是 OrderRef，按账户/会话独立递增，
+    /// 进程级去重表若只按 cid 会误吞另一账户的手工单播报。
+    ///
+    /// 锁竞争极短时放弃去重（宁可多播不丢播）；容量超限整体清空。
+    fn is_duplicate_order_event(
+        &self,
+        account: &str,
+        ev: &trading_core::protocol::OrderEvent,
+    ) -> bool {
+        let Ok(mut guard) = self.order_event_dedup.try_lock() else {
+            return false;
+        };
+        let key = format!("{account}:{}", ev.client_order_id);
+        let status = ev.status.clone();
+        let filled = ev
+            .filled_quantity
+            .map(|f| f.to_string())
+            .unwrap_or_default();
+        if let Some((s, f)) = guard.get(&key) {
+            if *s == status && *f == filled {
+                return true;
+            }
+        }
+        if guard.len() >= ORDER_EVENT_DEDUP_CAP {
+            guard.clear();
+        }
+        guard.insert(key, (status, filled));
+        false
     }
 
     /// 投递一条成交通知（同步等待 HTTP，仅供 spawn 任务/测试调用）。
@@ -201,8 +298,10 @@ impl NotifyHub {
         );
         match position {
             Some(pos) => {
+                // 分母口径由交易所档案决定：deribit/binance 成本、CTP 保证金。
+                let basis = self.profile(&order.exchange).close_roi;
                 let (profit, ratio) =
-                    pos.realized_close_pnl(order.filled_price, order.filled_quantity);
+                    close_pnl_ratio(&pos, order.filled_price, order.filled_quantity, basis);
                 (profit, ratio, Some(pos))
             }
             None => {
@@ -247,14 +346,19 @@ impl NotifyHub {
 
     /// 通知 A 投递：解析订单事件 → 拼动作 → 查活跃仓位取 ROI → 渲染 → POST Position 通道。
     ///
-    /// 任何异常（未知状态、缺 account_id/仓位/URL、HTTP 失败）都只记日志、不外传。
-    async fn deliver_deribit_position(
+    /// 动作矩阵与文案对所有档案完全一致，仅标题（`profile.order_events.title`）与
+    /// 查 ROI 的标的类别不同。任何异常（未知状态、缺方向/委托量/URL、HTTP 失败）
+    /// 都只记日志、不外传。
+    async fn deliver_order_event(
         &self,
+        profile: profile::VenueNotifyProfile,
         ev: &trading_core::protocol::OrderEvent,
         account: &str,
         account_id: Option<u64>,
     ) {
-        use trading_models::InstrumentType;
+        let Some(broadcast) = profile.order_events else {
+            return;
+        };
         // 前置守卫：通道未配置 / 状态不播报，都在解析渲染之前直接跳过。
         let Some(url) = self.channels.target_url(NotifyChannel::Position) else {
             tracing::debug!(account, "position Webhook 未配置，通知A静默跳过");
@@ -264,18 +368,24 @@ impl NotifyHub {
             tracing::debug!(account, status = %ev.status, "通知A：状态不播报，跳过");
             return;
         };
-        // 2) 订单方向 / reduce_only / 委托量 / 累计成交量。
-        let direction = if ev.direction.as_deref() == Some("sell") {
-            trading_models::Side::Sell
-        } else {
-            trading_models::Side::Buy
+        // 手工单/重放行也必须有方向与委托量，缺失宁可不播（不臆造开/平与数量）。
+        let direction = match ev.direction.as_deref() {
+            Some("sell") => Side::Sell,
+            Some("buy") => Side::Buy,
+            _ => {
+                tracing::debug!(account, cid = %ev.client_order_id, "通知A：缺订单方向，跳过");
+                return;
+            }
+        };
+        let Some(amount) = ev.amount else {
+            tracing::debug!(account, cid = %ev.client_order_id, "通知A：缺委托量，跳过");
+            return;
         };
         let reduce_only = ev.reduce_only;
-        let amount = ev.amount.unwrap_or(Decimal::ZERO);
         let filled = ev.filled_quantity.unwrap_or(Decimal::ZERO);
         let is_filled = matches!(state, message::DeribitState::Filled);
 
-        // 3) 数量/价格：成交切换为成交量/成交均价，挂单用委托量/委托价。
+        // 数量/价格：成交切换为成交量/成交均价，挂单用委托量/委托价。
         let (quantity, price) = if is_filled {
             (filled, ev.filled_price.unwrap_or(Decimal::ZERO))
         } else {
@@ -289,13 +399,13 @@ impl NotifyHub {
         };
         let action = message::build_deribit_action(direction, reduce_only, state, filled, amount);
 
-        // 4) ROI/max_roi：按 instrument 查活跃仓位（account_id 缺省或查不到则 0，隐藏 ROI 段）。
+        // ROI/max_roi：按档案的交易所 + 标的类别查活跃仓位（缺省/查不到则 0，隐藏 ROI 段）。
         let (roi, max_roi) = account_id
             .and_then(|id| {
                 self.positions.find_active_instrument(
                     id,
-                    "deribit",
-                    InstrumentType::Option,
+                    profile.exchange,
+                    broadcast.instrument_type,
                     &ev.instrument,
                 )
             })
@@ -313,7 +423,7 @@ impl NotifyHub {
             max_roi,
             price,
         };
-        let content = message::render_deribit_order_status(&input);
+        let content = message::render_order_status(broadcast.title, &input);
         self.post_text(url, &content, account).await;
     }
 
@@ -444,6 +554,11 @@ mod tests {
 
     /// 极简 mock 企业微信服务器：返回 (URL, 收到的请求体集合)。
     fn mock_wecom() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        mock_wecom_n(1)
+    }
+
+    /// 接收最多 `n` 条请求的 mock（多消息播报测试用）。
+    fn mock_wecom_n(n: usize) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -452,7 +567,7 @@ mod tests {
         let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let bodies2 = std::sync::Arc::clone(&bodies);
         std::thread::spawn(move || {
-            for stream in listener.incoming().take(1) {
+            for stream in listener.incoming().take(n) {
                 let mut stream = stream.unwrap();
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 1024];
@@ -504,7 +619,16 @@ mod tests {
             rule_repo,
             std::sync::Arc::new(FixedAccounts),
             channels,
+            default_profiles(),
         )
+    }
+
+    /// 默认档案注册表（-20% / -20%），与生产默认阈值一致。
+    fn default_profiles() -> Arc<profile::NotifyProfiles> {
+        Arc::new(profile::NotifyProfiles::from_config(
+            dec("-0.20"),
+            dec("-0.20"),
+        ))
     }
 
     #[tokio::test]
@@ -560,6 +684,402 @@ mod tests {
         // 盈亏 =(64100.2-63250.5)×0.125=106.2125；比率 =106.2125/(63250.5×0.125)=1.3434%。
         assert!(content.contains("- 盈利值：106.212500"));
         assert!(content.contains("- 盈利百分比：1.3434%"));
+    }
+
+    // ---- Task 2：平仓 ROI 口径（Cost / Margin；纯函数 + 消息级）----
+
+    /// 构造一个合约仓位（成本价/数量/保证金/乘数可调）。
+    fn position(
+        exchange: &str,
+        instrument: &str,
+        side: Side,
+        pos_price: &str,
+        quantity: &str,
+        margin: &str,
+    ) -> Position {
+        let mut p = Position::new(1, exchange, instrument, side);
+        p.instrument_type = InstrumentType::Futures;
+        p.pos_price = dec(pos_price);
+        p.quantity = dec(quantity);
+        p.multiplier = dec("10");
+        p.margin = dec(margin);
+        p
+    }
+
+    #[test]
+    fn close_pnl_ratio_cost_basis_matches_legacy_cost_ratio() {
+        use crate::notify::profile::CloseRoiBasis;
+        // 多仓：成本 100×1×10=1000，平仓 110 → profit=100，Cost 口径 ratio=100/1000=0.1。
+        let pos = position("binance", "BTCUSDT", Side::Buy, "100", "1", "50");
+        let (profit, ratio) = close_pnl_ratio(&pos, dec("110"), dec("1"), CloseRoiBasis::Cost);
+        assert_eq!(profit, dec("100"));
+        assert_eq!(ratio, dec("0.1"));
+    }
+
+    #[test]
+    fn close_pnl_ratio_margin_basis_full_close_uses_margin() {
+        use crate::notify::profile::CloseRoiBasis;
+        // CTP：全平按占用保证金 50 作分母 → ratio=100/50=2（200%），而非成本口径 0.1。
+        let pos = position("ctp", "rb2612", Side::Buy, "100", "1", "50");
+        let (profit, ratio) = close_pnl_ratio(&pos, dec("110"), dec("1"), CloseRoiBasis::Margin);
+        assert_eq!(profit, dec("100"));
+        assert_eq!(ratio, dec("2"));
+    }
+
+    #[test]
+    fn close_pnl_ratio_margin_basis_partial_close_prorates_margin() {
+        use crate::notify::profile::CloseRoiBasis;
+        // 4 手持仓保证金 1000，平 2 手 → 摊分保证金 500；profit=200 → ratio=0.4。
+        let pos = position("ctp", "rb2612", Side::Buy, "100", "4", "1000");
+        let (profit, ratio) = close_pnl_ratio(&pos, dec("110"), dec("2"), CloseRoiBasis::Margin);
+        assert_eq!(profit, dec("200"));
+        assert_eq!(ratio, dec("0.4"));
+    }
+
+    #[test]
+    fn close_pnl_ratio_margin_basis_falls_back_when_margin_or_quantity_missing() {
+        use crate::notify::profile::CloseRoiBasis;
+        // margin=0 / quantity=0：回退成本口径，绝不除零。
+        let no_margin = position("ctp", "rb2612", Side::Buy, "100", "1", "0");
+        assert_eq!(
+            close_pnl_ratio(&no_margin, dec("110"), dec("1"), CloseRoiBasis::Margin),
+            (dec("100"), dec("0.1"))
+        );
+        let no_qty = position("ctp", "rb2612", Side::Buy, "100", "0", "50");
+        assert_eq!(
+            close_pnl_ratio(&no_qty, dec("110"), dec("1"), CloseRoiBasis::Margin),
+            (dec("100"), dec("0.1"))
+        );
+    }
+
+    #[test]
+    fn close_pnl_ratio_margin_basis_caps_close_qty_at_position_qty() {
+        use crate::notify::profile::CloseRoiBasis;
+        // 平仓量大于持仓量：保证金按持仓量封顶（50，不随平仓量放大），
+        // 盈利仍按传入平仓量计算（10×2×10=200）→ 200/50=4。
+        let pos = position("ctp", "rb2612", Side::Buy, "100", "1", "50");
+        let (profit, ratio) = close_pnl_ratio(&pos, dec("110"), dec("2"), CloseRoiBasis::Margin);
+        assert_eq!(profit, dec("200"));
+        assert_eq!(ratio, dec("4"));
+    }
+
+    #[tokio::test]
+    async fn deliver_ctp_close_uses_margin_roi_percentage_e2e() {
+        // Arrange：CTP 多仓（保证金 50、乘数 10），平仓成交 110。
+        let repo = position_repo();
+        repo.upsert_matching(vec![position("ctp", "rb2612", Side::Buy, "100", "1", "50")])
+            .unwrap();
+
+        let (url, bodies) = mock_wecom();
+        let h = hub(repo, "", &url);
+        let mut order = filled_order(Side::Sell, true, "110", "1");
+        order.exchange = "ctp".to_string();
+        order.instrument = "rb2612".to_string();
+        h.deliver(&order).await;
+
+        // Assert：盈利值按成交价重算 100；百分比按保证金口径 100/50=200%。
+        let sent = bodies.lock().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        let content = v["markdown"]["content"].as_str().unwrap();
+        assert!(content.contains("- 盈利值：100.000000"), "实际:\n{content}");
+        assert!(
+            content.contains("- 盈利百分比：200.0000%"),
+            "实际:\n{content}"
+        );
+    }
+
+    // ---- Task 6：CTP 订单事件播报（手工单 / 标题 / 去重 / replay）----
+
+    /// 构造订单事件（方向/开平/委托量/成交可调）。
+    fn order_event(
+        cid: &str,
+        status: &str,
+        direction: &str,
+        reduce_only: bool,
+        amount: &str,
+        filled: Option<(&str, &str)>,
+        limit_price: &str,
+    ) -> trading_core::protocol::OrderEvent {
+        trading_core::protocol::OrderEvent {
+            client_order_id: cid.to_string(),
+            status: status.to_string(),
+            exchange_order_id: Some("sys-1".to_string()),
+            filled_price: filled.map(|(_, p)| dec(p)),
+            filled_quantity: filled.map(|(q, _)| dec(q)),
+            exchange_update_time: None,
+            message: None,
+            instrument: "rb2612".to_string(),
+            direction: Some(direction.to_string()),
+            reduce_only,
+            amount: Some(dec(amount)),
+            limit_price: Some(dec(limit_price)),
+        }
+    }
+
+    /// Position 通道指向 mock 的 hub（订单事件播报走该通道）。
+    fn hub_with_position_url(url: &str) -> NotifyHub {
+        hub_with_position_url_and(position_repo(), url)
+    }
+
+    /// 同上，但可注入仓位仓储（ROI 片段测试用）。
+    fn hub_with_position_url_and(positions: PositionRepo, url: &str) -> NotifyHub {
+        let mut h = hub(positions, "", "");
+        h.channels = ChannelUrls::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            url.to_string(),
+        );
+        h
+    }
+
+    /// 等待 mock 收到至少 `n` 条请求（announce 内部 spawn，异步到达）。
+    async fn wait_for_bodies(bodies: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, n: usize) {
+        for _ in 0..200 {
+            if bodies.lock().unwrap().len() >= n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "等待 {n} 条通知超时，实际 {} 条",
+            bodies.lock().unwrap().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_ctp_order_event_manual_order_uses_profile_title_and_copy() {
+        // 本地无任何 Order/Position（柜台手工单）：仍按事件字段播报。
+        let (url, bodies) = mock_wecom();
+        let h = hub_with_position_url(&url);
+        h.deliver_order_event(
+            h.profile("ctp"),
+            &order_event("manual-1", "NEW", "sell", true, "5", None, "3500"),
+            "ctp_acct",
+            None,
+        )
+        .await;
+
+        let sent = bodies.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(
+            v["markdown"]["content"],
+            "> **CtpPositions(ctp_acct)**\n\
+             代币：rb2612，减买仓挂单成功，数量：5.0000 ，价格: 3500.0000"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_ctp_filled_event_uses_filled_qty_and_vwap() {
+        let (url, bodies) = mock_wecom();
+        let h = hub_with_position_url(&url);
+        h.deliver_order_event(
+            h.profile("ctp"),
+            &order_event(
+                "c-1",
+                "FILLED",
+                "buy",
+                false,
+                "5",
+                Some(("5", "3520.5")),
+                "3500",
+            ),
+            "ctp_acct",
+            None,
+        )
+        .await;
+
+        let sent = bodies.lock().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(
+            v["markdown"]["content"],
+            "> **CtpPositions(ctp_acct)**\n\
+             代币：rb2612，开买仓成功，数量：5.0000 ，价格: 3520.5000"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_ctp_order_event_includes_roi_from_local_position() {
+        // 档案按 (exchange=ctp, instrument_type=Futures) 查本地活跃仓位取 ROI。
+        let repo = position_repo();
+        let mut pos = Position::new(1, "ctp", "rb2612", Side::Buy);
+        pos.instrument_type = InstrumentType::Futures;
+        pos.quantity = dec("1");
+        pos.pos_price = dec("3500");
+        pos.multiplier = dec("10");
+        pos.roi = dec("-0.25");
+        pos.max_roi = dec("0.12");
+        repo.upsert_matching(vec![pos]).unwrap();
+
+        let (url, bodies) = mock_wecom();
+        let h = hub_with_position_url_and(repo, &url);
+        h.deliver_order_event(
+            h.profile("ctp"),
+            &order_event(
+                "r1",
+                "FILLED",
+                "sell",
+                true,
+                "5",
+                Some(("5", "3505")),
+                "3500",
+            ),
+            "ctp_acct",
+            Some(1),
+        )
+        .await;
+
+        let sent = bodies.lock().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        let content = v["markdown"]["content"].as_str().unwrap();
+        assert!(
+            content.contains(" (ROI: -25.00%, Max ROI: 12.00%)"),
+            "实际:\n{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctp_order_events_dedup_repeated_state_to_three_messages() {
+        // 10 手 5+5：挂单 → 第一次成交（部分成交）→ 终态成功。
+        // 同一 (cid,status,filled) 的重复帧（OnRtnTrade 与 OnRtnOrder 同状态）只播一次。
+        // mock 接受 4 条：若去重失效，第 4 条会被记录下来使断言失败。
+        let (url, bodies) = mock_wecom_n(4);
+        let h = hub_with_position_url(&url);
+        let profile = h.profile("ctp");
+        let events = [
+            order_event("c1", "NEW", "sell", true, "10", None, "3500"),
+            order_event(
+                "c1",
+                "PARTIAL",
+                "sell",
+                true,
+                "10",
+                Some(("5", "3500")),
+                "3500",
+            ),
+            // 重复帧：与上一条状态/成交量完全相同 → 去重。
+            order_event(
+                "c1",
+                "PARTIAL",
+                "sell",
+                true,
+                "10",
+                Some(("5", "3500")),
+                "3500",
+            ),
+            order_event(
+                "c1",
+                "FILLED",
+                "sell",
+                true,
+                "10",
+                Some(("10", "3505")),
+                "3500",
+            ),
+        ];
+        for ev in &events {
+            h.announce_order_event(profile, ev, "ctp_acct", None);
+        }
+
+        wait_for_bodies(&bodies, 3).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let sent = bodies.lock().unwrap();
+        assert_eq!(sent.len(), 3, "重复状态不应重复播报（挂单/部分成交/成功）");
+        // 内容断言：三种状态各恰好一条，防止「去重了错误的帧」这类回归。
+        let contents: Vec<String> = sent
+            .iter()
+            .map(|b| {
+                let v: serde_json::Value = serde_json::from_str(b).unwrap();
+                v["markdown"]["content"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(
+            contents.iter().filter(|c| c.contains("挂单成功")).count(),
+            1,
+            "实际: {contents:?}"
+        );
+        assert_eq!(
+            contents
+                .iter()
+                .filter(|c| c.contains("部分成交成功"))
+                .count(),
+            1,
+            "实际: {contents:?}"
+        );
+        assert_eq!(
+            contents.iter().filter(|c| c.contains("减买仓成功")).count(),
+            1,
+            "实际: {contents:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctp_dedup_is_per_account_not_global() {
+        // 手工单 cid 是柜台 OrderRef（每账户/会话递增）：两账户同 cid 同状态都必须播。
+        let (url, bodies) = mock_wecom_n(2);
+        let h = hub_with_position_url(&url);
+        let profile = h.profile("ctp");
+        let ev = order_event("101", "NEW", "buy", false, "5", None, "3500");
+        h.announce_order_event(profile, &ev, "acct-a", None);
+        h.announce_order_event(profile, &ev, "acct-b", None);
+
+        wait_for_bodies(&bodies, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            bodies.lock().unwrap().len(),
+            2,
+            "去重必须按账户隔离，不能跨账户吞掉手工单播报"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctp_leg_events_are_deduped_per_physical_order() {
+        // 同一逻辑 cid 的两张物理腿（cid#OrderRef）各播一条；重复的同腿状态仍被去重。
+        let (url, bodies) = mock_wecom_n(3);
+        let h = hub_with_position_url(&url);
+        let profile = h.profile("ctp-leg");
+        let leg_a = order_event("c1#101", "NEW", "buy", false, "5", None, "3500");
+        let leg_b = order_event("c1#102", "NEW", "buy", false, "5", None, "3500");
+
+        h.announce_order_event(profile, &leg_a, "ctp_acct", None);
+        h.announce_order_event(profile, &leg_b, "ctp_acct", None);
+        wait_for_bodies(&bodies, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(bodies.lock().unwrap().len(), 2, "两张物理单各一条");
+
+        // 重复的同腿状态：若未去重会发第 3 条（mock 接受 3 条，会被记录）。
+        h.announce_order_event(profile, &leg_a, "ctp_acct", None);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            bodies.lock().unwrap().len(),
+            2,
+            "同一物理腿的重复状态应被去重"
+        );
+    }
+
+    #[tokio::test]
+    async fn deribit_order_events_are_not_deduped() {
+        // deribit 档案 dedup=false：同一状态重复推送仍逐条播报（现状不变）。
+        let (url, bodies) = mock_wecom_n(2);
+        let h = hub_with_position_url(&url);
+        let profile = h.profile("deribit");
+        let ev = order_event("d1", "NEW", "buy", false, "1", None, "0.01");
+        h.announce_order_event(profile, &ev, "deribit_acct", None);
+        h.announce_order_event(profile, &ev, "deribit_acct", None);
+
+        wait_for_bodies(&bodies, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(bodies.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ctp_replay_source_has_no_order_events() {
+        // 重连/重启的重放行 source="ctp-replay"：未登记 → 默认档案 → 不播。
+        let h = hub(position_repo(), "", "");
+        assert!(h.profile("ctp").order_events.is_some());
+        assert!(h.profile("ctp-replay").order_events.is_none());
     }
 
     #[tokio::test]
@@ -661,6 +1181,7 @@ mod tests {
             rule_repo,
             std::sync::Arc::new(FixedAccounts),
             channels,
+            default_profiles(),
         );
         (h, positions, saved.id)
     }
@@ -683,6 +1204,21 @@ mod tests {
         );
         r.id = 0; // 插入前清零，由仓储分配。
         r
+    }
+
+    #[test]
+    fn hub_profile_uses_registry_for_known_and_unknown_exchanges() {
+        // 通知层统一从 NotifyHub 取档案：已登记所命中专属档案，未知所回落默认。
+        let h = hub(position_repo(), "", "");
+        assert_eq!(
+            h.profile("deribit").close_roi,
+            crate::notify::profile::CloseRoiBasis::Cost
+        );
+        assert_eq!(
+            h.profile("ctp").report_source,
+            crate::notify::profile::ReportSource::LocalPositions
+        );
+        assert!(h.profile("binance").order_events.is_none());
     }
 
     #[test]

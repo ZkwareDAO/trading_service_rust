@@ -34,6 +34,11 @@ pub const DEFAULT_BACKFILL_PAGE_DELAY: Duration = Duration::from_millis(500);
 /// 每所并发上限缺省。
 pub const DEFAULT_BACKFILL_CONCURRENCY: usize = 2;
 
+/// ROI 告警阈值缺省（百分数，-20%）。
+pub const DEFAULT_ROI_ALERT_THRESHOLD_PCT: f64 = -20.0;
+/// CTP ROI 告警阈值缺省（百分数，-20%）。
+pub const DEFAULT_CTP_ROI_ALERT_THRESHOLD_PCT: f64 = DEFAULT_ROI_ALERT_THRESHOLD_PCT;
+
 /// 加载后的全部 venue 配置（CtpConfig 含 String 非 Copy，整体退化为 Clone）。
 #[derive(Debug, Clone)]
 pub struct LoadedVenueConfigs {
@@ -45,6 +50,8 @@ pub struct LoadedVenueConfigs {
     pub binance: BinanceVenueConfig,
     /// K线相关配置（历史缺失自动回补/手动补区间）。
     pub kline: KlineConfig,
+    /// 通知相关配置（`[notify]`；各所告警阈值等）。
+    pub notify: NotifyConfig,
     /// CTP：.so 路径/流目录基准（feature="ctp" 时由 registry 消费；生产模式
     /// 开关已下沉账户级 credentials）。
     #[cfg(feature = "ctp")]
@@ -56,6 +63,64 @@ pub struct LoadedVenueConfigs {
 pub struct KlineConfig {
     /// 历史缺失自动回补参数。
     pub backfill: KlineBackfillConfig,
+}
+
+/// `[notify]` 通知配置（各交易所差异阈值；缺失取默认）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NotifyConfig {
+    /// deribit ROI 告警阈值（**百分数**，默认 -20；比率 = 该值 / 100）。
+    pub deribit_roi_alert_threshold_pct: f64,
+    /// CTP ROI 告警阈值（**百分数**，默认 -20；比率 = 该值 / 100）。
+    pub ctp_roi_alert_threshold_pct: f64,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            deribit_roi_alert_threshold_pct: DEFAULT_ROI_ALERT_THRESHOLD_PCT,
+            ctp_roi_alert_threshold_pct: DEFAULT_CTP_ROI_ALERT_THRESHOLD_PCT,
+        }
+    }
+}
+
+impl NotifyConfig {
+    /// 构造通知档案注册表：百分数 → 比率口径（-20 → -0.20）。
+    ///
+    /// `load` 阶段已拒绝非有限值，这里的兜底仅防御直接构造 `NotifyConfig` 的调用方。
+    pub fn to_profiles(&self) -> crate::notify::profile::NotifyProfiles {
+        // 用 TryFrom（去掉 f64 多余精度位），避免 -20/100 变成 -0.20000000000000001。
+        let ratio = |pct: f64| {
+            rust_decimal::Decimal::try_from(pct / 100.0)
+                .ok()
+                .unwrap_or_else(crate::notify::report::default_roi_alert_threshold)
+        };
+        crate::notify::profile::NotifyProfiles::from_config(
+            ratio(self.deribit_roi_alert_threshold_pct),
+            ratio(self.ctp_roi_alert_threshold_pct),
+        )
+    }
+
+    /// TOML 段 → 强类型；`inf/nan` 属非法配置，启动期 fail-fast。
+    fn from_section(s: &NotifySection) -> anyhow::Result<Self> {
+        let deribit = s
+            .deribit_roi_alert_threshold_pct
+            .unwrap_or(DEFAULT_ROI_ALERT_THRESHOLD_PCT);
+        let ctp = s
+            .ctp_roi_alert_threshold_pct
+            .unwrap_or(DEFAULT_CTP_ROI_ALERT_THRESHOLD_PCT);
+        if !deribit.is_finite() {
+            anyhow::bail!(
+                "[notify] deribit_roi_alert_threshold_pct 必须是有限数值，实际 {deribit}"
+            );
+        }
+        if !ctp.is_finite() {
+            anyhow::bail!("[notify] ctp_roi_alert_threshold_pct 必须是有限数值，实际 {ctp}");
+        }
+        Ok(Self {
+            deribit_roi_alert_threshold_pct: deribit,
+            ctp_roi_alert_threshold_pct: ctp,
+        })
+    }
 }
 
 /// `[kline.backfill]` 强类型配置（启动期解析+校验，非法 fail-fast）。
@@ -213,7 +278,7 @@ pub fn kline_baselines(cfg: &LoadedVenueConfigs) -> Vec<crate::kline::BaselineKl
     )]
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 struct VenueFile {
     #[serde(default)]
     deribit: DeribitSection,
@@ -225,10 +290,22 @@ struct VenueFile {
     /// K线段（历史回补）。
     #[serde(default)]
     kline: KlineSection,
+    /// 通知段（告警阈值）。
+    #[serde(default)]
+    notify: NotifySection,
     /// CTP 段（feature="ctp" 时由 registry 消费；缺失回退 vendored 缺省）。
     #[serde(default)]
     #[cfg(feature = "ctp")]
     ctp: CtpSection,
+}
+
+/// `[notify]` 原始 TOML（阈值保持百分数）。
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+struct NotifySection {
+    /// deribit ROI 告警阈值（百分数，缺省 -20）。
+    deribit_roi_alert_threshold_pct: Option<f64>,
+    /// CTP ROI 告警阈值（百分数，缺省 -20）。
+    ctp_roi_alert_threshold_pct: Option<f64>,
 }
 
 /// `[kline]` 段（当前仅含 backfill 子表）。
@@ -306,6 +383,9 @@ pub fn load(path: &Path) -> anyhow::Result<LoadedVenueConfigs> {
     // 回补配置非法（坏时长/越界）在启动期 fail-fast。
     let backfill = KlineBackfillConfig::from_section(&parsed.kline.backfill)
         .map_err(|e| anyhow::anyhow!("解析 venue 配置 {path:?}: {e}"))?;
+    // 通知阈值：缺省取默认；inf/nan 属非法配置，启动期 fail-fast。
+    let notify = NotifyConfig::from_section(&parsed.notify)
+        .map_err(|e| anyhow::anyhow!("解析 venue 配置 {path:?}: {e}"))?;
     #[cfg(feature = "ctp")]
     let shfe_close_priority = parse_enum_setting(
         &parsed.ctp.shfe_close_priority,
@@ -348,6 +428,7 @@ pub fn load(path: &Path) -> anyhow::Result<LoadedVenueConfigs> {
             kline_symbols: parsed.binance.kline_symbols,
         },
         kline: KlineConfig { backfill },
+        notify,
         #[cfg(feature = "ctp")]
         ctp: {
             let mut cfg = trading_exchange::ctp::from_values(
@@ -397,6 +478,7 @@ pub fn default_configs() -> LoadedVenueConfigs {
         kline: KlineConfig {
             backfill: KlineBackfillConfig::default(),
         },
+        notify: NotifyConfig::default(),
         #[cfg(feature = "ctp")]
         ctp: trading_exchange::ctp::from_values(
             None, None, None, None, None, None, None, None, None, None, None, None, None, None,
@@ -427,6 +509,65 @@ mod tests {
         assert_eq!(cfg.hyperliquid.slippage, "0.02".parse().unwrap());
         // deribit 段缺失仍取默认。
         assert_eq!(cfg.deribit.drift_ticks, 5);
+    }
+
+    #[test]
+    fn notify_thresholds_default_to_minus_20() {
+        let cfg = load(Path::new("/nonexistent/venue.toml")).expect("ok");
+        assert_eq!(cfg.notify.deribit_roi_alert_threshold_pct, -20.0);
+        assert_eq!(cfg.notify.ctp_roi_alert_threshold_pct, -20.0);
+        assert_eq!(
+            cfg.notify.deribit_roi_alert_threshold_pct,
+            DEFAULT_ROI_ALERT_THRESHOLD_PCT
+        );
+        assert_eq!(
+            cfg.notify.ctp_roi_alert_threshold_pct,
+            DEFAULT_CTP_ROI_ALERT_THRESHOLD_PCT
+        );
+    }
+
+    #[test]
+    fn notify_config_to_profiles_converts_pct_to_ratio() {
+        let profiles = NotifyConfig {
+            deribit_roi_alert_threshold_pct: -15.0,
+            ctp_roi_alert_threshold_pct: -35.0,
+        }
+        .to_profiles();
+        assert_eq!(
+            profiles.get("deribit").alert_threshold,
+            Some(Decimal::new(-15, 2))
+        );
+        assert_eq!(
+            profiles.get("ctp").alert_threshold,
+            Some(Decimal::new(-35, 2))
+        );
+    }
+
+    #[test]
+    fn parses_notify_thresholds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("venue.toml");
+        std::fs::write(
+            &path,
+            "[notify]\nderibit_roi_alert_threshold_pct = -15\nctp_roi_alert_threshold_pct = -35\n",
+        )
+        .unwrap();
+        let cfg = load(&path).expect("ok");
+        assert_eq!(cfg.notify.deribit_roi_alert_threshold_pct, -15.0);
+        assert_eq!(cfg.notify.ctp_roi_alert_threshold_pct, -35.0);
+    }
+
+    #[test]
+    fn notify_thresholds_reject_non_finite() {
+        for (key, line) in [
+            ("deribit", "deribit_roi_alert_threshold_pct = nan"),
+            ("ctp", "ctp_roi_alert_threshold_pct = inf"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("venue.toml");
+            std::fs::write(&path, format!("[notify]\n{line}\n")).unwrap();
+            assert!(load(&path).is_err(), "{key} 非有限阈值必须启动期拒绝");
+        }
     }
 
     #[test]

@@ -116,10 +116,6 @@ pub struct Args {
     #[arg(long, default_value = "")]
     pub notify_position_url: String,
 
-    /// 仓位告警 deribit ROI 阈值（百分数，如 -20 表示 ROI ≤ -20% 告警）。
-    #[arg(long, default_value = "-20")]
-    pub roi_alert_threshold_pct: f64,
-
     /// Venue 配置文件（交易所可调参数，如 deribit 价差阈值/漂移档数）；
     /// 文件不存在时用内置默认值。
     #[arg(long, default_value = "./config/venue.toml")]
@@ -168,8 +164,6 @@ pub struct ServiceConfig {
     pub notify_manual_close_url: String,
     /// 企业微信 Deribit 订单事件播报 Webhook（空串=关闭）。
     pub notify_position_url: String,
-    /// 仓位告警 deribit ROI 阈值（百分数，默认 -20）。
-    pub roi_alert_threshold_pct: f64,
     /// Venue 配置文件路径。
     pub venue_config: String,
 }
@@ -243,7 +237,6 @@ impl Args {
             notify_test_url: args.notify_test_url.trim().to_string(),
             notify_manual_close_url: args.notify_manual_close_url.trim().to_string(),
             notify_position_url: args.notify_position_url.trim().to_string(),
-            roi_alert_threshold_pct: args.roi_alert_threshold_pct,
             venue_config: args.venue_config.trim().to_string(),
         })
     }

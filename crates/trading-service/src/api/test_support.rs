@@ -74,6 +74,11 @@ pub async fn app_with_accounts(csv_body: &str) -> TestApp {
             String::new(),
             String::new(),
         ),
+        // 测试使用生产默认阈值档案（-20% / -20%）。
+        notify_profiles: Arc::new(crate::notify::profile::NotifyProfiles::from_config(
+            crate::notify::report::default_roi_alert_threshold(),
+            crate::notify::report::default_roi_alert_threshold(),
+        )),
         venue: crate::venue_config::default_configs(),
     });
 

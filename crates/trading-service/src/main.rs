@@ -182,6 +182,10 @@ async fn main() -> anyhow::Result<()> {
     // —— 本地模拟所静态端点覆盖（REST 基址 + 账户事件 WS 地址，同一类型直通）——
     let endpoints: VenueEndpoints = Arc::new(cfg.exchanges.clone());
 
+    // —— 通知档案：由 venue.toml `[notify]` 阈值构造（百分数→比率在 config 层完成）——
+    let notify_thresholds = venue_cfg.notify.clone();
+    let notify_profiles = Arc::new(notify_thresholds.to_profiles());
+
     // —— 共享状态：交易所注册表/仓位引擎/规则引擎在此一处装配，数据句柄全取自 store ——
     let state = AppState::assemble(AssemblyDeps {
         store: Arc::clone(&store),
@@ -204,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.notify_manual_close_url,
             cfg.notify_position_url.clone(),
         ),
+        notify_profiles,
         venue: venue_cfg,
     });
 
@@ -287,20 +292,17 @@ async fn main() -> anyhow::Result<()> {
     if cfg.notify_position_url.trim().is_empty() {
         info!("未配置 --notify-position-url，仓位定时播报/告警不启动");
     } else {
-        // 百分数（-20）→ 比率口径（-0.20）；非法值回退默认 -20%。
-        let threshold = rust_decimal::Decimal::from_f64_retain(cfg.roi_alert_threshold_pct / 100.0)
-            .unwrap_or_else(notify::report::default_roi_alert_threshold);
         let reporter = notify::report::PositionReporter::new(
             state.notify.clone(),
             state.exchanges.clone(),
             state.accounts.inner().clone(),
             store.position_repo().expect("position repo after recover"),
             store.rule_repo().expect("rule repo after recover"),
-            threshold,
         );
         reporter.spawn();
         info!(
-            roi_alert_threshold = %threshold,
+            deribit_roi_alert_threshold_pct = notify_thresholds.deribit_roi_alert_threshold_pct,
+            ctp_roi_alert_threshold_pct = notify_thresholds.ctp_roi_alert_threshold_pct,
             "仓位定时播报/告警已启动（1h 周期，position 通道）"
         );
     }

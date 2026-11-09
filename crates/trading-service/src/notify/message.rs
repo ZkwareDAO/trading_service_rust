@@ -289,12 +289,12 @@ const DERIBIT_QTY_SCALE: u32 = 4;
 /// 通知 A ROI 百分比的固定小数位（2 位）。
 const DERIBIT_ROI_PCT_SCALE: u32 = 2;
 
-/// Deribit 订单状态播报（单行 markdown）。
-#[allow(dead_code)]
-pub fn render_deribit_order_status(input: &DeribitOrderStatusInput) -> String {
+/// 订单状态播报（单行 markdown）：`title` 为各所档案的标题
+/// （`DeribitPositions` / `CtpPositions`），其余文案完全一致。
+pub fn render_order_status(title: &str, input: &DeribitOrderStatusInput) -> String {
     // 头部 + 「代币 / 动作 / 数量」。
     let mut line = format!(
-        "> **DeribitPositions({})**\n代币：{}，{}，数量：{}",
+        "> **{title}({})**\n代币：{}，{}，数量：{}",
         input.user_name,
         input.instrument,
         input.action,
@@ -323,12 +323,27 @@ pub fn render_deribit_order_status(input: &DeribitOrderStatusInput) -> String {
     line
 }
 
+/// Deribit 订单状态播报（单行 markdown）：原函数保留为薄包装，输出逐字不变。
+#[allow(dead_code)]
+pub fn render_deribit_order_status(input: &DeribitOrderStatusInput) -> String {
+    render_order_status("DeribitPositions", input)
+}
+
 /// ROI 告警渲染时的小数位（百分比 2 位）。
 const REPORT_ROI_PCT_SCALE: u32 = 2;
 /// 数量固定小数位（代币数量 4 位）。
 const REPORT_QTY_SCALE: u32 = 4;
 /// 分段发送默认上限（字节）：企微 markdown content 上限 4096，预留安全余量。
 pub const CHUNK_MAX_BYTES: usize = 4000;
+
+/// 仓位播报中杠杆相关行的展示方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeverageDisplay {
+    /// 原「杠杆倍数: N」。
+    Multiple(u64),
+    /// 「保证金比例: X.XX%」（比率口径，渲染时 ×100）。
+    MarginRatio(Decimal),
+}
 
 /// 仓位定时播报中的单条持仓渲染输入。
 #[derive(Debug, Clone)]
@@ -343,8 +358,8 @@ pub struct PositionReportItem<'a> {
     pub entry_price: Decimal,
     /// 代币数量。
     pub quantity: Decimal,
-    /// 杠杆（0 = 期权无杠杆，省略该行）。
-    pub leverage: u64,
+    /// 杠杆相关行：None = 省略该行（期权无杠杆/分母缺失）。
+    pub leverage: Option<LeverageDisplay>,
     /// 盈亏金额。
     pub pnl: Decimal,
     /// 盈亏比率（比率口径；渲染 ×100，盈利带 +）。
@@ -387,9 +402,15 @@ fn render_report_item(p: &PositionReportItem) -> String {
         format!("成本价: {}", fixed(p.entry_price, MONEY_SCALE)),
         format!("代币数量: {}", fixed(p.quantity, REPORT_QTY_SCALE)),
     ];
-    // 杠杆行：仅 >0 输出（期权无杠杆）。
-    if p.leverage > 0 {
-        lines.push(format!("杠杆倍数: {}", p.leverage));
+    // 杠杆相关行：期权/分母缺失时省略。
+    if let Some(display) = p.leverage {
+        match display {
+            LeverageDisplay::Multiple(n) => lines.push(format!("杠杆倍数: {n}")),
+            LeverageDisplay::MarginRatio(ratio) => lines.push(format!(
+                "保证金比例: {}%",
+                fixed(ratio * Decimal::ONE_HUNDRED, REPORT_ROI_PCT_SCALE)
+            )),
+        }
     }
     // ROI 文本：×100 后 2 位小数，正值显式加 `+`（负值自带 -）。
     let roi_text = roi_pct_text(p.roi);
@@ -938,6 +959,24 @@ mod tests {
         );
     }
 
+    /// 通用标题包装：除标题外与 deribit 输出逐字一致（CTP 复用同一文案）。
+    #[test]
+    fn render_order_status_swaps_title_only() {
+        let input = DeribitOrderStatusInput {
+            user_name: "ctp_acct",
+            instrument: "rb2612",
+            action: "开买仓挂单成功",
+            quantity: dec("5"),
+            remaining: dec("2"),
+            roi: dec("-0.123"),
+            max_roi: dec("0.456"),
+            price: dec("3500"),
+        };
+        let deribit = render_deribit_order_status(&input);
+        let ctp = render_order_status("CtpPositions", &input);
+        assert_eq!(ctp, deribit.replacen("DeribitPositions", "CtpPositions", 1));
+    }
+
     /// build_deribit_action 完整矩阵。
     #[test]
     fn build_deribit_action_matrix() {
@@ -1020,6 +1059,44 @@ mod tests {
         assert_eq!(deribit_state_from_wire(""), None);
     }
 
+    // ---- Task 3：保证金比例行（CTP）----
+
+    #[test]
+    fn render_position_report_margin_ratio_line() {
+        // MarginRatio 比率口径 0.1 → 「保证金比例: 10.00%」，不出现杠杆倍数行。
+        let item = PositionReportItem {
+            instrument: "rb2612",
+            side: Side::Buy,
+            market_price: dec("4100"),
+            entry_price: dec("4000"),
+            quantity: dec("1"),
+            leverage: Some(LeverageDisplay::MarginRatio(dec("0.1"))),
+            pnl: dec("100"),
+            roi: dec("0.025"),
+        };
+        let msg = render_position_report("ctp_acct", "ctp", &[item]);
+        assert!(msg.contains("保证金比例: 10.00%"), "实际:\n{msg}");
+        assert!(!msg.contains("杠杆倍数"), "实际:\n{msg}");
+    }
+
+    #[test]
+    fn render_position_report_omits_leverage_line_when_none() {
+        // None：杠杆倍数与保证金比例两行都不出现。
+        let item = PositionReportItem {
+            instrument: "rb2612",
+            side: Side::Buy,
+            market_price: dec("4100"),
+            entry_price: dec("4000"),
+            quantity: dec("1"),
+            leverage: None,
+            pnl: dec("100"),
+            roi: dec("0.025"),
+        };
+        let msg = render_position_report("ctp_acct", "ctp", &[item]);
+        assert!(!msg.contains("杠杆倍数"), "实际:\n{msg}");
+        assert!(!msg.contains("保证金比例"), "实际:\n{msg}");
+    }
+
     /// 仓位播报示例：标题、颜色标签、杠杆与盈亏格式（多仓）。
     #[test]
     fn render_position_report_matches_doc_example_long() {
@@ -1029,7 +1106,7 @@ mod tests {
             market_price: dec("63980.5"),
             entry_price: dec("63250"),
             quantity: dec("0.125"),
-            leverage: 10,
+            leverage: Some(LeverageDisplay::Multiple(10)),
             pnl: dec("91.3125"),
             roi: dec("0.0115"),
         };
@@ -1056,7 +1133,7 @@ mod tests {
             market_price: dec("3100.2"),
             entry_price: dec("3120"),
             quantity: dec("1.5"),
-            leverage: 0,
+            leverage: None,
             pnl: dec("29.7"),
             roi: dec("0.0095"),
         };
@@ -1070,7 +1147,7 @@ mod tests {
             market_price: dec("0.058267"),
             entry_price: dec("0.065"),
             quantity: dec("40"),
-            leverage: 0,
+            leverage: None,
             pnl: dec("0.269335"),
             roi: dec("-0.1036"),
         };
@@ -1098,7 +1175,7 @@ mod tests {
             market_price: dec("0.083009"),
             entry_price: dec("0.11"),
             quantity: dec("40"),
-            leverage: 0,
+            leverage: None,
             pnl: dec("-1.079623"),
             roi: dec("-0.2454"),
         };

@@ -64,6 +64,8 @@ pub struct AssemblyDeps {
     pub endpoints: VenueEndpoints,
     /// 企业微信四通道 Webhook 对照表（空串=未配置）。
     pub channels: crate::notify::ChannelUrls,
+    /// 各交易所通知差异档案（唯一扩展点，main 按 CLI 阈值构造）。
+    pub notify_profiles: Arc<crate::notify::profile::NotifyProfiles>,
     /// 全部 venue 可调参数（deribit 价差/漂移、hyperliquid 滑点）。
     pub venue: crate::venue_config::LoadedVenueConfigs,
 }
@@ -109,6 +111,7 @@ impl AppState {
             kline_stall_threshold,
             endpoints,
             channels,
+            notify_profiles,
             venue,
         } = deps;
 
@@ -233,6 +236,7 @@ impl AppState {
             watch_rules.clone(),
             Arc::new(accounts.clone()),
             channels,
+            notify_profiles,
         );
 
         let rule_engine = RuleEngine::new(

@@ -101,17 +101,24 @@ pub async fn apply_and_route(state: &AppState, ev: &OrderEvent, source: &str) {
 /// AppState 作为交易所接入层的订单回报出口：账户事件流只认 `OrderEventSink`，
 /// 不反向依赖 AppState 具体类型。
 ///
-/// 顺序：**先触发通知 A（仅 deribit）、再做本地订单处理**。通知为 fire-and-forget
-/// （内部自行 spawn），此处不 await，故通知超时/失败绝不影响下面的订单状态机与路由。
+/// 顺序：**先按交易所档案触发通知 A（deribit / ctp），再做本地订单处理**。通知为
+/// fire-and-forget（内部自行 spawn），此处不 await，故通知超时/失败绝不影响下面的
+/// 订单状态机与路由。重放来源（`ctp-replay`）未登记档案 → 不播，业务照常。
 #[async_trait::async_trait]
 impl trading_exchange::port::OrderEventSink for crate::state::AppState {
     async fn on_order_event(&self, ev: &OrderEvent, source: &str, account: &str) {
-        // 通知 A：仅 deribit 订单流；在 apply_and_route 之前旁路触发。
-        if source == "deribit" {
+        // 通知 A：档案启用了订单事件播报才触发；在 apply_and_route 之前旁路。
+        let profile = self.notify.profile(source);
+        if profile.order_events.is_some() {
             // 按账户名反查 id（供任务内查仓位 ROI）；查不到传 None，任务照常播报。
             let account_id = self.accounts.account_id_by_name(account);
             self.notify
-                .announce_deribit_position(ev, account, account_id);
+                .announce_order_event(profile, ev, account, account_id);
+        }
+        // 物理腿事件只用于播报（一单两腿各自独立通知），不进订单状态机：
+        // 业务状态只认按 cid 聚合的逻辑事件（source="ctp" / "ctp-agg" / "ctp-replay"）。
+        if source == "ctp-leg" {
+            return;
         }
         apply_and_route(self, ev, source).await;
     }
@@ -206,6 +213,116 @@ mod tests {
             rule.status
         );
         // FILLED 单已被状态机软删（tombstone），须用 peek 读取终态。
+        let order = state.store.order_repo().unwrap().peek_by_cid(&cid).unwrap();
+        assert_eq!(order.status, trading_models::OrderStatus::Filled);
+    }
+
+    /// 通知层前置守卫（deribit 缺 direction/amount 不播）不得影响业务推进。
+    #[tokio::test]
+    async fn deribit_notification_guard_does_not_block_business_apply() {
+        use trading_exchange::port::OrderEventSink;
+
+        let (state, cid, rule_id) = seed_inuse_rule_order(false).await;
+        let mut e = ev(&cid, "FILLED", None);
+        e.direction = None;
+        e.amount = None;
+
+        state.on_order_event(&e, "deribit", "acct").await;
+
+        // 通知可静默跳过，但订单状态机与规则必须照常推进。
+        let order = state.store.order_repo().unwrap().peek_by_cid(&cid).unwrap();
+        assert_eq!(order.status, trading_models::OrderStatus::Filled);
+        let rule = state
+            .store
+            .rule_repo()
+            .unwrap()
+            .get_including_deleted(rule_id)
+            .expect("rule row exists");
+        assert_eq!(rule.status, WatchRuleStatus::Retired);
+    }
+
+    /// 物理腿来源（ctp-leg）：只播报，绝不推进订单状态机/规则。
+    #[tokio::test]
+    async fn leg_source_notifies_only_and_does_not_apply_business() {
+        use trading_exchange::port::OrderEventSink;
+
+        let (state, cid, rule_id) = seed_inuse_rule_order(false).await;
+        assert!(state.notify.profile("ctp-leg").order_events.is_some());
+        let before = state
+            .store
+            .order_repo()
+            .unwrap()
+            .peek_by_cid(&cid)
+            .unwrap()
+            .status;
+
+        // 用同一 cid 的终态回报模拟腿事件：若误入 apply_and_route 会立即置 Filled。
+        state
+            .on_order_event(&ev(&cid, "FILLED", None), "ctp-leg", "acct")
+            .await;
+
+        let after = state
+            .store
+            .order_repo()
+            .unwrap()
+            .peek_by_cid(&cid)
+            .unwrap()
+            .status;
+        assert_eq!(after, before, "腿事件不得推进订单状态机");
+        let rule = state
+            .store
+            .rule_repo()
+            .unwrap()
+            .get_including_deleted(rule_id)
+            .expect("rule row exists");
+        assert_ne!(rule.status, WatchRuleStatus::Retired, "腿事件不得退休规则");
+    }
+
+    /// 两腿聚合来源（ctp-agg）：业务照常推进，通知层无档案 → 不播。
+    #[tokio::test]
+    async fn agg_source_applies_business_without_notification() {
+        use trading_exchange::port::OrderEventSink;
+
+        let (state, cid, rule_id) = seed_inuse_rule_order(false).await;
+        assert!(state.notify.profile("ctp-agg").order_events.is_none());
+
+        state
+            .on_order_event(&ev(&cid, "FILLED", None), "ctp-agg", "acct")
+            .await;
+
+        let order = state.store.order_repo().unwrap().peek_by_cid(&cid).unwrap();
+        assert_eq!(order.status, trading_models::OrderStatus::Filled);
+        let rule = state
+            .store
+            .rule_repo()
+            .unwrap()
+            .get_including_deleted(rule_id)
+            .expect("rule row exists");
+        assert_eq!(rule.status, WatchRuleStatus::Retired);
+    }
+
+    /// 重放 source（ctp-replay）：不播订单事件，但业务状态机照常推进并退休规则。
+    #[tokio::test]
+    async fn replay_source_skips_order_notification_but_applies_business() {
+        use trading_exchange::port::OrderEventSink;
+
+        let (state, cid, rule_id) = seed_inuse_rule_order(false).await;
+        // 未登记交易所档案 → order_events=None，通知层直接跳过。
+        assert!(state.notify.profile("ctp-replay").order_events.is_none());
+
+        // Act：以重放来源投递终态回报。
+        state
+            .on_order_event(&ev(&cid, "FILLED", None), "ctp-replay", "acct")
+            .await;
+
+        // Assert：业务照常（规则退休、订单终态）。
+        let rule = state
+            .store
+            .rule_repo()
+            .unwrap()
+            .get_including_deleted(rule_id)
+            .expect("rule row exists");
+        assert_eq!(rule.status, WatchRuleStatus::Retired);
         let order = state.store.order_repo().unwrap().peek_by_cid(&cid).unwrap();
         assert_eq!(order.status, trading_models::OrderStatus::Filled);
     }
