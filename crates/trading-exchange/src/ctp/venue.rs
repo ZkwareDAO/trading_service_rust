@@ -1375,6 +1375,22 @@ fn is_venue_reject_status_msg(msg: &str) -> bool {
     REJECT_KEYWORDS.iter().any(|k| msg.contains(k))
 }
 
+/// CTP 终态 → 统一订单状态：`Cancelled` + 拒单文案 → `Rejected`（柜台拒绝，
+/// 不是用户主动撤单）；其余（含正常「已撤单」）走常规映射。
+///
+/// 仅 `Cancelled` 可改判：全成/排队态即便文案含关键词也保持原映射。
+fn terminal_status_from(
+    reported: crate::ctp::core::types::OrderStatus,
+    status_msg: &str,
+) -> trading_models::OrderStatus {
+    use crate::ctp::core::types::OrderStatus as CtpStatus;
+    if reported == CtpStatus::Cancelled && is_venue_reject_status_msg(status_msg.trim()) {
+        trading_models::OrderStatus::Rejected
+    } else {
+        crate::ctp::mapping::status_from_snapshot(reported)
+    }
+}
+
 /// 委托快照 → 订单端口（实时回报与后台重放共用同一路径）。
 ///
 /// 一个 cid 可能对应跨今昨一单两腿：先把本腿最新快照写入 LegTable，按 **cid 聚合**
@@ -1507,6 +1523,9 @@ fn emit_leg_notification(
         return;
     }
     let mut state = crate::ctp::mapping::order_state_from_snapshot(leg);
+    // 物理腿通知与逻辑终态同口径：Cancelled + 拒单文案 → REJECTED。
+    // 多腿单不播聚合事件，用户只看到 ctp-leg，必须在这里改判。
+    state.status = terminal_status_from(leg.status, &leg.status_msg);
     state.average_price = vwap;
     let mut event = crate::translate::order_event(&state);
     event.client_order_id = format!("{cid}#{}", leg.order_ref);
@@ -1641,18 +1660,11 @@ fn project_terminal(ctx: &EventContext, handle: &Arc<CtpUserHandle>, cid: &str, 
             "CTP 终态投影缺成交回报 VWAP（可能丢帧），按快照成交量投影、成交价留空"
         );
     }
-    // Part B：柜台对「受理后拒绝」只回 OnRtnOrder(Cancelled)+StatusMsg（如
-    // `49:…被拒绝…价格超出涨停板`），raw_status 仍是 Cancelled。据拒单文案把它
-    // 收敛为 Rejected，避免下游把柜台拒单当成用户主动撤单（通知文案/复盘口径）。
-    // 仅 Cancelled 可改判：全成/排队态即便文案含关键词也保持原映射。
-    let venue_rejected = reported == CtpStatus::Cancelled
-        && is_venue_reject_status_msg(agg.representative.status_msg.trim());
     let mut state = crate::ctp::mapping::order_state_from_snapshot(&agg.representative);
-    state.status = if venue_rejected {
-        trading_models::OrderStatus::Rejected
-    } else {
-        crate::ctp::mapping::status_from_snapshot(reported)
-    };
+    // 柜台对「受理后拒绝」只回 OnRtnOrder(Cancelled)+StatusMsg（如
+    // `49:…被拒绝…价格超出涨停板`）：据拒单文案改判 Rejected，避免下游把
+    // 柜台拒单当成用户主动撤单（通知文案/复盘口径）。
+    state.status = terminal_status_from(reported, &agg.representative.status_msg);
     state.filled_quantity = rust_decimal::Decimal::from(agg.filled.max(0));
     // 快照本身无价；真实成交均价只来自 OnRtnTrade 累计。
     state.average_price = vwap;
