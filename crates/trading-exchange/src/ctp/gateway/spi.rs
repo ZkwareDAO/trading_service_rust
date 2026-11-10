@@ -8,6 +8,7 @@ use std::sync::mpsc::SyncSender;
 
 use crate::ctp::core::encoding::decode_fixed;
 use crate::ctp::core::event::{CtpEvent, InstrumentInfo, LoginInfo};
+use crate::ctp::core::types::{Direction, Offset};
 use ctp2rs::v1alpha1::{CThostFtdcRspInfoField, CThostFtdcRspUserLoginField, TraderSpi};
 
 use crate::ctp::gateway::convert::snapshot::{order_snapshot, position_snapshot, trade_snapshot};
@@ -33,6 +34,26 @@ impl EventTraderSpi {
 fn read_rsp(info: Option<&CThostFtdcRspInfoField>) -> (i32, String) {
     info.map(|i| (i.ErrorID, decode_fixed(&i.ErrorMsg)))
         .unwrap_or((0, String::new()))
+}
+
+/// 报单录入错误帧 → [`CtpEvent::OrderRejected`]（订单须收敛，不能只记错误）。
+///
+/// 字段口径与 `order_snapshot` 一致：方向未知回退 Buy、开平未知为 None
+/// （宁缺勿错，不臆造开平方向）。
+fn rejected_event(
+    input: &ctp2rs::v1alpha1::CThostFtdcInputOrderField,
+    code: i32,
+    msg: String,
+) -> CtpEvent {
+    CtpEvent::OrderRejected {
+        order_ref: decode_fixed(&input.OrderRef),
+        instrument: decode_fixed(&input.InstrumentID),
+        direction: Direction::from_code(input.Direction as u8 as char).unwrap_or(Direction::Buy),
+        offset: Offset::from_code(input.CombOffsetFlag[0] as u8 as char),
+        volume: input.VolumeTotalOriginal,
+        code,
+        msg,
+    }
 }
 
 impl EventTraderSpi {
@@ -104,13 +125,23 @@ impl TraderSpi for EventTraderSpi {
 
     fn on_rsp_order_insert(
         &mut self,
-        _input: Option<&ctp2rs::v1alpha1::CThostFtdcInputOrderField>,
+        input: Option<&ctp2rs::v1alpha1::CThostFtdcInputOrderField>,
         info: Option<&CThostFtdcRspInfoField>,
         _request_id: i32,
         _is_last: bool,
     ) {
         // 报单录入被拒；受理成功时委托状态经 on_rtn_order 推送。
-        self.emit_error_if_any(info);
+        let (code, msg) = read_rsp(info);
+        if code == 0 {
+            return;
+        }
+        match input {
+            // 有输入字段即可反查 OrderRef→cid，把该单收敛为终态（柜台不会再发
+            // OnRtnOrder，只看错误帧会永久卡 NEW）。
+            Some(i) => self.emit(rejected_event(i, code, msg)),
+            // 无 input（理论不应发生）：退回 Error，保留错误码可诊断。
+            None => self.emit(CtpEvent::Error { code, msg }),
+        }
     }
 
     fn on_rtn_order(&mut self, order: Option<&ctp2rs::v1alpha1::CThostFtdcOrderField>) {
@@ -212,11 +243,15 @@ impl TraderSpi for EventTraderSpi {
 
     fn on_err_rtn_order_insert(
         &mut self,
-        _input: Option<&ctp2rs::v1alpha1::CThostFtdcInputOrderField>,
+        input: Option<&ctp2rs::v1alpha1::CThostFtdcInputOrderField>,
         info: Option<&CThostFtdcRspInfoField>,
     ) {
+        // 异步拒绝报单录入：同样携带 input，收敛路径与同步应答一致。
         let (code, msg) = read_rsp(info);
-        self.emit(CtpEvent::Error { code, msg });
+        match input {
+            Some(i) if code != 0 => self.emit(rejected_event(i, code, msg)),
+            _ => self.emit(CtpEvent::Error { code, msg }),
+        }
     }
 
     fn on_rsp_error(

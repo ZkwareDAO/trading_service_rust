@@ -1201,6 +1201,44 @@ fn dispatch_event(
         CtpEvent::Order(s) => {
             forward_order_snapshot(ctx, handle, s, false);
         }
+        // 报单录入被拒（柜台只回插入错误帧、无 OnRtnOrder）：合成零成交 Canceled
+        // 终态快照，走与实时回报相同的腿表聚合/终态收口。拒单文案命中关键词时
+        // project_terminal 改判 Rejected；单腿立即终态，多腿须全部腿终态才收敛
+        // （一腿拒、一腿在挂不误杀）。幂等：随后若仍有 OnRtnOrder 终态，apply_event
+        // 侧已是终态会忽略。
+        CtpEvent::OrderRejected {
+            order_ref,
+            instrument,
+            direction,
+            offset,
+            volume,
+            code,
+            msg,
+        } => {
+            let cid = resolve_event_cid(ctx, &order_ref);
+            tracing::warn!(
+                account = %ctx.account, cid = %cid, order_ref = %order_ref,
+                instrument = %instrument, code, %msg,
+                "CTP 报单录入被拒，按 OrderRef 收敛订单"
+            );
+            let snap = crate::ctp::core::event::OrderSnapshot {
+                order_ref,
+                instrument,
+                exchange_id: String::new(),
+                order_sys_id: String::new(),
+                insert_time: String::new(),
+                direction,
+                offset,
+                status: crate::ctp::core::types::OrderStatus::Cancelled,
+                limit_price: 0.0,
+                volume_total: volume,
+                volume_traded: 0,
+                status_msg: msg,
+                front_id: 0,
+                session_id: 0,
+            };
+            forward_order_snapshot(ctx, handle, snap, false);
+        }
         // 当日报单查询行：按在途闸门分流——前台查单缓冲，后台重放走订单桥。
         CtpEvent::OrderQuery(s) => match active {
             Some(ActiveQuery::FrontOrder { rows, .. }) => rows.push(s),

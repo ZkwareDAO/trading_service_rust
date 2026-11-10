@@ -104,6 +104,27 @@ pub enum CtpEvent {
     OrderQuery(OrderSnapshot),
     /// 成交回报。
     Trade(TradeSnapshot),
+    /// 报单录入被柜台拒绝（`on_rsp_order_insert` / `on_err_rtn_order_insert`）。
+    ///
+    /// 此类拒单柜台**不会再推 `OnRtnOrder`**，若不据此收敛，订单会卡在 `NEW`。
+    /// 事件携带原始输入字段要素，供上层按 `order_ref` 反查 cid 并收敛终态。
+    /// 撤单错误帧（24/25/26）没有此语义，仍走 [`Error`](Self::Error)。
+    OrderRejected {
+        /// 报单引用（客户端自填，cid 关联键）。
+        order_ref: String,
+        /// 合约代码。
+        instrument: String,
+        /// 买卖方向。
+        direction: Direction,
+        /// 开平标志（开仓/平仓/平今/平昨）；未知字符为 None。
+        offset: Option<Offset>,
+        /// 委托总量（手）。
+        volume: i32,
+        /// 柜台错误码。
+        code: i32,
+        /// 错误信息（GB18030 解码后的中文文本）。
+        msg: String,
+    },
     /// 报单被拒/错误回报。
     Error { code: i32, msg: String },
     /// 合约信息（查询应答逐条返回）。
