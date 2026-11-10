@@ -2478,6 +2478,118 @@ mod tests {
         assert!(ctx.order_refs.cid_of(&r1).is_none());
     }
 
+    // ---- Part A：插入错误帧（携带 OrderRef）收敛为终态 ----
+
+    /// 构造插入错误帧事件（柜台只回报单录入错误、无 OnRtnOrder 的情形）。
+    fn insert_reject(order_ref: &str, volume: i32) -> CtpEvent {
+        CtpEvent::OrderRejected {
+            order_ref: order_ref.to_string(),
+            instrument: "rb2510".to_string(),
+            direction: Direction::Sell,
+            offset: Some(Offset::Open),
+            volume,
+            code: 31,
+            msg: "资金不足".to_string(),
+        }
+    }
+
+    /// Part A：仅收到插入错误帧（code=31 资金不足）时，按 OrderRef 反查 cid，
+    /// 单腿单立即收敛为 REJECTED（旧实现会卡在 NEW）。
+    #[test]
+    fn insert_error_frame_converges_single_leg_to_rejected() {
+        // Arrange
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("P");
+        let r1 = ctx.order_refs.allocate(&cid);
+
+        // Act
+        dispatch_event(insert_reject(&r1, 5), &h, &ctx, &mut None);
+
+        // Assert：恰好一条终态 REJECTED，带方向/开平/委托总量，并照常回收。
+        let (event, source) = match rx.try_recv() {
+            Ok(BridgeEvent::Order { event, source }) => (event, source),
+            other => panic!("期望订单事件，实际 {other:?}"),
+        };
+        assert_eq!(source, "ctp");
+        assert_eq!(event.status, "REJECTED");
+        assert_eq!(event.filled_quantity, None, "零成交终态不填成交量");
+        assert_eq!(event.filled_price, None);
+        assert_eq!(event.direction.as_deref(), Some("sell"));
+        assert!(!event.reduce_only, "开仓单不得标成 reduce_only");
+        assert_eq!(event.amount, Some(rust_decimal::Decimal::from(5)));
+        assert!(rx.try_recv().is_err(), "终态只应发一条");
+        assert!(ctx.order_refs.cid_of(&r1).is_none(), "终态后回收映射");
+        assert!(!ctx.leg_table.contains(&cid));
+    }
+
+    /// Part A：一单两腿仅一腿被拒不得提前终态；两腿都拒才收敛，且只发一条终态。
+    #[test]
+    fn insert_error_frame_one_leg_does_not_terminate_two_leg_order() {
+        // Arrange：跨今昨一单两腿，两条 OrderRef 同属一个 cid。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("Q");
+        let r1 = ctx.order_refs.allocate(&cid);
+        let r2 = ctx.order_refs.allocate(&cid);
+
+        // Act ①：仅首腿被拒。
+        dispatch_event(insert_reject(&r1, 1), &h, &ctx, &mut None);
+
+        // Assert：腿未收齐不得置终态/回收（一腿拒、一腿在挂不误杀）。
+        let evs = drain_all_orders(&mut rx);
+        assert!(
+            !evs.iter()
+                .any(|(s, _, _)| matches!(s.as_str(), "FILLED" | "CANCELED" | "REJECTED")),
+            "一腿拒不得提前终态；事件={evs:?}"
+        );
+        assert!(ctx.order_refs.cid_of(&r1).is_some());
+        assert!(ctx.leg_table.contains(&cid));
+
+        // Act ②：次腿也被拒 → 两腿齐终态。
+        dispatch_event(insert_reject(&r2, 1), &h, &ctx, &mut None);
+
+        // Assert：恰好一条 REJECTED 并回收全部映射/腿表。
+        let evs = drain_all_orders(&mut rx);
+        let terminals: Vec<_> = evs
+            .iter()
+            .filter(|(s, _, _)| matches!(s.as_str(), "FILLED" | "CANCELED" | "REJECTED"))
+            .collect();
+        assert_eq!(terminals.len(), 1, "终态只发一次；事件={evs:?}");
+        assert_eq!(terminals[0].0, "REJECTED");
+        assert!(ctx.order_refs.cid_of(&r1).is_none());
+        assert!(ctx.order_refs.cid_of(&r2).is_none());
+        assert!(!ctx.leg_table.contains(&cid));
+    }
+
+    /// 负例：撤单错误帧（24/25/26）不携带 OrderRef，保持 Error——仅告警，
+    /// 不臆测收敛订单（终态仍以 on_rtn_order 为准）。
+    #[test]
+    fn cancel_error_frames_do_not_converge_orders() {
+        // Arrange
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("U");
+        let r1 = ctx.order_refs.allocate(&cid);
+
+        // Act
+        for code in [24, 25, 26] {
+            dispatch_event(
+                CtpEvent::Error {
+                    code,
+                    msg: "撤单出错".to_string(),
+                },
+                &h,
+                &ctx,
+                &mut None,
+            );
+        }
+
+        // Assert：无订单事件；登记映射保留（终态仍等 on_rtn_order）。
+        assert!(rx.try_recv().is_err(), "撤单错误帧不得产生订单事件");
+        assert!(ctx.order_refs.cid_of(&r1).is_some());
+    }
+
     #[test]
     fn orphan_cid_terminal_is_not_deferred() {
         // T5：未在本会话 registry 的 cid（重连回放/跨会话孤儿）来全成快照，

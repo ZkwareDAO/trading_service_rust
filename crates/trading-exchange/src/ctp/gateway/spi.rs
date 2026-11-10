@@ -319,6 +319,104 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(CtpEvent::Error { .. })));
     }
 
+    // ---- 报单录入被拒：输入字段携带 OrderRef，须以 OrderRejected 收敛订单 ----
+
+    /// 构造带完整关联字段的报单录入请求（卖开 3 手 rb2510，OrderRef=7）。
+    fn input_order() -> ctp2rs::v1alpha1::CThostFtdcInputOrderField {
+        use std::os::raw::c_char;
+        let mut input = ctp2rs::v1alpha1::CThostFtdcInputOrderField::default();
+        crate::ctp::core::encoding::encode_fixed(&mut input.OrderRef, "7");
+        crate::ctp::core::encoding::encode_fixed(&mut input.InstrumentID, "rb2510");
+        input.Direction = '1' as c_char; // 卖
+        input.CombOffsetFlag[0] = '0' as c_char; // 开仓
+        input.VolumeTotalOriginal = 3;
+        input
+    }
+
+    fn rsp_error(code: i32) -> ctp2rs::v1alpha1::CThostFtdcRspInfoField {
+        ctp2rs::v1alpha1::CThostFtdcRspInfoField {
+            ErrorID: code,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rsp_order_insert_error_with_input_emits_order_rejected() {
+        // Arrange：柜台同步拒绝报单录入（code=31 资金不足），input 回显 OrderRef。
+        let (mut spi, rx) = setup();
+
+        // Act
+        spi.on_rsp_order_insert(Some(&input_order()), Some(&rsp_error(31)), 1, true);
+
+        // Assert：发 OrderRejected 且携带全部关联字段，不再退化为无 Ref 的 Error。
+        match rx.try_recv() {
+            Ok(CtpEvent::OrderRejected {
+                order_ref,
+                instrument,
+                direction,
+                offset,
+                volume,
+                code,
+                msg: _,
+            }) => {
+                assert_eq!(order_ref, "7");
+                assert_eq!(instrument, "rb2510");
+                assert_eq!(direction, crate::ctp::core::types::Direction::Sell);
+                assert_eq!(offset, Some(crate::ctp::core::types::Offset::Open));
+                assert_eq!(volume, 3);
+                assert_eq!(code, 31);
+            }
+            other => panic!("期望 OrderRejected，实际 {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "不应再额外发 Error");
+    }
+
+    #[test]
+    fn rsp_order_insert_error_without_input_falls_back_to_error() {
+        // Arrange：错误帧无 input，无法关联 OrderRef。
+        let (mut spi, rx) = setup();
+
+        // Act
+        spi.on_rsp_order_insert(None, Some(&rsp_error(31)), 1, true);
+
+        // Assert：退回 Error（保持旧行为，不臆造 OrderRef）。
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(CtpEvent::Error { code: 31, .. })
+        ));
+    }
+
+    #[test]
+    fn rsp_order_insert_accepted_emits_nothing() {
+        // Arrange：受理成功（无错误）不制造事件——委托状态经 on_rtn_order 推送。
+        let (mut spi, rx) = setup();
+
+        // Act
+        spi.on_rsp_order_insert(Some(&input_order()), None, 1, true);
+
+        // Assert
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn err_rtn_order_insert_with_input_emits_order_rejected() {
+        // Arrange：异步拒绝报单（OnErrRtnOrderInsert），input 可关联 OrderRef。
+        let (mut spi, rx) = setup();
+
+        // Act
+        spi.on_err_rtn_order_insert(Some(&input_order()), Some(&rsp_error(31)));
+
+        // Assert
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(CtpEvent::OrderRejected {
+                order_ref,
+                code: 31,
+                ..
+            }) if order_ref == "7"
+        ));
+    }
+
     #[test]
     fn rsp_qry_order_emits_order_query_then_query_end() {
         // Arrange：查询应答行必须区别于实时回报（OrderQuery，而非 Order）。
