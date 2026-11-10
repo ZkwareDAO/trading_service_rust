@@ -2412,20 +2412,59 @@ mod tests {
         }
     }
 
+    /// Part B：柜台把「受理后拒绝」写在 StatusMsg（raw_status 仍是 `Cancelled`），
+    /// 终态必须收敛为 `REJECTED`（而非 `CANCELED`），下游据此播「挂单失败」。
     #[test]
-    fn cancel_snapshot_with_status_msg_still_projects_canceled() {
-        // 柜台在 StatusMsg 回填撤单原因（GB18030 已解码）：诊断日志不影响终态投影/回收。
+    fn cancelled_snapshot_with_reject_status_msg_projects_rejected() {
+        for msg in [
+            "资金不足",
+            "49:已撤单报单被拒绝SHFE:价格超出涨停板",
+            "707:已撤单报单被拒绝CZCE:出错: 指定商品不在本交易节交易",
+        ] {
+            // Arrange：每轮独立上下文，避免前一轮终态回收影响。
+            let (ctx, mut rx) = ctx_and_rx();
+            let h = handle();
+            let cid = long_cid("M");
+            let r1 = ctx.order_refs.allocate(&cid);
+            let mut snap = leg_snap(&r1, OrderStatus::Cancelled, 1, 0, "s1");
+            snap.status_msg = msg.to_string();
+
+            // Act
+            dispatch_event(CtpEvent::Order(snap), &h, &ctx, &mut None);
+
+            // Assert：终态唯一且为 REJECTED，并照常回收映射/腿表。
+            let evs = drain_all_orders(&mut rx);
+            assert!(
+                evs.iter().any(|(s, _, _)| s == "REJECTED"),
+                "msg={msg} 应收敛 REJECTED；事件={evs:?}"
+            );
+            assert!(
+                !evs.iter().any(|(s, _, _)| s == "CANCELED"),
+                "msg={msg} 不得再报 CANCELED"
+            );
+            assert!(ctx.order_refs.cid_of(&r1).is_none());
+            assert!(!ctx.leg_table.contains(&cid));
+        }
+    }
+
+    /// 正常撤单（StatusMsg「已撤单」）语义不变：仍投影 `CANCELED`。
+    #[test]
+    fn cancelled_snapshot_with_normal_status_msg_still_projects_canceled() {
+        // Arrange
         let (ctx, mut rx) = ctx_and_rx();
         let h = handle();
-        let cid = long_cid("M");
+        let cid = long_cid("N");
         let r1 = ctx.order_refs.allocate(&cid);
         let mut snap = leg_snap(&r1, OrderStatus::Cancelled, 1, 0, "s1");
-        snap.status_msg = "资金不足".to_string();
+        snap.status_msg = "已撤单".to_string();
 
+        // Act
         dispatch_event(CtpEvent::Order(snap), &h, &ctx, &mut None);
 
+        // Assert
         let evs = drain_all_orders(&mut rx);
         assert!(evs.iter().any(|(s, _, _)| s == "CANCELED"));
+        assert!(!evs.iter().any(|(s, _, _)| s == "REJECTED"));
         assert!(ctx.order_refs.cid_of(&r1).is_none());
     }
 
