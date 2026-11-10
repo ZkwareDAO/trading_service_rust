@@ -2600,6 +2600,40 @@ mod tests {
         assert!(!ctx.leg_table.contains(&cid));
     }
 
+    /// Part A/B（通知层）：一单两腿均被拒时，用户可见的物理腿通知也必须是
+    /// `REJECTED`——否则多腿单只播 ctp-leg，用户会看到「已取消」而非「挂单失败」。
+    #[test]
+    fn insert_error_frames_notify_two_legs_as_rejected() {
+        // Arrange：一单两腿同属一个 cid。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("V");
+        let r1 = ctx.order_refs.allocate(&cid);
+        let r2 = ctx.order_refs.allocate(&cid);
+
+        // Act：两腿先后被拒（每腿各播一条 ctp-leg）。
+        dispatch_event(insert_reject(&r1, 1), &h, &ctx, &mut None);
+        dispatch_event(insert_reject(&r2, 1), &h, &ctx, &mut None);
+
+        // Assert：物理腿通知均为 REJECTED，且按腿区分 cid#OrderRef。
+        let mut legs = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let BridgeEvent::Order { event, source } = ev {
+                if source == "ctp-leg" {
+                    legs.push((event.client_order_id.clone(), event.status.clone()));
+                }
+            }
+        }
+        assert_eq!(
+            legs,
+            vec![
+                (format!("{cid}#{r1}"), "REJECTED".to_string()),
+                (format!("{cid}#{r2}"), "REJECTED".to_string()),
+            ],
+            "物理腿拒单通知应为 REJECTED"
+        );
+    }
+
     /// 负例：撤单错误帧（24/25/26）不携带 OrderRef，保持 Error——仅告警，
     /// 不臆测收敛订单（终态仍以 on_rtn_order 为准）。
     #[test]
