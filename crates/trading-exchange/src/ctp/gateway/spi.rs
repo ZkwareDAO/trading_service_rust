@@ -67,6 +67,20 @@ impl EventTraderSpi {
             false
         }
     }
+
+    /// 报单录入错误帧的统一出口：有 `input` 且 `code != 0` 时发 [`CtpEvent::OrderRejected`]
+    /// （订单可收敛）；否则退回 [`CtpEvent::Error`]（无 OrderRef，仅可诊断）。
+    fn emit_order_insert_error(
+        &self,
+        input: Option<&ctp2rs::v1alpha1::CThostFtdcInputOrderField>,
+        code: i32,
+        msg: String,
+    ) {
+        match input {
+            Some(i) if code != 0 => self.emit(rejected_event(i, code, msg)),
+            _ => self.emit(CtpEvent::Error { code, msg }),
+        }
+    }
 }
 
 impl TraderSpi for EventTraderSpi {
@@ -131,16 +145,11 @@ impl TraderSpi for EventTraderSpi {
         _is_last: bool,
     ) {
         // 报单录入被拒；受理成功时委托状态经 on_rtn_order 推送。
+        // 插入错误帧后柜台不会再发 OnRtnOrder，只看错误帧会永久卡 NEW——
+        // 有 input 时据此收敛终态。
         let (code, msg) = read_rsp(info);
-        if code == 0 {
-            return;
-        }
-        match input {
-            // 有输入字段即可反查 OrderRef→cid，把该单收敛为终态（柜台不会再发
-            // OnRtnOrder，只看错误帧会永久卡 NEW）。
-            Some(i) => self.emit(rejected_event(i, code, msg)),
-            // 无 input（理论不应发生）：退回 Error，保留错误码可诊断。
-            None => self.emit(CtpEvent::Error { code, msg }),
+        if code != 0 {
+            self.emit_order_insert_error(input, code, msg);
         }
     }
 
@@ -248,10 +257,7 @@ impl TraderSpi for EventTraderSpi {
     ) {
         // 异步拒绝报单录入：同样携带 input，收敛路径与同步应答一致。
         let (code, msg) = read_rsp(info);
-        match input {
-            Some(i) if code != 0 => self.emit(rejected_event(i, code, msg)),
-            _ => self.emit(CtpEvent::Error { code, msg }),
-        }
+        self.emit_order_insert_error(input, code, msg);
     }
 
     fn on_rsp_error(
