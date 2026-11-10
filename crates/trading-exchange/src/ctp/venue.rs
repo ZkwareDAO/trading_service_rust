@@ -1661,10 +1661,18 @@ fn project_terminal(ctx: &EventContext, handle: &Arc<CtpUserHandle>, cid: &str, 
         );
     }
     let mut state = crate::ctp::mapping::order_state_from_snapshot(&agg.representative);
-    // 柜台对「受理后拒绝」只回 OnRtnOrder(Cancelled)+StatusMsg（如
-    // `49:…被拒绝…价格超出涨停板`）：据拒单文案改判 Rejected，避免下游把
-    // 柜台拒单当成用户主动撤单（通知文案/复盘口径）。
-    state.status = terminal_status_from(reported, &agg.representative.status_msg);
+    state.status = if reported == CtpStatus::PartTradedNotQueueing {
+        // 全部腿终态但未全成（一腿成、一腿撤/拒）：剩余量已终结，必须投影终态。
+        // 若映射成 PARTIAL（非终态），状态机/规则会永远认为单还活着，而 cid 已回收。
+        // 部分成交后剩余终结统一按 CANCELED 收口（`Rejected` 约定为零成交被拒；
+        // 物理腿的 REJECTED 通知仍按腿单独播报）。
+        trading_models::OrderStatus::Canceled
+    } else {
+        // 柜台对「受理后拒绝」只回 OnRtnOrder(Cancelled)+StatusMsg（如
+        // `49:…被拒绝…价格超出涨停板`）：据拒单文案改判 Rejected，避免下游把
+        // 柜台拒单当成用户主动撤单（通知文案/复盘口径）。
+        terminal_status_from(reported, &agg.representative.status_msg)
+    };
     state.filled_quantity = rust_decimal::Decimal::from(agg.filled.max(0));
     // 快照本身无价；真实成交均价只来自 OnRtnTrade 累计。
     state.average_price = vwap;
