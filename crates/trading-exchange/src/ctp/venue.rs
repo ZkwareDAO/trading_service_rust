@@ -1603,8 +1603,18 @@ fn project_terminal(ctx: &EventContext, handle: &Arc<CtpUserHandle>, cid: &str, 
             "CTP 终态投影缺成交回报 VWAP（可能丢帧），按快照成交量投影、成交价留空"
         );
     }
+    // Part B：柜台对「受理后拒绝」只回 OnRtnOrder(Cancelled)+StatusMsg（如
+    // `49:…被拒绝…价格超出涨停板`），raw_status 仍是 Cancelled。据拒单文案把它
+    // 收敛为 Rejected，避免下游把柜台拒单当成用户主动撤单（通知文案/复盘口径）。
+    // 仅 Cancelled 可改判：全成/排队态即便文案含关键词也保持原映射。
+    let venue_rejected = reported == CtpStatus::Cancelled
+        && is_venue_reject_status_msg(agg.representative.status_msg.trim());
     let mut state = crate::ctp::mapping::order_state_from_snapshot(&agg.representative);
-    state.status = crate::ctp::mapping::status_from_snapshot(reported);
+    state.status = if venue_rejected {
+        trading_models::OrderStatus::Rejected
+    } else {
+        crate::ctp::mapping::status_from_snapshot(reported)
+    };
     state.filled_quantity = rust_decimal::Decimal::from(agg.filled.max(0));
     // 快照本身无价；真实成交均价只来自 OnRtnTrade 累计。
     state.average_price = vwap;
