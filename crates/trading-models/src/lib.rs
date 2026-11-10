@@ -25,7 +25,10 @@ pub use bar::{
 pub use order::{Order, OrderStatus, OrderType, TimeInForce};
 pub use order_rule::{OrderRule, OrderRuleKey, PriceTier};
 pub use position::{revalue_positions, Position, PositionPrice, QtyUnit, ROI_SCALE};
-pub use position_sync::{diff_positions, merge_remote_into_local, PositionDiff, ReconcileReport};
+pub use position_sync::{
+    diff_positions, find_duplicate_active_groups, merge_remote_into_local, DuplicateActiveGroup,
+    PositionDiff, ReconcileReport,
+};
 pub use quote::{Instrument, MarketKind, Quote, TopOfBook, Venue};
 pub use types::{InstrumentType, PositionMode, Side};
 pub use watch_rule::{

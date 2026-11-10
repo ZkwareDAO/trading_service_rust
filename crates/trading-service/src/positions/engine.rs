@@ -20,8 +20,8 @@ use trading_exchange::api::{OrderPositionSide, PositionInfo};
 use trading_exchange::port::{PositionSnapshotSink, QuoteObserver};
 use trading_exchange::PositionProfile;
 use trading_models::{
-    diff_positions, Instrument, InstrumentType, MarketKind, Position, PositionPrice, QtyUnit, Side,
-    Venue,
+    diff_positions, find_duplicate_active_groups, Instrument, InstrumentType, MarketKind, Position,
+    PositionPrice, QtyUnit, Side, Venue,
 };
 use trading_store::{LeverageKey, LeverageRepo, PositionRepo};
 
@@ -206,6 +206,17 @@ impl PositionEngine {
         let local = self
             .positions
             .list_active_scope(account_id, exchange, &types);
+        // 可观测：本地同 key 多条活跃行（历史脏数据）→ diff_positions 本轮会保留 keeper、
+        // 其余软平仓；这里先告警，便于定位是哪批数据被治愈。
+        let duplicates = find_duplicate_active_groups(&local);
+        if !duplicates.is_empty() {
+            tracing::warn!(
+                exchange,
+                account,
+                duplicate_groups = ?duplicates,
+                "仓位对账发现重复活跃仓位：本轮保留 keeper，其余软平仓"
+            );
+        }
         let diffs = diff_positions(snapshot, local, now_ms);
         if diffs.is_empty() {
             return;

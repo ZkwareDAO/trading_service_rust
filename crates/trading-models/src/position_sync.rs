@@ -8,11 +8,12 @@
 //! 纯裁决函数 [`diff_positions`] 零 IO、确定性、可独立单测；取快照、写表由上层
 //! 编排（trading-service 的 mapper + trading-store 的 PositionRepo）负责。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use rust_decimal::Decimal;
 
 use crate::position::Position;
+use crate::types::{InstrumentType, Side};
 
 /// 单条仓位对账裁决。
 #[derive(Debug, Clone)]
@@ -71,25 +72,29 @@ impl PositionKey {
 ///
 /// - 本地仅传对账作用域内（同账户/同交易所/同 instrument_type）`deleted=0` 的活跃仓位；
 /// - `now_ms` 仅用于平仓行的 `close_time`；
-/// - 返回顺序确定（Created/Updated 在前、Closed 在后，各段按键排序），便于单测与日志。
+/// - 返回顺序确定（Created/Updated 在前、Closed 在后，各段按键+id 排序），便于单测与日志。
+///
+/// **本地重复 key 自愈**：同一 `(account, instrument, side, instrument_type)` 若存在多条
+/// 活跃行（历史脏数据/异常插入），本函数不再用 HashMap 静默覆盖：远端仍在时保留
+/// [`pick_keeper`] 选出的 keeper 并 `Updated`，组内其余行全部 `Closed`；远端已无该 key
+/// 时整组 `Closed`。远端适配层保证每个 key 只出现一条，本函数不处理远端重复。
 pub fn diff_positions(
     exchange_back: Vec<Position>,
     local_active: Vec<Position>,
     now_ms: u64,
 ) -> Vec<PositionDiff> {
-    let local: HashMap<PositionKey, Position> = local_active
-        .into_iter()
-        .map(|p| (PositionKey::of(&p), p))
-        .collect();
+    // 同 key 收成一组（保留全部行，禁止后写覆盖前写）。
+    let mut local: HashMap<PositionKey, Vec<Position>> = HashMap::new();
+    for p in local_active {
+        local.entry(PositionKey::of(&p)).or_default().push(p);
+    }
 
     let mut diffs = Vec::new();
-    let mut matched: HashSet<PositionKey> = HashSet::new();
 
     for remote in exchange_back {
         let key = PositionKey::of(&remote);
-        matched.insert(key.clone());
-        match local.get(&key) {
-            // 交易所有、本地无 → 新建（确保为活跃态，按快照价重估）。
+        match local.remove(&key) {
+            // 本地已无该 key（未持有或组已在上一轮消费）→ 新建。
             None => {
                 let mut p = remote;
                 p.deleted = false;
@@ -97,18 +102,33 @@ pub fn diff_positions(
                 let price = p.current_price;
                 diffs.push(PositionDiff::Created(p.revalued(price)));
             }
-            // 两边都有 → 交易所覆盖变动字段，保留本地账簿字段后重估。
-            Some(existing) => {
-                let merged = merge_remote_into_local(existing, &remote);
+            // 两边都有 → keeper 承接远端字段；组内其余重复行软平仓（自愈）。
+            Some(group) => {
+                let Some(keeper) = pick_keeper(&remote, &group) else {
+                    // 组由非空 Vec 构造，此分支不可达；保守按远端新建，绝不 panic。
+                    let mut p = remote;
+                    p.deleted = false;
+                    p.close_time = None;
+                    let price = p.current_price;
+                    diffs.push(PositionDiff::Created(p.revalued(price)));
+                    continue;
+                };
+                for extra in group.iter().filter(|p| p.id != keeper.id) {
+                    let mut closed = extra.clone();
+                    closed.deleted = true;
+                    closed.close_time = Some(now_ms);
+                    diffs.push(PositionDiff::Closed(closed));
+                }
+                let merged = merge_remote_into_local(keeper, &remote);
                 let price = merged.current_price;
                 diffs.push(PositionDiff::Updated(merged.revalued(price)));
             }
         }
     }
 
-    // 本地有、交易所无 → 软平仓。
-    for (key, existing) in local {
-        if !matched.contains(&key) {
+    // 本地有、交易所无 → 整组软平仓（组内每条都不得泄漏）。
+    for (_, group) in local {
+        for existing in group {
             let mut p = existing;
             p.deleted = true;
             p.close_time = Some(now_ms);
@@ -116,7 +136,7 @@ pub fn diff_positions(
         }
     }
 
-    // 确定顺序：Created/Updated 在前（按键），Closed 在后（按键）。
+    // 确定顺序：Created/Updated 在前，Closed 在后；同键再按 id，消除 HashMap 顺序影响。
     diffs.sort_by_key(|d| {
         let p = d.position();
         (
@@ -125,9 +145,79 @@ pub fn diff_positions(
             p.instrument.clone(),
             p.instrument_type as u8,
             p.side as u8,
+            p.id,
         )
     });
     diffs
+}
+
+/// 从本地重复组中选出承接远端更新的 keeper：
+/// 1. 优先 `(quantity, pos_price)` 与远端一致的行——对账一直在维护的那条；
+///    多条一致时取 `id` 最大者，消除输入顺序依赖；
+/// 2. 不匹配时同样取 `id` 最大者（最后插入）。
+///
+/// 空组返回 `None`（调用方以非空 Vec 构造组，正常路径不会走到）。
+fn pick_keeper<'a>(remote: &Position, group: &'a [Position]) -> Option<&'a Position> {
+    group
+        .iter()
+        .filter(|p| p.quantity == remote.quantity && p.pos_price == remote.pos_price)
+        .max_by_key(|p| p.id)
+        .or_else(|| group.iter().max_by_key(|p| p.id))
+}
+
+/// 同一对账键存在多条活跃仓位的组（**观测用**；裁决由 [`diff_positions`] 自愈）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateActiveGroup {
+    pub account_id: u64,
+    pub instrument: String,
+    pub side: Side,
+    pub instrument_type: InstrumentType,
+    /// 组内仓位 id（升序）。
+    pub ids: Vec<u64>,
+}
+
+/// 扫描本地活跃仓位中的重复对账键；返回按 key 排序、id 升序的分组。
+///
+/// 纯只读：不修改任何行；仅用于对账前 `warn!` 可观测性。
+pub fn find_duplicate_active_groups(active: &[Position]) -> Vec<DuplicateActiveGroup> {
+    // 只收集 id 与首次出现的元信息，避免为观测克隆整行 Position。
+    let mut by_key: HashMap<PositionKey, (Side, InstrumentType, Vec<u64>)> = HashMap::new();
+    for p in active {
+        by_key
+            .entry(PositionKey::of(p))
+            .or_insert_with(|| (p.side, p.instrument_type, Vec::new()))
+            .2
+            .push(p.id);
+    }
+    let mut out: Vec<DuplicateActiveGroup> = by_key
+        .into_iter()
+        .filter(|(_, (_, _, ids))| ids.len() > 1)
+        .map(|(key, (side, instrument_type, mut ids))| {
+            ids.sort_unstable();
+            DuplicateActiveGroup {
+                account_id: key.account_id,
+                instrument: key.instrument,
+                side,
+                instrument_type,
+                ids,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        (
+            a.account_id,
+            a.instrument.as_str(),
+            a.side as u8,
+            a.instrument_type as u8,
+        )
+            .cmp(&(
+                b.account_id,
+                b.instrument.as_str(),
+                b.side as u8,
+                b.instrument_type as u8,
+            ))
+    });
+    out
 }
 
 /// 以交易所快照覆盖本地仓位的变动字段，保留本地权威的账簿/风控字段。
@@ -272,6 +362,181 @@ mod tests {
         assert!(p.deleted);
         assert_eq!(p.close_time, Some(77));
         assert_eq!(p.id, 10);
+    }
+
+    // ---- 本地重复 key 自愈：显式保留 keeper，其余软平仓（禁止 HashMap 静默吞行）----
+
+    /// 同 key 两条本地仓位，远端仍在（与维护中的一条一致）：
+    /// keeper=与远端数量/成本一致的行；另一条必须产出 Closed。
+    #[test]
+    fn duplicate_local_keeps_remote_matching_row_and_closes_others() {
+        // Arrange：ru2701 幽灵 1417(1@19910) + 实际 1418(2@18820)，柜台就是 2@18820。
+        let mut phantom = local(1417, 1, "ru2701", InstrumentType::Futures, Side::Buy);
+        phantom.quantity = dec("1");
+        phantom.pos_price = dec("19910");
+        let mut keeper = local(1418, 1, "ru2701", InstrumentType::Futures, Side::Buy);
+        keeper.quantity = dec("2");
+        keeper.pos_price = dec("18820");
+        let snap = remote(
+            1,
+            "ru2701",
+            InstrumentType::Futures,
+            Side::Buy,
+            "2",
+            "18820",
+            "19700",
+            1,
+        );
+
+        // Act
+        let diffs = diff_positions(vec![snap], vec![phantom, keeper], 99);
+
+        // Assert：一条 Updated(1418) + 一条 Closed(1417)，不得静默丢行。
+        assert_eq!(
+            diffs.len(),
+            2,
+            "重复 key 必须产出 Updated + Closed，实际 {diffs:?}"
+        );
+        let updated = diffs
+            .iter()
+            .find_map(|d| match d {
+                PositionDiff::Updated(p) => Some(p),
+                _ => None,
+            })
+            .expect("应保留与远端一致的行");
+        assert_eq!(updated.id, 1418);
+        assert_eq!(updated.quantity, dec("2"));
+        let closed = diffs
+            .iter()
+            .find_map(|d| match d {
+                PositionDiff::Closed(p) => Some(p),
+                _ => None,
+            })
+            .expect("幽灵行必须被软平仓");
+        assert_eq!(closed.id, 1417);
+        assert!(closed.deleted);
+        assert_eq!(closed.close_time, Some(99));
+    }
+
+    /// 同 key 两条本地仓位、远端已无该 key：两条都必须 Closed。
+    #[test]
+    fn duplicate_local_without_remote_closes_all() {
+        let a = local(10, 1, "ETHUSDT", InstrumentType::Futures, Side::Buy);
+        let b = local(20, 1, "ETHUSDT", InstrumentType::Futures, Side::Buy);
+
+        let diffs = diff_positions(vec![], vec![a, b], 55);
+
+        assert_eq!(diffs.len(), 2, "两条重复行都应被平仓，实际 {diffs:?}");
+        let mut ids: Vec<u64> = diffs
+            .iter()
+            .map(|d| {
+                assert!(matches!(d, PositionDiff::Closed(_)));
+                d.position().id
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![10, 20]);
+    }
+
+    /// 同 key 两条且远端数量/成本都已变化（两条都不匹配）：
+    /// 确定性保留 id 最大的一条，其余 Closed，且 keeper 采用远端值。
+    #[test]
+    fn duplicate_local_remote_changed_falls_back_to_newest_id() {
+        let mut older = local(10, 1, "BTCUSDT", InstrumentType::Futures, Side::Buy);
+        older.quantity = dec("1");
+        older.pos_price = dec("100");
+        let mut newer = local(20, 1, "BTCUSDT", InstrumentType::Futures, Side::Buy);
+        newer.quantity = dec("3");
+        newer.pos_price = dec("200");
+        let snap = remote(
+            1,
+            "BTCUSDT",
+            InstrumentType::Futures,
+            Side::Buy,
+            "5",
+            "300",
+            "310",
+            1,
+        );
+
+        let diffs = diff_positions(vec![snap], vec![older, newer], 1);
+
+        assert_eq!(diffs.len(), 2, "实际 {diffs:?}");
+        let updated = diffs
+            .iter()
+            .find_map(|d| match d {
+                PositionDiff::Updated(p) => Some(p),
+                _ => None,
+            })
+            .expect("应更新 keeper");
+        assert_eq!(updated.id, 20, "无匹配时保留 id 最大者");
+        assert_eq!(updated.quantity, dec("5"));
+        assert_eq!(updated.pos_price, dec("300"));
+        let closed = diffs
+            .iter()
+            .find_map(|d| match d {
+                PositionDiff::Closed(p) => Some(p),
+                _ => None,
+            })
+            .expect("另一条应 Closed");
+        assert_eq!(closed.id, 10);
+    }
+
+    /// 两条数量/成本都匹配远端时，keeper 取 id 最大者（不依赖输入顺序）。
+    #[test]
+    fn duplicate_local_identical_rows_prefer_highest_id() {
+        let mut a = local(10, 1, "X", InstrumentType::Futures, Side::Buy);
+        a.quantity = dec("1");
+        a.pos_price = dec("100");
+        let mut b = local(20, 1, "X", InstrumentType::Futures, Side::Buy);
+        b.quantity = dec("1");
+        b.pos_price = dec("100");
+        let snap = remote(
+            1,
+            "X",
+            InstrumentType::Futures,
+            Side::Buy,
+            "1",
+            "100",
+            "110",
+            1,
+        );
+
+        let diffs = diff_positions(vec![snap], vec![a, b], 7);
+
+        let updated = diffs
+            .iter()
+            .find_map(|d| match d {
+                PositionDiff::Updated(p) => Some(p),
+                _ => None,
+            })
+            .expect("应更新 keeper");
+        assert_eq!(updated.id, 20);
+        let closed = diffs
+            .iter()
+            .find_map(|d| match d {
+                PositionDiff::Closed(p) => Some(p),
+                _ => None,
+            })
+            .expect("另一条应 Closed");
+        assert_eq!(closed.id, 10);
+    }
+
+    #[test]
+    fn find_duplicate_active_groups_reports_same_key_ids() {
+        let a = local(10, 1, "ETHUSDT", InstrumentType::Futures, Side::Buy);
+        let b = local(20, 1, "ETHUSDT", InstrumentType::Futures, Side::Buy);
+        // 不同标的/账户不参与分组。
+        let c = local(30, 1, "BTCUSDT", InstrumentType::Futures, Side::Buy);
+
+        let groups = find_duplicate_active_groups(&[a, b, c]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].account_id, 1);
+        assert_eq!(groups[0].instrument, "ETHUSDT");
+        assert_eq!(groups[0].side, Side::Buy);
+        assert_eq!(groups[0].instrument_type, InstrumentType::Futures);
+        assert_eq!(groups[0].ids, vec![10, 20], "id 需升序");
     }
 
     #[test]
