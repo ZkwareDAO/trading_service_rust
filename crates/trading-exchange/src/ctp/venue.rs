@@ -1254,11 +1254,14 @@ fn dispatch_event(
                 project_terminal(ctx, handle, &cid, false);
                 return;
             }
-            let state = crate::ctp::mapping::order_state_from_trade(
+            let mut state = crate::ctp::mapping::order_state_from_trade(
                 &t,
                 rust_decimal::Decimal::from(cum),
                 avg_price,
             );
+            // 单腿逻辑单补 venue_extra（方向/开平/委托总量），使带真实 VWAP 的成交帧
+            // 可被通知层播报；多腿走 ctp-leg 物理腿通知，不补以免重复。
+            state.venue_extra = single_leg_trade_venue_extra(ctx, &cid, &t);
             // cid 已在上方反查（两腿共享，成交按 cid 累计）。
             let mut event = crate::translate::order_event(&state);
             event.client_order_id = cid;
@@ -1529,6 +1532,35 @@ fn vwap_of_leg(handle: &Arc<CtpUserHandle>, order_ref: &str) -> Option<rust_deci
         .unwrap_or(0.0);
     rust_decimal::Decimal::from_f64_retain(amount / qty as f64)
         .filter(|p| *p > rust_decimal::Decimal::ZERO)
+}
+
+/// 单腿逻辑单的成交回报帧补齐委托要素（方向/开平/委托总量），使其可被通知层播报。
+///
+/// 委托总量取自 [`LegTable`]（由委托快照写入）。多腿（走 `ctp-leg` 物理腿通知）、
+/// 尚无快照或总量未知时返回 `None`（不臆造），交由后续快照帧承担播报。
+fn single_leg_trade_venue_extra(
+    ctx: &EventContext,
+    cid: &str,
+    t: &crate::ctp::core::event::TradeSnapshot,
+) -> Option<crate::api::VenueOrderExtra> {
+    if ctx.order_refs.count_of_cid(cid).max(1) > 1 {
+        return None;
+    }
+    // 开平未知（offset=None）宁可不播，避免把平仓误标成开仓（与快照帧口径一致）。
+    let offset = t.offset?;
+    let amount = rust_decimal::Decimal::from(ctx.leg_table.aggregate_cid(cid)?.total.max(0));
+    if amount <= rust_decimal::Decimal::ZERO {
+        return None;
+    }
+    Some(crate::api::VenueOrderExtra {
+        direction: match t.direction {
+            crate::ctp::core::types::Direction::Buy => trading_models::Side::Buy,
+            crate::ctp::core::types::Direction::Sell => trading_models::Side::Sell,
+        },
+        reduce_only: offset != crate::ctp::core::types::Offset::Open,
+        amount,
+        limit_price: rust_decimal::Decimal::ZERO,
+    })
 }
 
 /// 终态唯一投影收口：从腿表聚合终态、附成交回报累计的真实 VWAP，向上游发**一条**
@@ -2492,6 +2524,124 @@ mod tests {
         assert_eq!(filled[0].2, Some(rust_decimal::Decimal::from(3972)));
         assert!(!ctx.pending_terminal.contains(&cid));
         assert!(ctx.order_refs.cid_of(&r1).is_none());
+    }
+
+    #[test]
+    fn single_leg_trade_event_carries_venue_extra_and_vwap() {
+        // 单腿：成交回报帧必须既带真实 VWAP，又补 venue_extra（方向/委托量）才能被通知层播报。
+        // 委托总量来自 LegTable（快照写入）；成交价来自成交回报本身。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("S");
+        let r1 = ctx.order_refs.allocate(&cid); // 单腿登记
+
+        // 先来部分成交委托快照，建立 LegTable（volume_total=10）。
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r1, OrderStatus::PartTradedQueueing, 10, 4, "s1")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        // 成交回报 4 手 @3500：应产出带 venue_extra + 成交价的帧。
+        dispatch_event(
+            CtpEvent::Trade(trade_snap(&r1, 3500.0, 4)),
+            &h,
+            &ctx,
+            &mut None,
+        );
+
+        let mut trade_ev = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let BridgeEvent::Order { event: e, .. } = ev {
+                // 成交回报帧：带价且累计量=4（进度帧无价，借此区分）。
+                if e.filled_price == Some(rust_decimal::Decimal::from(3500))
+                    && e.filled_quantity == Some(rust_decimal::Decimal::from(4))
+                {
+                    trade_ev = Some(e);
+                }
+            }
+        }
+        let e = trade_ev.expect("应有带价的成交回报帧");
+        // venue_extra 经 translate 摊平到 OrderEvent 的 direction/amount/reduce_only。
+        assert_eq!(e.direction.as_deref(), Some("buy"), "成交帧应带方向");
+        assert_eq!(
+            e.amount,
+            Some(rust_decimal::Decimal::from(10)),
+            "委托总量取自 LegTable"
+        );
+        assert!(!e.reduce_only, "开仓 offset=Open → reduce_only=false");
+    }
+
+    #[test]
+    fn trade_with_unknown_offset_not_announceable() {
+        // 开平未知（offset=None）时成交帧不补 venue_extra：宁可不播，也不把平仓误标成开仓。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("U");
+        let r1 = ctx.order_refs.allocate(&cid);
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r1, OrderStatus::PartTradedQueueing, 10, 4, "s1")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        let mut t = trade_snap(&r1, 3500.0, 4);
+        t.offset = None;
+        dispatch_event(CtpEvent::Trade(t), &h, &ctx, &mut None);
+
+        let mut trade_ev = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let BridgeEvent::Order { event: e, .. } = ev {
+                if e.filled_price == Some(rust_decimal::Decimal::from(3500)) {
+                    trade_ev = Some(e);
+                }
+            }
+        }
+        let e = trade_ev.expect("应有带价的成交回报帧");
+        assert!(e.direction.is_none(), "开平未知不应补方向（不播）");
+        assert!(e.amount.is_none(), "开平未知不补 venue_extra");
+    }
+
+    #[test]
+    fn two_leg_trade_event_has_no_venue_extra() {
+        // 多腿：逻辑成交帧不补 venue_extra（用户可见播报走 ctp-leg 物理腿），避免重复。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("M");
+        let r1 = ctx.order_refs.allocate(&cid);
+        let r2 = ctx.order_refs.allocate(&cid);
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r1, OrderStatus::PartTradedQueueing, 5, 2, "s1")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r2, OrderStatus::PartTradedQueueing, 5, 0, "s2")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        dispatch_event(
+            CtpEvent::Trade(trade_snap(&r1, 3500.0, 2)),
+            &h,
+            &ctx,
+            &mut None,
+        );
+
+        let mut saw_logical_trade = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let BridgeEvent::Order { event: e, source } = ev {
+                if source == "ctp" && e.filled_price.is_some() {
+                    saw_logical_trade = true;
+                    assert!(
+                        e.direction.is_none() && e.amount.is_none(),
+                        "多腿逻辑成交帧不应带方向/委托量"
+                    );
+                }
+            }
+        }
+        assert!(saw_logical_trade, "应存在多腿逻辑成交帧");
     }
 
     #[test]

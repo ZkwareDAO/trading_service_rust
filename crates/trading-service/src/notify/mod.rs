@@ -193,6 +193,16 @@ impl NotifyHub {
         if profile.order_events.is_none() {
             return;
         }
+        // CTP（dedup 开）专用：不可播报的帧（缺方向/委托量、成交类无真实价）不播，
+        // 也不占用去重键——避免无价/无方向帧吞掉随后带真实成交价的帧（价格 0 的成因）。
+        if profile.dedup_order_events && !Self::order_event_announceable(ev) {
+            tracing::debug!(
+                cid = %ev.client_order_id,
+                status = %ev.status,
+                "订单事件不可播报，跳过"
+            );
+            return;
+        }
         if profile.dedup_order_events && self.is_duplicate_order_event(account, ev) {
             tracing::debug!(
                 cid = %ev.client_order_id,
@@ -225,7 +235,7 @@ impl NotifyHub {
             return false;
         };
         let key = format!("{account}:{}", ev.client_order_id);
-        let status = ev.status.clone();
+        let status = Self::dedupe_status(ev);
         let filled = ev
             .filled_quantity
             .map(|f| f.to_string())
@@ -240,6 +250,37 @@ impl NotifyHub {
         }
         guard.insert(key, (status, filled));
         false
+    }
+
+    /// 去重键用的状态：满量成交（filled>=amount）的 PARTIAL 与 FILLED 归一为同一终态，
+    /// 避免"成交先到的 PARTIAL 满量"与随后"FILLED"各播一条（trade-first 全成交重复）。
+    fn dedupe_status(ev: &trading_core::protocol::OrderEvent) -> String {
+        let full = matches!(
+            (ev.filled_quantity, ev.amount),
+            (Some(f), Some(a)) if a > Decimal::ZERO && f >= a
+        );
+        match ev.status.as_str() {
+            "PARTIAL" | "FILLED" if full => "FILLED".to_string(),
+            _ => ev.status.clone(),
+        }
+    }
+
+    /// CTP 订单事件是否可播报（纯函数）：状态可识别 + 有方向 + 有委托量 + 成交类
+    /// （PARTIAL/FILLED，经 [`message::deribit_state_from_wire`] 归一）必须带正的
+    /// 真实成交价。在去重之前拦截，既避免渲染 `价格: 0.0000`，也避免不可用帧占去重键。
+    fn order_event_announceable(ev: &trading_core::protocol::OrderEvent) -> bool {
+        let Some(state) = message::deribit_state_from_wire(&ev.status) else {
+            return false;
+        };
+        if ev.direction.is_none() || ev.amount.is_none() {
+            return false;
+        }
+        if matches!(state, message::DeribitState::Filled)
+            && !matches!(ev.filled_price, Some(p) if p > Decimal::ZERO)
+        {
+            return false;
+        }
+        true
     }
 
     /// 投递一条成交通知（同步等待 HTTP，仅供 spawn 任务/测试调用）。
@@ -1056,6 +1097,104 @@ mod tests {
             bodies.lock().unwrap().len(),
             2,
             "同一物理腿的重复状态应被去重"
+        );
+    }
+
+    /// 无价成交帧：不得播 0 价、也不得占用去重位；随后带价帧必须正常播（真实价）。
+    #[tokio::test]
+    async fn ctp_unpriced_partial_skipped_and_does_not_block_priced_frame() {
+        let (url, bodies) = mock_wecom_n(1);
+        let h = hub_with_position_url(&url);
+        let profile = h.profile("ctp");
+        let mut unpriced = order_event(
+            "c-p",
+            "PARTIAL",
+            "sell",
+            true,
+            "10",
+            Some(("4", "0")),
+            "3500",
+        );
+        unpriced.filled_price = None; // 快照推导帧：无价
+        h.announce_order_event(profile, &unpriced, "ctp_acct", None);
+        let priced = order_event(
+            "c-p",
+            "PARTIAL",
+            "sell",
+            true,
+            "10",
+            Some(("4", "3500")),
+            "3500",
+        );
+        h.announce_order_event(profile, &priced, "ctp_acct", None);
+
+        wait_for_bodies(&bodies, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let sent = bodies.lock().unwrap();
+        assert_eq!(sent.len(), 1, "只应播带价那条");
+        let v: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        let content = v["markdown"]["content"].as_str().unwrap();
+        assert!(content.contains("部分成交成功"), "实际: {content}");
+        assert!(
+            content.contains("价格: 3500.0000"),
+            "带价帧不得被无价帧吞掉: {content}"
+        );
+    }
+
+    /// 成交先到：PARTIAL(满量) 与随后 FILLED 视为同一终态，只播一条。
+    #[tokio::test]
+    async fn ctp_trade_first_full_fill_notifies_once() {
+        let (url, bodies) = mock_wecom_n(2);
+        let h = hub_with_position_url(&url);
+        let profile = h.profile("ctp");
+        h.announce_order_event(
+            profile,
+            &order_event(
+                "c-f",
+                "PARTIAL",
+                "sell",
+                true,
+                "10",
+                Some(("10", "3500")),
+                "3500",
+            ),
+            "ctp_acct",
+            None,
+        );
+        h.announce_order_event(
+            profile,
+            &order_event(
+                "c-f",
+                "FILLED",
+                "sell",
+                true,
+                "10",
+                Some(("10", "3500")),
+                "3500",
+            ),
+            "ctp_acct",
+            None,
+        );
+        wait_for_bodies(&bodies, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(bodies.lock().unwrap().len(), 1, "满量成交不得重复播报");
+    }
+
+    /// deribit（dedup=false）不得受 CTP 可播报守卫影响：无价成交仍按旧行为播（隔离回归）。
+    #[tokio::test]
+    async fn deribit_unpriced_fill_still_notifies_unchanged() {
+        let (url, bodies) = mock_wecom_n(1);
+        let h = hub_with_position_url(&url);
+        let profile = h.profile("deribit");
+        let mut ev = order_event("d-1", "FILLED", "buy", false, "2", Some(("2", "0")), "0");
+        ev.filled_price = None;
+        h.announce_order_event(profile, &ev, "deribit_acct", None);
+        wait_for_bodies(&bodies, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            bodies.lock().unwrap().len(),
+            1,
+            "deribit 通知行为不得被 CTP 守卫改变"
         );
     }
 
