@@ -2277,6 +2277,90 @@ mod tests {
         }
     }
 
+    /// 一腿全成 + 一腿撤：两腿都终态 → 逻辑单必须投影**终态**（成交量如实保留），
+    /// 不能停在 PARTIAL（非终态会让状态机/规则认为单永远活着，而 cid 已回收）。
+    #[test]
+    fn two_leg_one_filled_one_cancelled_projects_terminal_canceled() {
+        // Arrange：腿 1 成交 1 手 @3500（成交回报已累计），腿 2 零成交撤单。
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("H");
+        let r1 = ctx.order_refs.allocate(&cid);
+        let r2 = ctx.order_refs.allocate(&cid);
+        h.filled_by_cid.lock().unwrap().insert(cid.clone(), 1);
+        h.filled_amount_by_cid
+            .lock()
+            .unwrap()
+            .insert(cid.clone(), 3500.0);
+
+        // Act：两腿先后终态。
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r1, OrderStatus::AllTraded, 1, 1, "s1")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r2, OrderStatus::Cancelled, 1, 0, "s2")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+
+        // Assert：恰好一条终态 CANCELED（部分成交后剩余终结），filled=1 且带 VWAP。
+        let evs = drain_all_orders(&mut rx);
+        let terminal: Vec<_> = evs
+            .iter()
+            .filter(|(s, _, _)| matches!(s.as_str(), "FILLED" | "CANCELED" | "REJECTED"))
+            .collect();
+        assert_eq!(terminal.len(), 1, "终态只发一次；事件={evs:?}");
+        assert_eq!(terminal[0].0, "CANCELED", "部分成交+剩余终结必须终态");
+        assert_eq!(terminal[0].1, Some(rust_decimal::Decimal::from(1)));
+        assert_eq!(terminal[0].2, Some(rust_decimal::Decimal::from(3500)));
+        assert!(ctx.order_refs.cid_of(&r1).is_none());
+        assert!(ctx.order_refs.cid_of(&r2).is_none());
+        assert!(!ctx.leg_table.contains(&cid));
+    }
+
+    /// 一腿全成 + 一腿被拒：同样两腿终态 → 逻辑单收敛终态（部分成交按 CANCELED
+    /// 收口；`Rejected` 约定为零成交被拒，物理腿的 REJECTED 通知另行单独播报）。
+    #[test]
+    fn two_leg_one_filled_one_rejected_projects_terminal_canceled() {
+        // Arrange
+        let (ctx, mut rx) = ctx_and_rx();
+        let h = handle();
+        let cid = long_cid("J");
+        let r1 = ctx.order_refs.allocate(&cid);
+        let r2 = ctx.order_refs.allocate(&cid);
+        h.filled_by_cid.lock().unwrap().insert(cid.clone(), 1);
+        h.filled_amount_by_cid
+            .lock()
+            .unwrap()
+            .insert(cid.clone(), 3500.0);
+
+        // Act：腿 1 全成，腿 2 插入被拒。
+        dispatch_event(
+            CtpEvent::Order(leg_snap(&r1, OrderStatus::AllTraded, 1, 1, "s1")),
+            &h,
+            &ctx,
+            &mut None,
+        );
+        dispatch_event(insert_reject(&r2, 1), &h, &ctx, &mut None);
+
+        // Assert
+        let evs = drain_all_orders(&mut rx);
+        let terminal: Vec<_> = evs
+            .iter()
+            .filter(|(s, _, _)| matches!(s.as_str(), "FILLED" | "CANCELED" | "REJECTED"))
+            .collect();
+        assert_eq!(terminal.len(), 1, "终态只发一次；事件={evs:?}");
+        assert_eq!(terminal[0].0, "CANCELED", "部分成交+剩余被拒也必须终态");
+        assert_eq!(terminal[0].1, Some(rust_decimal::Decimal::from(1)));
+        assert!(ctx.order_refs.cid_of(&r1).is_none());
+        assert!(ctx.order_refs.cid_of(&r2).is_none());
+        assert!(!ctx.leg_table.contains(&cid));
+    }
+
     #[test]
     fn two_leg_filled_uses_leg_vwap_and_leg_quantity() {
         // 腿 1 成交 5 手 @3500（先收到成交回报，再收到全成快照）。
