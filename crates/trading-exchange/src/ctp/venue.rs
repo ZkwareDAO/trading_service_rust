@@ -377,6 +377,11 @@ enum ActiveQuery {
         rows: Vec<crate::ctp::core::event::PositionSnapshot>,
         reply: Option<tokio::sync::oneshot::Sender<anyhow::Result<Vec<crate::api::PositionInfo>>>>,
     },
+    /// 前台按需查资金账户：柜台通常只回一行，QueryEnd 映射为统一余额后回执。
+    FrontBalance {
+        row: Option<crate::ctp::core::event::TradingAccountSnapshot>,
+        reply: Option<tokio::sync::oneshot::Sender<anyhow::Result<Vec<crate::api::BalanceInfo>>>>,
+    },
     /// 后台委托重放（重连 query_orders("")）：查询行经订单桥恢复状态机并喂目录。
     BackOrderReplay,
     /// 后台持仓对账：缓冲柜台原始持仓行，QueryEnd 聚合为整合仓位经持仓桥，
@@ -537,7 +542,9 @@ fn run_command(h: &mut TraderHandle, ctx: &EventContext, req: crate::ctp::mailbo
             let _ = c.reply.send(ret);
         }
         // 查询类走 issue_front_query，不会进入这里。
-        SessionRequest::QueryOrder(_) | SessionRequest::QueryPositions(_) => {}
+        SessionRequest::QueryOrder(_)
+        | SessionRequest::QueryPositions(_)
+        | SessionRequest::QueryBalance(_) => {}
     }
 }
 
@@ -1038,7 +1045,7 @@ fn issue_front_query(
     active: &mut Option<ActiveQuery>,
     req: crate::ctp::mailbox::SessionRequest,
 ) {
-    use crate::ctp::mailbox::{QueryOrderJob, QueryPositionsJob, SessionRequest};
+    use crate::ctp::mailbox::{QueryBalanceJob, QueryOrderJob, QueryPositionsJob, SessionRequest};
     match req {
         SessionRequest::QueryOrder(QueryOrderJob {
             instrument,
@@ -1072,6 +1079,18 @@ fn issue_front_query(
                 });
             } else {
                 let _ = reply.send(Err(anyhow::anyhow!("CTP 持仓查询受理失败（流控/未就绪）")));
+            }
+        }
+        SessionRequest::QueryBalance(QueryBalanceJob { reply }) => {
+            if h.query_trading_account() == 0 {
+                *active = Some(ActiveQuery::FrontBalance {
+                    row: None,
+                    reply: Some(reply),
+                });
+            } else {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "CTP 资金账户查询受理失败（流控/未就绪）"
+                )));
             }
         }
         _ => {}
@@ -1339,6 +1358,14 @@ fn dispatch_event(
                     "收到无在途查询的持仓行，已忽略"),
             }
         }
+        // 资金账户应答：仅在按需余额查询在途时缓冲；无在途查询的杂散行忽略。
+        CtpEvent::TradingAccount(a) => match active {
+            Some(ActiveQuery::FrontBalance { row, .. }) => *row = Some(a),
+            _ => tracing::debug!(
+                account = %ctx.account,
+                "收到无在途余额查询的资金账户行，已忽略"
+            ),
+        },
         CtpEvent::QueryEnd => finish_active_query(ctx, active),
         CtpEvent::Error { code, msg } => {
             // 报单拒/撤单异步拒绝（24/25/26 等）：终态以 on_rtn_order 为准，
@@ -1892,6 +1919,18 @@ fn finish_active_query(ctx: &EventContext, active: &mut Option<ActiveQuery>) {
             let positions = finalize_position_batch(ctx, rows);
             if let Some(reply) = reply {
                 let _ = reply.send(Ok(positions));
+            }
+        }
+        ActiveQuery::FrontBalance { row, reply } => {
+            // QueryEnd 收齐：柜台正常回一行资金账户；无行（查询错误/柜台异常）
+            // 显式回 Err——绝不返回空余额冒充"账户没钱"。
+            let result = match row {
+                Some(snapshot) => crate::ctp::mapping::balance_info_from_snapshot(&snapshot)
+                    .map(|balance| vec![balance]),
+                None => Err(anyhow::anyhow!("CTP 资金账户查询未返回数据")),
+            };
+            if let Some(reply) = reply {
+                let _ = reply.send(result);
             }
         }
         ActiveQuery::BackOrderReplay => {
@@ -4401,6 +4440,62 @@ mod tests {
             positions[0].multiplier,
             Some(rust_decimal::Decimal::from(10))
         );
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn front_balance_queryend_replies_mapped_row() {
+        // Arrange：前台查余额在途，喂一行资金账户。
+        let (ctx, _rx) = ctx_and_rx();
+        let h = handle();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut active = Some(ActiveQuery::FrontBalance {
+            row: None,
+            reply: Some(tx),
+        });
+        dispatch_event(
+            CtpEvent::TradingAccount(crate::ctp::core::event::TradingAccountSnapshot {
+                balance: 100_000.0,
+                available: 80_000.0,
+                curr_margin: 20_000.0,
+                position_profit: -500.0,
+                currency_id: "CNY".into(),
+            }),
+            &h,
+            &ctx,
+            &mut active,
+        );
+
+        // Act
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+
+        // Assert：QueryEnd 映射为一行统一余额并回执，闸门释放。
+        let balances = rx.try_recv().unwrap().unwrap();
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].currency, "CNY");
+        assert_eq!(
+            balances[0].equity,
+            rust_decimal::Decimal::try_from(100_000.0).unwrap()
+        );
+        assert_eq!(
+            balances[0].available,
+            rust_decimal::Decimal::try_from(80_000.0).unwrap()
+        );
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn front_balance_queryend_without_row_replies_err() {
+        // 柜台未回资金账户（查询错误/无数据）：显式 Err，绝不返回空余额。
+        let (ctx, _rx) = ctx_and_rx();
+        let h = handle();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut active = Some(ActiveQuery::FrontBalance {
+            row: None,
+            reply: Some(tx),
+        });
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+        assert!(rx.try_recv().unwrap().is_err());
         assert!(active.is_none());
     }
 

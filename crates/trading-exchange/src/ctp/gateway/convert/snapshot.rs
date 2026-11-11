@@ -4,7 +4,9 @@
 //! 指向柜台内存的指针。未知字符统一回退为 `Unknown`，而不是 panic。
 
 use crate::ctp::core::encoding::decode_fixed;
-use crate::ctp::core::event::{OrderSnapshot, PositionSnapshot, TradeSnapshot};
+use crate::ctp::core::event::{
+    OrderSnapshot, PositionSnapshot, TradeSnapshot, TradingAccountSnapshot,
+};
 use crate::ctp::core::types::{Direction, Offset, OrderStatus};
 use ctp2rs::v1alpha1::{
     CThostFtdcInvestorPositionField, CThostFtdcOrderField, CThostFtdcTradeField,
@@ -51,6 +53,19 @@ pub fn trade_snapshot(trade: &CThostFtdcTradeField) -> TradeSnapshot {
     }
 }
 
+/// 把柜台资金账户结构的关键要素拷贝为 owned 快照。
+pub fn trading_account_snapshot(
+    account: &ctp2rs::v1alpha1::CThostFtdcTradingAccountField,
+) -> TradingAccountSnapshot {
+    TradingAccountSnapshot {
+        balance: account.Balance,
+        available: account.Available,
+        curr_margin: account.CurrMargin,
+        position_profit: account.PositionProfit,
+        currency_id: decode_fixed(&account.CurrencyID),
+    }
+}
+
 /// 把柜台持仓结构的关键要素拷贝为 owned 快照。
 pub fn position_snapshot(position: &CThostFtdcInvestorPositionField) -> PositionSnapshot {
     PositionSnapshot {
@@ -67,11 +82,32 @@ pub fn position_snapshot(position: &CThostFtdcInvestorPositionField) -> Position
 
 #[cfg(test)]
 mod tests {
-    use super::{order_snapshot, trade_snapshot};
+    use super::{order_snapshot, trade_snapshot, trading_account_snapshot};
     use crate::ctp::core::encoding::encode_fixed;
     use crate::ctp::core::types::{Direction, Offset, OrderStatus};
     use ctp2rs::v1alpha1::{CThostFtdcOrderField, CThostFtdcTradeField};
     use std::os::raw::c_char;
+
+    #[test]
+    fn maps_trading_account_fields() {
+        // Arrange：柜台资金账户结构（人民币）。
+        let mut a = ctp2rs::v1alpha1::CThostFtdcTradingAccountField::default();
+        encode_fixed(&mut a.CurrencyID, "CNY");
+        a.Balance = 123_456.78;
+        a.Available = 100_000.5;
+        a.CurrMargin = 23_456.28;
+        a.PositionProfit = -1_200.0;
+
+        // Act
+        let s = trading_account_snapshot(&a);
+
+        // Assert：币种解码 + 四项金额原样拷贝。
+        assert_eq!(s.currency_id, "CNY");
+        assert!((s.balance - 123_456.78).abs() < 1e-9);
+        assert!((s.available - 100_000.5).abs() < 1e-9);
+        assert!((s.curr_margin - 23_456.28).abs() < 1e-9);
+        assert!((s.position_profit + 1_200.0).abs() < 1e-9);
+    }
 
     fn sample_order() -> CThostFtdcOrderField {
         let mut o = CThostFtdcOrderField::default();

@@ -5,6 +5,7 @@
 //! 且不下发 qty_unit、密钥、内部行锁等实现细节。
 
 pub mod account;
+pub mod balance;
 pub mod order;
 pub mod position;
 pub mod rule;

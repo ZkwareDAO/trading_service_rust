@@ -6,13 +6,42 @@
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
-use crate::api::{OrderPositionSide, PositionInfo};
-use crate::ctp::core::event::{OrderSnapshot, PositionSnapshot, TradeSnapshot};
+use crate::api::{BalanceInfo, OrderPositionSide, PositionInfo};
+use crate::ctp::core::event::{
+    OrderSnapshot, PositionSnapshot, TradeSnapshot, TradingAccountSnapshot,
+};
 use crate::ctp::core::types::{Direction, Offset};
 use trading_models::{InstrumentType, OrderStatus};
 
 /// 保证金补齐差额日志的相对容差：避免浮点尾差（如 5527.2 vs 5527.200000001）刷日志。
 const MARGIN_SHORTFALL_REL_TOL: f64 = 1e-6;
+
+/// 柜台资金账户快照 → 统一余额快照。
+///
+/// CTP 以人民币结算，币种缺失时兜底 CNY；金额为柜台 f64。权益/可用为
+/// **必填语义**，NaN/Inf/超出 Decimal 范围时显式报错，绝不落成 0 余额；
+/// 占用保证金/持仓盈亏为可选，转换失败按"未知"（None）处理。
+pub fn balance_info_from_snapshot(
+    snapshot: &TradingAccountSnapshot,
+) -> anyhow::Result<BalanceInfo> {
+    let currency = match snapshot.currency_id.trim() {
+        "" => "CNY".to_string(),
+        c => c.to_string(),
+    };
+    let equity = Decimal::try_from(snapshot.balance)
+        .map_err(|e| anyhow::anyhow!("CTP 资金账户 balance 无法转 Decimal: {e}"))?;
+    let available = Decimal::try_from(snapshot.available)
+        .map_err(|e| anyhow::anyhow!("CTP 资金账户 available 无法转 Decimal: {e}"))?;
+    Ok(BalanceInfo {
+        currency,
+        equity,
+        available,
+        margin_used: Decimal::try_from(snapshot.curr_margin).ok(),
+        unrealized_pnl: Decimal::try_from(snapshot.position_profit).ok(),
+        // CTP 资金账户不带毫秒时间戳：None 表示"柜台查询当刻"，不做伪时间。
+        update_ms: None,
+    })
+}
 
 /// 统一 `Side`（买/卖）→ CTP `Direction`。
 /// reduce_only 只影响开平标志，不改变方向语义。
@@ -333,6 +362,58 @@ mod tests {
     use super::*;
     use crate::ctp::core::types::OrderStatus as CtpStatus;
     use trading_models::Side;
+
+    #[test]
+    fn trading_account_snapshot_maps_to_balance_info() {
+        // Arrange：柜台资金账户快照（人民币）。
+        let s = crate::ctp::core::event::TradingAccountSnapshot {
+            balance: 100_000.5,
+            available: 80_000.25,
+            curr_margin: 20_000.25,
+            position_profit: -500.0,
+            currency_id: "CNY".into(),
+        };
+
+        // Act
+        let b = balance_info_from_snapshot(&s).expect("有限金额应可转换");
+
+        // Assert：四项金额与币种逐项映射；CTP 无毫秒时间戳 → None。
+        assert_eq!(b.currency, "CNY");
+        assert_eq!(b.equity, Decimal::try_from(100_000.5).unwrap());
+        assert_eq!(b.available, Decimal::try_from(80_000.25).unwrap());
+        assert_eq!(b.margin_used, Some(Decimal::try_from(20_000.25).unwrap()));
+        assert_eq!(b.unrealized_pnl, Some(Decimal::try_from(-500.0).unwrap()));
+        assert_eq!(b.update_ms, None);
+    }
+
+    #[test]
+    fn trading_account_without_currency_falls_back_to_cny() {
+        // 柜台未回填币种时按国内期货结算币种 CNY 兜底，不返回空币种。
+        let s = crate::ctp::core::event::TradingAccountSnapshot {
+            balance: 1.0,
+            available: 1.0,
+            curr_margin: 0.0,
+            position_profit: 0.0,
+            currency_id: String::new(),
+        };
+        assert_eq!(
+            balance_info_from_snapshot(&s).expect("有限金额").currency,
+            "CNY"
+        );
+    }
+
+    #[test]
+    fn trading_account_non_finite_amount_is_rejected() {
+        // NaN/Inf 无法转 Decimal：显式失败，绝不落成 0 余额。
+        let s = crate::ctp::core::event::TradingAccountSnapshot {
+            balance: f64::NAN,
+            available: 1.0,
+            curr_margin: 0.0,
+            position_profit: 0.0,
+            currency_id: "CNY".into(),
+        };
+        assert!(balance_info_from_snapshot(&s).is_err());
+    }
 
     #[test]
     fn side_maps_to_direction() {

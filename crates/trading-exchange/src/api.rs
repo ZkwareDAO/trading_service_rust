@@ -185,6 +185,30 @@ pub struct PositionInfo {
     pub update_ms: Option<i64>,
 }
 
+/// 账户余额快照（一行一个结算币种）。
+///
+/// 单币种所（Binance 永续 USDT、CTP 人民币、Hyperliquid USDC）恒返回一行；
+/// Deribit 按 BTC/ETH 等结算币种各返回一行。金额为交易所口径原值，不做换算。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BalanceInfo {
+    /// 结算币种：USDT / BTC / ETH / CNY / USDC 等。
+    pub currency: String,
+    /// 账户权益（含未实现盈亏）：币安 `totalMarginBalance`、Deribit `equity`、
+    /// CTP `Balance`、Hyperliquid `accountValue`。
+    pub equity: Decimal,
+    /// 可用资金：币安 `availableBalance`、Deribit `available_funds`、
+    /// CTP `Available`、Hyperliquid `withdrawable`。
+    pub available: Decimal,
+    /// 占用保证金：币安 `totalInitialMargin`、Deribit `initial_margin`、
+    /// CTP `CurrMargin`、Hyperliquid `totalMarginUsed`；交易所未提供时为 None。
+    pub margin_used: Option<Decimal>,
+    /// 未实现盈亏：币安 `totalUnrealizedProfit`、Deribit `unrealized_pl`、
+    /// CTP `PositionProfit`；Hyperliquid 无独立字段时为 None。
+    pub unrealized_pnl: Option<Decimal>,
+    /// 交易所侧数据时间（UTC 毫秒）；无毫秒口径（CTP）时为 None。
+    pub update_ms: Option<i64>,
+}
+
 /// 参考价口径：三家不一致（币安=最新成交、Hyperliquid=中间价、Deribit=标记价）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriceBasis {
@@ -334,6 +358,15 @@ pub trait ExchangeApi: Send + Sync {
 
     /// 查询账户持仓（仅返回数量非零者）。
     async fn get_positions(&self) -> anyhow::Result<Vec<PositionInfo>>;
+
+    /// 查询账户**当前**余额（即查即返，不缓存、不落盘）。
+    ///
+    /// 单币种所返回一行，Deribit 多结算币种返回多行；币种与字段口径见
+    /// [`BalanceInfo`]。默认实现显式报"不支持"（xili 等无余额接口的 venue）——
+    /// 调用方拿到的是错误，而不是被编造出来的零余额。
+    async fn get_balance(&self) -> anyhow::Result<Vec<BalanceInfo>> {
+        anyhow::bail!("{} 不支持账户余额查询", self.exchange())
+    }
 
     /// 设置杠杆；Deribit（仅期权）应返回 `不支持` 错误而非成功。
     async fn set_leverage(&self, instrument: &str, leverage: u32) -> anyhow::Result<()>;
@@ -488,5 +521,47 @@ mod preflight_tests {
         assert_eq!(out.request.order_type, request.order_type);
         assert_eq!(out.request.price, request.price);
         assert_eq!(out.request.quantity, request.quantity);
+    }
+}
+
+#[cfg(test)]
+mod balance_tests {
+    use super::*;
+
+    /// 最小 ExchangeApi 实现：只用于验证默认余额查询的行为。
+    struct NoBalanceVenue;
+
+    #[async_trait]
+    impl ExchangeApi for NoBalanceVenue {
+        fn exchange(&self) -> &str {
+            "no-balance"
+        }
+        async fn place_order(&self, _: &PlaceOrderRequest) -> anyhow::Result<OrderAck> {
+            anyhow::bail!("unused")
+        }
+        async fn cancel_order(&self, _: &str, _: &OrderRef) -> anyhow::Result<OrderAck> {
+            anyhow::bail!("unused")
+        }
+        async fn query_order(&self, _: &str, _: &OrderRef) -> OrderLookup {
+            OrderLookup::Unavailable
+        }
+        async fn get_positions(&self) -> anyhow::Result<Vec<PositionInfo>> {
+            Ok(vec![])
+        }
+        async fn set_leverage(&self, _: &str, _: u32) -> anyhow::Result<()> {
+            anyhow::bail!("unused")
+        }
+        async fn get_reference_price(&self, _: &str) -> anyhow::Result<ReferencePrice> {
+            anyhow::bail!("unused")
+        }
+    }
+
+    #[tokio::test]
+    async fn default_get_balance_reports_unsupported() {
+        // 未实现余额查询的 venue（xili/测试桩）必须显式报错，绝不编造零余额。
+        let err = NoBalanceVenue.get_balance().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no-balance"), "错误信息应含交易所名：{msg}");
+        assert!(msg.contains("不支持"), "错误信息应明示不支持：{msg}");
     }
 }

@@ -6,11 +6,12 @@
 use async_trait::async_trait;
 
 use crate::api::{
-    ExchangeApi, OrderAck, OrderLookup, OrderRef, PlaceErrorKind, PlaceOrderRequest, PositionInfo,
-    ReferencePrice,
+    BalanceInfo, ExchangeApi, OrderAck, OrderLookup, OrderRef, PlaceErrorKind, PlaceOrderRequest,
+    PositionInfo, ReferencePrice,
 };
 use crate::ctp::mailbox::{
-    CancelJob, PendingInsert, QueryOrderJob, QueryPositionsJob, SessionMailbox, SessionRequest,
+    CancelJob, PendingInsert, QueryBalanceJob, QueryOrderJob, QueryPositionsJob, SessionMailbox,
+    SessionRequest,
 };
 use crate::ctp::order_ref::OrderRefRegistry;
 use crate::ctp::prep;
@@ -44,6 +45,23 @@ const SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CANCEL_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// 查仓等待回执超时（按需直调方可能赶上对账在途，放宽到 10s）。
 const POSITIONS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// 查资金账户等待回执超时（与查仓同一在途闸门，给同样的 10s 余量）。
+const BALANCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 等待会话线程查询回执：断线（Sender drop）与超时都映射为带业务名的错误。
+///
+/// 查仓/查余额共用（二者都是「投递查询 → 等回执 → 原样返回 Result」）。
+async fn await_query_reply<T>(
+    reply_rx: tokio::sync::oneshot::Receiver<anyhow::Result<T>>,
+    timeout: std::time::Duration,
+    what: &str,
+) -> anyhow::Result<T> {
+    match tokio::time::timeout(timeout, reply_rx).await {
+        Ok(Ok(ret)) => ret,
+        Ok(Err(_)) => anyhow::bail!("CTP 会话线程已退出，{what}失败（会话断开）"),
+        Err(_) => anyhow::bail!("CTP {what}等待会话线程超时（{}s）", timeout.as_secs()),
+    }
+}
 
 /// CTP 下单/查询门面（tokio 侧持有；实际执行在阻塞会话内）。
 pub struct CtpApi {
@@ -253,11 +271,21 @@ impl ExchangeApi for CtpApi {
             .submit(SessionRequest::QueryPositions(QueryPositionsJob {
                 reply: reply_tx,
             }));
-        match tokio::time::timeout(POSITIONS_TIMEOUT, reply_rx).await {
-            Ok(Ok(ret)) => ret,
-            Ok(Err(_)) => anyhow::bail!("CTP 会话线程已退出，持仓查询失败（会话断开）"),
-            Err(_) => anyhow::bail!("CTP 持仓查询等待会话线程超时（10s）"),
-        }
+        await_query_reply(reply_rx, POSITIONS_TIMEOUT, "持仓查询").await
+    }
+
+    /// 查资金账户余额：复用长会话线程的 `ReqQryTradingAccount`，经信箱
+    /// oneshot 回真实快照（CTP 无 REST，与查仓同一在途闸门）。
+    ///
+    /// 柜台未返回资金账户（查询错误/流控后异常）由会话线程映射为 Err，
+    /// 绝不把"没查到"当成"余额为 0"。
+    async fn get_balance(&self) -> anyhow::Result<Vec<BalanceInfo>> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.mailbox
+            .submit(SessionRequest::QueryBalance(QueryBalanceJob {
+                reply: reply_tx,
+            }));
+        await_query_reply(reply_rx, BALANCE_TIMEOUT, "资金账户查询").await
     }
 
     /// CTP 无程序化杠杆设置语义（保证金率由柜台/交易所规定）。
@@ -846,6 +874,60 @@ mod tests {
         let (eid, got_hint) = rx.await.unwrap();
         assert_eq!(eid, "20260101-2");
         assert_eq!(got_hint.as_deref(), Some(hint.as_str()));
+    }
+
+    fn one_balance() -> crate::api::BalanceInfo {
+        crate::api::BalanceInfo {
+            currency: "CNY".into(),
+            equity: Decimal::from(100_000),
+            available: Decimal::from(80_000),
+            margin_used: Some(Decimal::from(20_000)),
+            unrealized_pnl: Some(Decimal::ZERO),
+            update_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_balance_returns_snapshot() {
+        // Arrange：假线程回一行资金账户余额。
+        let (api, mailbox) = api_with_mailbox();
+        spawn_worker(mailbox, |req| match req {
+            SessionRequest::QueryBalance(QueryBalanceJob { reply }) => {
+                let _ = reply.send(Ok(vec![one_balance()]));
+            }
+            _ => panic!("期望查余额请求"),
+        });
+
+        // Act
+        let bs = api.get_balance().await.unwrap();
+
+        // Assert：整批透传（CTP 单币种一行）。
+        assert_eq!(bs.len(), 1);
+        assert_eq!(bs[0].currency, "CNY");
+        assert_eq!(bs[0].equity, Decimal::from(100_000));
+    }
+
+    #[tokio::test]
+    async fn get_balance_flow_control_or_disconnect_errors() {
+        // Arrange：受理失败（流控/mapping 无数据）→ Err，不返回空余额。
+        let (api, mailbox) = api_with_mailbox();
+        spawn_worker(mailbox, |req| match req {
+            SessionRequest::QueryBalance(QueryBalanceJob { reply }) => {
+                let _ = reply.send(Err(anyhow::anyhow!("受理失败")));
+            }
+            _ => panic!("期望查余额请求"),
+        });
+        assert!(api.get_balance().await.is_err());
+
+        // Arrange：线程退出（reply drop）→ Err（RecvError 映射会话断开）。
+        let (api2, mailbox2) = api_with_mailbox();
+        spawn_worker(mailbox2, |req| match req {
+            SessionRequest::QueryBalance(QueryBalanceJob { reply }) => drop(reply),
+            _ => panic!("期望查余额请求"),
+        });
+        let start = std::time::Instant::now();
+        assert!(api2.get_balance().await.is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
     fn one_position() -> crate::api::PositionInfo {

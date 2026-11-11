@@ -20,9 +20,10 @@ use binance_sdk::common::errors::ConnectorError;
 use binance_sdk::config::ConfigurationRestApi;
 use binance_sdk::derivatives_trading_usds_futures::rest_api::PositionInformationV2ResponseInner;
 use binance_sdk::derivatives_trading_usds_futures::rest_api::{
-    CancelOrderParams, ChangeInitialLeverageParams, GetCurrentPositionModeParams, NewOrderParams,
-    NewOrderReduceOnlyEnum, NewOrderSideEnum, NewOrderTimeInForceEnum, NewOrderTypeEnum,
-    PositionInformationV2Params, QueryOrderParams, RestApi as SdkRestApi,
+    AccountInformationV2Params, CancelOrderParams, ChangeInitialLeverageParams,
+    GetCurrentPositionModeParams, NewOrderParams, NewOrderReduceOnlyEnum, NewOrderSideEnum,
+    NewOrderTimeInForceEnum, NewOrderTypeEnum, PositionInformationV2Params, QueryOrderParams,
+    RestApi as SdkRestApi,
 };
 use binance_sdk::derivatives_trading_usds_futures::DerivativesTradingUsdsFuturesRestApi;
 use futures_util::stream::{self, BoxStream, StreamExt};
@@ -33,9 +34,9 @@ use trading_core::order_rule::OrderRuleTable;
 use trading_models::{InstrumentType, OrderStatus, PositionMode, Side};
 
 use crate::api::{
-    AccountDirty, AccountEvent, AccountEventStream, ExchangeApi, OrderAck, OrderLookup, OrderRef,
-    OrderState, PlaceErrorKind, PlaceOrderRequest, PositionInfo, PriceBasis, ReferencePrice,
-    RuleFetcher,
+    AccountDirty, AccountEvent, AccountEventStream, BalanceInfo, ExchangeApi, OrderAck,
+    OrderLookup, OrderRef, OrderState, PlaceErrorKind, PlaceOrderRequest, PositionInfo, PriceBasis,
+    ReferencePrice, RuleFetcher,
 };
 use crate::backoff::ReconnectBackoff;
 use crate::binance::prep::{
@@ -82,7 +83,7 @@ fn map_status(raw: &str) -> OrderStatus {
 fn parse_opt_dec(field: &str, raw: Option<&str>) -> anyhow::Result<Option<Decimal>> {
     raw.map(|s| parse_dec(s.trim_start_matches('+')))
         .transpose()
-        .map_err(|e| anyhow::anyhow!("binance 持仓字段 `{field}` 解析失败: {e}"))
+        .map_err(|e| anyhow::anyhow!("binance 字段 `{field}` 解析失败: {e}"))
 }
 
 /// 解析杠杆字符串（"10"->10）；缺失/非法返回 None，不阻断整个快照。
@@ -178,6 +179,46 @@ fn map_v2_position(p: PositionInformationV2ResponseInner) -> anyhow::Result<Opti
         margin,
         update_ms: p.update_time,
     }))
+}
+
+/// 账户余额应答（v2）→ 统一快照。
+///
+/// 账户级总额的计价口径由 `multiAssetsMargin` 决定：单资产模式为 USDT，
+/// 多资产模式为 USD（不能按 `assets[0].asset` 标注——首行可能只是某个保证金
+/// 资产，会得到类似 FDUSD 的错误标签）。`totalMarginBalance` 缺失时回退
+/// `totalWalletBalance`（权益=钱包余额）；**权益与可用均缺失即视为无效应答
+/// 返回 Err**，绝不用 0 冒充账户余额。
+fn map_account_balance(
+    resp: binance_sdk::derivatives_trading_usds_futures::rest_api::AccountInformationV2Response,
+) -> anyhow::Result<BalanceInfo> {
+    // 字段缺失按单资产口径保守取 USDT（USDⓈ-M 永续默认结算资产）。
+    let currency = if resp.multi_assets_margin.unwrap_or(false) {
+        "USD"
+    } else {
+        "USDT"
+    };
+    // 显式 match 而非 Option::or：避免主字段有效时仍急切解析备用字段。
+    let equity = match parse_opt_dec("totalMarginBalance", resp.total_margin_balance.as_deref())? {
+        Some(v) => v,
+        None => parse_opt_dec("totalWalletBalance", resp.total_wallet_balance.as_deref())?
+            .ok_or_else(|| {
+                anyhow::anyhow!("binance 余额应答缺少 totalMarginBalance/totalWalletBalance")
+            })?,
+    };
+    let available = parse_opt_dec("availableBalance", resp.available_balance.as_deref())?
+        .ok_or_else(|| anyhow::anyhow!("binance 余额应答缺少 availableBalance"))?;
+    Ok(BalanceInfo {
+        currency: currency.to_string(),
+        equity,
+        available,
+        margin_used: parse_opt_dec("totalInitialMargin", resp.total_initial_margin.as_deref())?,
+        unrealized_pnl: parse_opt_dec(
+            "totalUnrealizedProfit",
+            resp.total_unrealized_profit.as_deref(),
+        )?,
+        // v2 提供账户级更新时间；缺失即 None（不伪时间）。
+        update_ms: resp.update_time,
+    })
 }
 
 // =====================================================================
@@ -571,6 +612,23 @@ impl ExchangeApi for BinanceUser {
             }
         }
         Ok(out)
+    }
+
+    /// 账户当前余额（v2）：一次签名请求返回权益/可用/保证金/未实现盈亏。
+    ///
+    /// 用 v2 而非 v3：v2 带 `multiAssetsMargin`（决定总额计价 USD/USDT）与
+    /// `updateTime`，避免按 `assets[0]` 误标币种。
+    async fn get_balance(&self) -> anyhow::Result<Vec<BalanceInfo>> {
+        let params = AccountInformationV2Params::builder()
+            .recv_window(Some(RECV_WINDOW_MS))
+            .build()?;
+        let resp = self
+            .rest
+            .account_information_v2(params)
+            .await?
+            .data()
+            .await?;
+        Ok(vec![map_account_balance(resp)?])
     }
 
     async fn set_leverage(&self, instrument: &str, leverage: u32) -> anyhow::Result<()> {
@@ -1124,5 +1182,124 @@ mod tests {
             .unwrap()
             .as_nanos();
         format!("{:032x}", nanos)
+    }
+
+    /// 构造 v2 账户应答，只给关心的字段（其余 None）。
+    #[allow(clippy::too_many_arguments)]
+    fn v2_account(
+        margin_balance: Option<&str>,
+        wallet_balance: Option<&str>,
+        available: Option<&str>,
+        initial_margin: Option<&str>,
+        unrealized: Option<&str>,
+        multi_assets: Option<bool>,
+        update_ms: Option<i64>,
+    ) -> binance_sdk::derivatives_trading_usds_futures::rest_api::AccountInformationV2Response {
+        binance_sdk::derivatives_trading_usds_futures::rest_api::AccountInformationV2Response {
+            total_margin_balance: margin_balance.map(str::to_string),
+            total_wallet_balance: wallet_balance.map(str::to_string),
+            available_balance: available.map(str::to_string),
+            total_initial_margin: initial_margin.map(str::to_string),
+            total_unrealized_profit: unrealized.map(str::to_string),
+            multi_assets_margin: multi_assets,
+            update_time: update_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn maps_full_account_balance_in_single_asset_mode() {
+        // Arrange：完整 v2 应答（单资产模式 → 账户级金额以 USDT 计）。
+        let resp = v2_account(
+            Some("10000.5"),
+            Some("9800.0"),
+            Some("8000.25"),
+            Some("2000.0"),
+            Some("200.5"),
+            Some(false),
+            Some(1_731_081_600_000),
+        );
+
+        // Act
+        let b = map_account_balance(resp).expect("v2 应答应可映射");
+
+        // Assert：四要素逐项对应账户级字段；币种由 multiAssetsMargin 决定。
+        assert_eq!(b.currency, "USDT");
+        assert_eq!(b.equity, Decimal::from_str("10000.5").unwrap());
+        assert_eq!(b.available, Decimal::from_str("8000.25").unwrap());
+        assert_eq!(b.margin_used, Some(Decimal::from_str("2000.0").unwrap()));
+        assert_eq!(b.unrealized_pnl, Some(Decimal::from_str("200.5").unwrap()));
+        assert_eq!(b.update_ms, Some(1_731_081_600_000));
+    }
+
+    #[test]
+    fn multi_asset_mode_labels_currency_usd() {
+        // 多资产模式下账户级总额为 USD 计价，不能标成某个保证金资产。
+        let resp = v2_account(
+            Some("3734.47"),
+            Some("4581.33"),
+            Some("67.38"),
+            Some("3665.49"),
+            Some("-846.85"),
+            Some(true),
+            None,
+        );
+        let b = map_account_balance(resp).expect("多资产应答应可映射");
+        assert_eq!(b.currency, "USD");
+    }
+
+    #[test]
+    fn missing_multi_assets_flag_defaults_to_usdt() {
+        // 字段缺失按单资产口径保守取 USDT（USDⓈ-M 永续默认结算资产）。
+        let resp = v2_account(Some("100"), None, Some("90"), None, None, None, None);
+        let b = map_account_balance(resp).expect("应可映射");
+        assert_eq!(b.currency, "USDT");
+        assert_eq!(b.update_ms, None);
+    }
+
+    #[test]
+    fn falls_back_to_wallet_balance_when_margin_balance_missing() {
+        // Arrange：totalMarginBalance 缺失（字段裁剪），钱包余额可用。
+        let resp = v2_account(None, Some("9800.0"), Some("8000"), None, None, None, None);
+
+        // Act
+        let b = map_account_balance(resp).expect("缺 totalMarginBalance 时回退");
+
+        // Assert：权益回退钱包余额。
+        assert_eq!(b.equity, Decimal::from_str("9800.0").unwrap());
+        assert_eq!(b.available, Decimal::from_str("8000").unwrap());
+        assert_eq!(b.margin_used, None);
+        assert_eq!(b.unrealized_pnl, None);
+    }
+
+    #[test]
+    fn rejects_missing_equity_and_wallet_balance() {
+        // 两个权益字段都没有：无效应答，绝不能返回 equity=0 冒充空账户。
+        let resp = v2_account(None, None, Some("8000"), None, None, None, None);
+        assert!(map_account_balance(resp).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_available_balance() {
+        // 可用资金缺失：无效应答，绝不能返回 available=0。
+        let resp = v2_account(Some("10000"), Some("9800"), None, None, None, None, None);
+        assert!(map_account_balance(resp).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_decimal_field() {
+        // Arrange：可用资金为非法串，不能静默当 0。
+        let resp = v2_account(
+            Some("10000"),
+            None,
+            Some("not-a-number"),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        // Act / Assert
+        assert!(map_account_balance(resp).is_err());
     }
 }

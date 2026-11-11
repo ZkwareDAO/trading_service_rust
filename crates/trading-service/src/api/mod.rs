@@ -26,6 +26,7 @@ use crate::state::AppState;
 
 // 只读 handler 在模块树声明（见 handlers）。
 use crate::api::handlers::accounts::list_accounts;
+use crate::api::handlers::exchange_balance::query_exchange_balance;
 use crate::api::handlers::exchange_positions::query_exchange_positions;
 use crate::api::handlers::lists::{
     get_position, list_orders as query_orders, list_positions, list_rules,
@@ -80,6 +81,11 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/exchange/positions",
             axum::routing::post(query_exchange_positions),
+        )
+        // 实时查询交易所账户余额（与查仓同口径：产品缺省 futures）。
+        .route(
+            "/api/v1/exchange/balance",
+            axum::routing::post(query_exchange_balance),
         )
 }
 

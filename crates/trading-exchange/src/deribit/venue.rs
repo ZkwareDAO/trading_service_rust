@@ -19,8 +19,8 @@ use trading_core::order_rule::OrderRuleTable;
 use trading_models::{InstrumentType, OrderStatus, OrderType, Side};
 
 use crate::api::{
-    AccountEventStream, ExchangeApi, OrderAck, OrderPositionSide, OrderRef, OrderState,
-    PlaceErrorKind, PlaceOrderRequest, PreparedPlacement, PriceBasis, ReferencePrice,
+    AccountEventStream, BalanceInfo, ExchangeApi, OrderAck, OrderPositionSide, OrderRef,
+    OrderState, PlaceErrorKind, PlaceOrderRequest, PreparedPlacement, PriceBasis, ReferencePrice,
 };
 use crate::deribit::instant;
 use crate::deribit::prep::{self, PrepConfig};
@@ -320,6 +320,30 @@ impl ExchangeApi for DeribitUser {
         Ok(out)
     }
 
+    /// 账户当前余额：按结算币种分别拉取账户摘要（与查仓同口径 BTC/ETH）。
+    ///
+    /// 任一币种查询失败或应答无权益字段即整体失败，避免用部分余额冒充全账户。
+    async fn get_balance(&self) -> anyhow::Result<Vec<BalanceInfo>> {
+        let token = self.token().await?;
+        let mut out = Vec::new();
+        for currency in ["BTC", "ETH"] {
+            let params = serde_json::json!({ "currency": currency });
+            let result = rpc::call(
+                self.http.clone(),
+                self.base(),
+                "private/get_account_summary",
+                params,
+                Some(&token),
+            )
+            .await?;
+            let info = map_account_summary_balance(&result, currency).ok_or_else(|| {
+                anyhow::anyhow!("deribit 账户摘要缺少 equity/balance（currency={currency}）")
+            })?;
+            out.push(info);
+        }
+        Ok(out)
+    }
+
     /// 错误分类委托纯函数 [`classify_deribit_error`]。
     fn classify_place_error(&self, err: &anyhow::Error) -> PlaceErrorKind {
         classify_deribit_error(err)
@@ -403,6 +427,29 @@ pub(crate) fn map_order_state(v: &serde_json::Value, instrument: &str) -> OrderS
         position_side: OrderPositionSide::Both,
         venue_extra: Some(extra),
     }
+}
+
+/// `private/get_account_summary` 应答 → 统一余额快照。
+///
+/// 权益口径优先 `equity`（含未实现盈亏），缺失时回退 `balance`（静态余额）；
+/// 权益/余额与 `available_funds` 任一缺失即视为无效应答返回 None——
+/// 绝不用 0 冒充账户余额或"无可用资金"。
+fn map_account_summary_balance(v: &serde_json::Value, query_currency: &str) -> Option<BalanceInfo> {
+    let equity = json_dec(v.get("equity")).or_else(|| json_dec(v.get("balance")))?;
+    let available = json_dec(v.get("available_funds"))?;
+    Some(BalanceInfo {
+        currency: v
+            .get("currency")
+            .and_then(|x| x.as_str())
+            .unwrap_or(query_currency)
+            .to_string(),
+        equity,
+        available,
+        margin_used: json_dec(v.get("initial_margin")),
+        // Deribit 的 unrealized_pl 在部分账户/旧版应答里可能缺省；缺省即 None。
+        unrealized_pnl: json_dec(v.get("unrealized_pl")),
+        update_ms: v.get("timestamp").and_then(|x| x.as_i64()),
+    })
 }
 
 /// 映射 get_positions 一行为 [`PositionInfo`]；非 option/0 量返回 None（过滤）。
@@ -611,5 +658,64 @@ mod tests {
         assert!(map_position(&zero, "BTC").is_none());
         let not_option = serde_json::json!({"instrument_name":"X","kind":"future","size":1});
         assert!(map_position(&not_option, "BTC").is_none());
+    }
+
+    #[test]
+    fn account_summary_maps_balance_fields() {
+        // Arrange：完整账户摘要（BTC）。
+        let v = serde_json::json!({
+            "currency": "BTC",
+            "equity": 1.25,
+            "balance": 1.20,
+            "available_funds": 0.80,
+            "initial_margin": 0.45,
+            "unrealized_pl": 0.05,
+            "timestamp": 1_731_081_600_000i64
+        });
+
+        // Act
+        let b = map_account_summary_balance(&v, "BTC").expect("应有余额");
+
+        // Assert：逐字段映射；权益取 equity 而非 balance。
+        assert_eq!(b.currency, "BTC");
+        assert_eq!(b.equity, dec("1.25"));
+        assert_eq!(b.available, dec("0.80"));
+        assert_eq!(b.margin_used, Some(dec("0.45")));
+        assert_eq!(b.unrealized_pnl, Some(dec("0.05")));
+        assert_eq!(b.update_ms, Some(1_731_081_600_000));
+    }
+
+    #[test]
+    fn account_summary_falls_back_to_balance_and_query_currency() {
+        // Arrange：equity/currency 缺失（旧版应答或字段裁剪）。
+        let v = serde_json::json!({
+            "balance": 2.5,
+            "available_funds": 2.0
+        });
+
+        // Act
+        let b = map_account_summary_balance(&v, "ETH").expect("应回退 balance");
+
+        // Assert：权益回退 balance，币种回退查询币种，可选字段为 None。
+        assert_eq!(b.currency, "ETH");
+        assert_eq!(b.equity, dec("2.5"));
+        assert_eq!(b.available, dec("2.0"));
+        assert_eq!(b.margin_used, None);
+        assert_eq!(b.unrealized_pnl, None);
+        assert_eq!(b.update_ms, None);
+    }
+
+    #[test]
+    fn account_summary_without_available_funds_is_none() {
+        // 可用资金缺失：无效应答，绝不能返回 available=0。
+        let v = serde_json::json!({"currency": "BTC", "equity": 1.25});
+        assert!(map_account_summary_balance(&v, "BTC").is_none());
+    }
+
+    #[test]
+    fn account_summary_without_equity_or_balance_is_none() {
+        // 既无 equity 也无 balance：视为无效应答，绝不编造零余额。
+        let v = serde_json::json!({"currency": "BTC", "available_funds": 1.0});
+        assert!(map_account_summary_balance(&v, "BTC").is_none());
     }
 }

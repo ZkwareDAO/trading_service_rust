@@ -131,8 +131,28 @@ pub enum CtpEvent {
     Instrument(InstrumentInfo),
     /// 持仓信息（查询应答逐条返回；数量为 0 的行柜台也会推送，由上层过滤）。
     Position(PositionSnapshot),
+    /// 资金账户信息（`on_rsp_qry_trading_account` 应答，通常一行）。
+    TradingAccount(TradingAccountSnapshot),
     /// 查询应答结束（`is_last=true`），标志一次分页查询的所有记录已收齐。
     QueryEnd,
+}
+
+/// 资金账户快照（柜台 `CThostFtdcTradingAccountField` 的安全副本）。
+///
+/// 仅拷贝余额查询消费的字段：权益（Balance）、可用（Available）、
+/// 占用保证金（CurrMargin）、持仓盈亏（PositionProfit）与币种。
+#[derive(Debug, Clone)]
+pub struct TradingAccountSnapshot {
+    /// 结算准备金/账户权益（含持仓盈亏）。
+    pub balance: f64,
+    /// 可用资金。
+    pub available: f64,
+    /// 当前占用保证金。
+    pub curr_margin: f64,
+    /// 持仓盈亏（未实现）。
+    pub position_profit: f64,
+    /// 币种代码（如 CNY）。
+    pub currency_id: String,
 }
 
 /// 持仓快照（柜台 `CThostFtdcInvestorPositionField` 的安全副本）。

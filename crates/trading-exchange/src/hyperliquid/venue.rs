@@ -21,8 +21,8 @@ use trading_core::order_rule::OrderRuleTable;
 use trading_models::{Instrument, InstrumentType, MarketKind, OrderStatus, OrderType, Side, Venue};
 
 use crate::api::{
-    AccountEventStream, ExchangeApi, OrderAck, OrderPositionSide, OrderRef, OrderState,
-    PlaceErrorKind, PlaceOrderRequest, PriceBasis, ReferencePrice,
+    AccountEventStream, BalanceInfo, ExchangeApi, OrderAck, OrderPositionSide, OrderRef,
+    OrderState, PlaceErrorKind, PlaceOrderRequest, PriceBasis, ReferencePrice,
 };
 use crate::hyperliquid::endpoint;
 use crate::hyperliquid::pricing;
@@ -125,6 +125,26 @@ pub(crate) fn parse_all_mids(v: &Value) -> HashMap<String, Decimal> {
         }
     }
     mids
+}
+
+/// `clearinghouseState` → 统一余额快照（永续账户以 USDC 计价）。
+///
+/// 账户价值取 `marginSummary.accountValue`；可用取顶层 `withdrawable`；
+/// 占用保证金取 `marginSummary.totalMarginUsed`。`accountValue` 或 `withdrawable`
+/// 缺失即视为无效应答返回 None——绝不用 0 冒充账户余额或"无可用资金"。
+pub(crate) fn map_clearinghouse_balance(v: &Value) -> Option<BalanceInfo> {
+    let summary = v.get("marginSummary")?;
+    let equity = json_dec(summary.get("accountValue"))?;
+    let available = json_dec(v.get("withdrawable"))?;
+    Some(BalanceInfo {
+        currency: "USDC".to_string(),
+        equity,
+        available,
+        margin_used: json_dec(summary.get("totalMarginUsed")),
+        // marginSummary 无未实现盈亏独立字段；统一模型留 None，不臆造。
+        unrealized_pnl: None,
+        update_ms: v.get("time").and_then(|x| x.as_i64()),
+    })
 }
 
 // =====================================================================
@@ -431,6 +451,19 @@ impl ExchangeApi for HyperliquidUser {
         Ok(out)
     }
 
+    /// 账户当前余额：复用 clearinghouseState（无需 allMids 补价）。
+    async fn get_balance(&self) -> anyhow::Result<Vec<BalanceInfo>> {
+        let body = serde_json::json!({
+            "type": "clearinghouseState",
+            "user": self.user_address(),
+        });
+        let env = self.post_info(body).await?;
+        let info = map_clearinghouse_balance(&env).ok_or_else(|| {
+            anyhow::anyhow!("hyperliquid 清算所状态缺少 marginSummary.accountValue")
+        })?;
+        Ok(vec![info])
+    }
+
     async fn set_leverage(&self, instrument: &str, leverage: u32) -> anyhow::Result<()> {
         let coin = instrument.trim();
         let row = self
@@ -636,6 +669,76 @@ mod parse_tests {
             Some("0xe5ef414515074ad0a89093bd82919e3e")
         );
         assert_eq!(s.exchange_order_id.as_deref(), Some("61391108446"));
+    }
+}
+
+#[cfg(test)]
+mod balance_tests {
+    use super::*;
+
+    #[test]
+    fn clearinghouse_maps_balance_fields() {
+        // Arrange：完整 clearinghouseState（永续账户 USDC）。
+        let v = serde_json::json!({
+            "marginSummary": {
+                "accountValue": "12345.67",
+                "totalMarginUsed": "2345.67",
+                "totalNtlPos": "50000.0",
+                "totalRawUsd": "10000.0"
+            },
+            "withdrawable": "8500.25",
+            "time": 1_731_081_600_000i64
+        });
+
+        // Act
+        let b = map_clearinghouse_balance(&v).expect("应有余额");
+
+        // Assert：权益/可用/保证金逐项映射；HL 无未实现盈亏独立字段。
+        assert_eq!(b.currency, "USDC");
+        assert_eq!(b.equity, Decimal::from_str_exact("12345.67").unwrap());
+        assert_eq!(b.available, Decimal::from_str_exact("8500.25").unwrap());
+        assert_eq!(
+            b.margin_used,
+            Some(Decimal::from_str_exact("2345.67").unwrap())
+        );
+        assert_eq!(b.unrealized_pnl, None);
+        assert_eq!(b.update_ms, Some(1_731_081_600_000));
+    }
+
+    #[test]
+    fn clearinghouse_without_account_value_is_none() {
+        // marginSummary/accountValue 缺失：无效应答，不编造零余额。
+        assert!(map_clearinghouse_balance(&serde_json::json!({})).is_none());
+        assert!(map_clearinghouse_balance(&serde_json::json!({
+            "marginSummary": {"totalMarginUsed": "1"}
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn clearinghouse_defaults_missing_optional_fields() {
+        // Arrange：账户价值 + 可用资金齐全，缺保证金/时间。
+        let v = serde_json::json!({
+            "marginSummary": {"accountValue": "100"},
+            "withdrawable": "90"
+        });
+
+        // Act
+        let b = map_clearinghouse_balance(&v).expect("应有余额");
+
+        // Assert：可用原样映射，其余可选字段 None（不臆造）。
+        assert_eq!(b.equity, Decimal::from(100));
+        assert_eq!(b.available, Decimal::from(90));
+        assert_eq!(b.margin_used, None);
+        assert_eq!(b.unrealized_pnl, None);
+        assert_eq!(b.update_ms, None);
+    }
+
+    #[test]
+    fn clearinghouse_without_withdrawable_is_none() {
+        // 可用资金缺失：无效应答，绝不能返回 available=0。
+        let v = serde_json::json!({"marginSummary": {"accountValue": "100"}});
+        assert!(map_clearinghouse_balance(&v).is_none());
     }
 }
 

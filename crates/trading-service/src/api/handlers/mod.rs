@@ -1,6 +1,7 @@
 //! 薄 axum handler 集合：解析请求 → 调 store/service → DTO 信封。
 
 pub mod accounts;
+pub mod exchange_balance;
 pub mod exchange_positions;
 pub mod klines_backfill;
 pub mod lists;

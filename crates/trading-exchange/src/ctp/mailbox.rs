@@ -92,7 +92,14 @@ pub struct QueryPositionsJob {
     pub reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<PositionInfo>>>,
 }
 
-/// 投递到长会话线程的请求（四类共用一条 FIFO）。
+/// 一笔资金账户查询请求（余额即查即返）。
+pub struct QueryBalanceJob {
+    /// 余额回执；柜台未返回资金账户/流控/断线均为 Err（绝不返回空余额冒充成功）。
+    /// 断线时 Sender 随 ActiveQuery drop → 接收端 RecvError，门面映射"会话断开"。
+    pub reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<crate::api::BalanceInfo>>>,
+}
+
+/// 投递到长会话线程的请求（五类共用一条 FIFO）。
 pub enum SessionRequest {
     /// 下单。
     Insert(PendingInsert),
@@ -102,6 +109,8 @@ pub enum SessionRequest {
     QueryOrder(QueryOrderJob),
     /// 持仓查询。
     QueryPositions(QueryPositionsJob),
+    /// 资金账户查询。
+    QueryBalance(QueryBalanceJob),
 }
 
 impl SessionRequest {
@@ -113,6 +122,7 @@ impl SessionRequest {
             SessionRequest::Cancel(c) => c.reply.is_closed(),
             SessionRequest::QueryOrder(q) => q.reply.is_closed(),
             SessionRequest::QueryPositions(q) => q.reply.is_closed(),
+            SessionRequest::QueryBalance(q) => q.reply.is_closed(),
         }
     }
 
@@ -123,6 +133,7 @@ impl SessionRequest {
             SessionRequest::Cancel(_) => "Cancel",
             SessionRequest::QueryOrder(_) => "QueryOrder",
             SessionRequest::QueryPositions(_) => "QueryPositions",
+            SessionRequest::QueryBalance(_) => "QueryBalance",
         }
     }
 }
@@ -194,7 +205,9 @@ pub(crate) enum MailboxAction {
 pub(crate) fn is_query(req: &SessionRequest) -> bool {
     matches!(
         req,
-        SessionRequest::QueryOrder(_) | SessionRequest::QueryPositions(_)
+        SessionRequest::QueryOrder(_)
+            | SessionRequest::QueryPositions(_)
+            | SessionRequest::QueryBalance(_)
     )
 }
 
@@ -265,6 +278,12 @@ mod tests {
         SessionRequest::QueryPositions(QueryPositionsJob { reply: tx })
     }
 
+    fn query_balance() -> SessionRequest {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::mem::forget(rx); // 模拟调用方仍在等待回执（接收端保活）。
+        SessionRequest::QueryBalance(QueryBalanceJob { reply: tx })
+    }
+
     #[tokio::test]
     async fn submit_then_take_returns_insert_payload() {
         // Arrange / Act
@@ -295,6 +314,7 @@ mod tests {
         m.submit(cancel());
         m.submit(query_order());
         m.submit(query_positions());
+        m.submit(query_balance());
 
         // Act / Assert：严格按入队顺序、类型正确地取回。
         assert!(matches!(m.take_next(), Some(SessionRequest::Insert(_))));
@@ -303,6 +323,10 @@ mod tests {
         assert!(matches!(
             m.take_next(),
             Some(SessionRequest::QueryPositions(_))
+        ));
+        assert!(matches!(
+            m.take_next(),
+            Some(SessionRequest::QueryBalance(_))
         ));
         assert!(m.take_next().is_none());
     }
@@ -400,6 +424,15 @@ mod tests {
         assert!(matches!(
             plan_mailbox_drain(Some(query_positions()), false),
             MailboxAction::Issue(_)
+        ));
+        // 资金账户查询同属查询类：空闲 Issue、在途 Defer。
+        assert!(matches!(
+            plan_mailbox_drain(Some(query_balance()), false),
+            MailboxAction::Issue(_)
+        ));
+        assert!(matches!(
+            plan_mailbox_drain(Some(query_balance()), true),
+            MailboxAction::Defer(_)
         ));
         // 已有查询在途 → Defer（携带原请求塞回队首，本轮不叠加第二个查询）。
         assert!(matches!(

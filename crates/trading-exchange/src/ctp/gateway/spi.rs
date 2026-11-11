@@ -11,7 +11,9 @@ use crate::ctp::core::event::{CtpEvent, InstrumentInfo, LoginInfo};
 use crate::ctp::core::types::{Direction, Offset};
 use ctp2rs::v1alpha1::{CThostFtdcRspInfoField, CThostFtdcRspUserLoginField, TraderSpi};
 
-use crate::ctp::gateway::convert::snapshot::{order_snapshot, position_snapshot, trade_snapshot};
+use crate::ctp::gateway::convert::snapshot::{
+    order_snapshot, position_snapshot, trade_snapshot, trading_account_snapshot,
+};
 
 /// 把回调映射为 [`CtpEvent`] 并转发的 SPI 适配器。
 pub struct EventTraderSpi {
@@ -210,6 +212,25 @@ impl TraderSpi for EventTraderSpi {
         }
     }
 
+    fn on_rsp_qry_trading_account(
+        &mut self,
+        account: Option<&ctp2rs::v1alpha1::CThostFtdcTradingAccountField>,
+        info: Option<&CThostFtdcRspInfoField>,
+        _request_id: i32,
+        is_last: bool,
+    ) {
+        // 查询被拒时先保留柜台错误码（CtpEvent::Error 供诊断）；oneshot 仍由随后的
+        // QueryEnd 收敛为 Err，二者职责分开、不互相替代。
+        self.emit_error_if_any(info);
+        // 与持仓/委托查询一致：逐条转发生成数据事件，末条发 QueryEnd 释放闸门。
+        if let Some(a) = account {
+            self.emit(CtpEvent::TradingAccount(trading_account_snapshot(a)));
+        }
+        if is_last {
+            self.emit(CtpEvent::QueryEnd);
+        }
+    }
+
     fn on_rsp_qry_order(
         &mut self,
         order: Option<&ctp2rs::v1alpha1::CThostFtdcOrderField>,
@@ -319,6 +340,50 @@ mod tests {
         );
         // 末条（末页可能无数据行）：必须发 QueryEnd 释放合约预热闸门。
         spi.on_rsp_qry_instrument(None, None, 1, true);
+        assert!(matches!(rx.try_recv(), Ok(CtpEvent::QueryEnd)));
+    }
+
+    #[test]
+    fn rsp_qry_trading_account_emits_event_and_query_end_on_last() {
+        // Arrange：资金账户应答行。
+        let mut account = ctp2rs::v1alpha1::CThostFtdcTradingAccountField::default();
+        crate::ctp::core::encoding::encode_fixed(&mut account.CurrencyID, "CNY");
+        account.Balance = 10.0;
+
+        // Act：非末条只发数据事件，不提前释放查询闸门。
+        let (mut spi, rx) = setup();
+        spi.on_rsp_qry_trading_account(Some(&account), None, 1, false);
+        match rx.try_recv() {
+            Ok(CtpEvent::TradingAccount(a)) => {
+                assert_eq!(a.currency_id, "CNY");
+                assert!((a.balance - 10.0).abs() < 1e-9);
+            }
+            other => panic!("期望 TradingAccount 事件，实际 {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "非末条不得发 QueryEnd");
+
+        // 末条（末页可能无数据行）：必须发 QueryEnd。
+        spi.on_rsp_qry_trading_account(None, None, 1, true);
+        assert!(matches!(rx.try_recv(), Ok(CtpEvent::QueryEnd)));
+    }
+
+    #[test]
+    fn rsp_qry_trading_account_error_keeps_venue_error_code() {
+        // Arrange：柜台拒绝查询（非 0 错误码）且无数据行。
+        let rsp = ctp2rs::v1alpha1::CThostFtdcRspInfoField {
+            ErrorID: 31,
+            ..Default::default()
+        };
+
+        // Act
+        let (mut spi, rx) = setup();
+        spi.on_rsp_qry_trading_account(None, Some(&rsp), 1, true);
+
+        // Assert：先错误事件（保留真实错误码），再 QueryEnd 释放闸门。
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(CtpEvent::Error { code: 31, .. })
+        ));
         assert!(matches!(rx.try_recv(), Ok(CtpEvent::QueryEnd)));
     }
 

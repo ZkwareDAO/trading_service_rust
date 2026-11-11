@@ -157,6 +157,17 @@ impl TraderHandle {
         self.api.req_qry_investor_position(&mut req, id)
     }
 
+    /// 发起资金账户查询，返回柜台受理码。
+    ///
+    /// 结果经 `CtpEvent::TradingAccount` 返回，`CtpEvent::QueryEnd` 表示收齐。
+    pub fn query_trading_account(&mut self) -> i32 {
+        let mut req = ctp2rs::v1alpha1::CThostFtdcQryTradingAccountField::default();
+        encode_fixed(&mut req.BrokerID, &self.account.broker_id);
+        encode_fixed(&mut req.InvestorID, self.account.effective_investor_id());
+        let id = self.session.request_id();
+        self.api.req_qry_trading_account(&mut req, id)
+    }
+
     /// 发起当日成交查询，返回柜台受理码。
     ///
     /// 结果经 `CtpEvent::Trade` 逐条返回，`CtpEvent::QueryEnd` 表示收齐。
