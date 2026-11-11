@@ -67,7 +67,7 @@ pub struct CtpProvider {
 impl CtpProvider {
     pub fn new(deps: ProviderDeps, config: CtpConfig) -> Self {
         let instrument_dir = Arc::new(crate::ctp::instrument_dir::InstrumentDir::new());
-        // 冷启动种子：最新一份 instruments.csv（仅在交易期货）灌入内存表，
+        // 冷启动种子：最新一份 instruments.csv（在交易期货 + 期权）灌入内存表，
         // 使品种订阅在交易侧在线合约查询返回前即可展开；文件缺失不阻断启动。
         if let Some(path) = config.instrument_specs_path.as_ref() {
             if path.exists() {
@@ -210,8 +210,8 @@ impl CtpProvider {
         // 2) 先落盘（失败则不重灌内存，保留旧目录）。
         persist(&snapshot)?;
 
-        // 3) 原地重灌共享合约目录（仅在交易期货）；retain 新集合，摘牌合约被移除。
-        let dir_rows = spec_fetch::to_trading_futures_dir_rows(&snapshot);
+        // 3) 原地重灌共享合约目录（在交易期货 + 期权）；retain 新集合，摘牌合约被移除。
+        let dir_rows = spec_fetch::to_trading_dir_rows(&snapshot);
         let loaded = self.instrument_dir.replace_all(dir_rows);
         tracing::info!(
             account = %name,
@@ -269,12 +269,14 @@ impl VenueProvider for CtpProvider {
         instrument.trim().to_string()
     }
 
-    /// 建单前同步预检：**仅 SHFE** 市价单转穿价限价（GFD），其他所/限价单透传。
+    /// 建单前同步预检：**全部期权 + `market_limit_exchanges` 内的期货**市价单
+    /// 转穿价限价（GFD），其余透传。
     ///
-    /// SHFE/INE 柜台不支持 AnyPrice；这里从共享合约目录判交易所、取最小变动价位，
-    /// 从共享行情表读 best bid/ask，交纯函数 [`prep::prepare_shfe_market_limit`]
-    /// 转成对手价（平仓）或对手价±n tick（开仓）限价。合约/行情未就绪 → DataNotReady，
-    /// 引擎不 claim、规则保活下轮重试。非 SHFE 市价维持原生 AnyPrice+IOC。
+    /// SHFE/INE 柜台不支持 AnyPrice，期权则统一走对手价限价；这里从共享合约目录
+    /// 取产品类型/最小变动价位，从共享行情表读 best bid/ask，交纯函数
+    /// [`prep::prepare_market_to_limit`] 转成对手价（平仓）或对手价±n tick（开仓）
+    /// 限价。合约/行情未就绪 → DataNotReady，引擎不 claim、规则保活下轮重试。
+    /// `market_limit_exchanges` 只约束期货；DCE/CZCE 期货市价仍走原生 AnyPrice+IOC。
     fn prepare_placement(
         &self,
         _venue: &str,
@@ -402,6 +404,7 @@ impl VenueProvider for CtpProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ctp::instrument_dir::PRODUCT_FUTURES;
     use crate::port::CredentialResolver;
     use std::sync::Mutex;
 
@@ -678,7 +681,7 @@ mod tests {
         assert_eq!(profile.quote_venue, trading_models::Venue::Ctp);
     }
 
-    // ---- prepare_placement：仅 SHFE 市价转穿价限价 ----
+    // ---- prepare_placement：全部期权 + 配置交易所期货的市价转穿价限价 ----
 
     use crate::api::{OrderPositionSide, PlaceDefer};
     use crate::ctp::core::event::InstrumentInfo;
@@ -736,6 +739,7 @@ mod tests {
             instrument: "rb2510".into(),
             exchange_id: exchange.into(),
             product_id: "rb".into(),
+            product_class: PRODUCT_FUTURES,
             is_trading: true,
             volume_multiple: 10,
             price_tick: tick,

@@ -7,7 +7,8 @@
 //! 生命周期：**仅会话内存**（DashMap），不落盘、不产生第二条持久仓位——
 //! 持久层一个 (账户,交易所,合约,方向) 始终只有一条整合 Position，本表仅供
 //! 「这一下单平今还是平昨」的瞬间路由。真相源是周期持仓快照
-//! （`merge_position_snapshots` 收齐后整批 `set` 覆盖），实时成交按开平标志
+//! （`merge_position_snapshots`/`merge_option_position_snapshots` 收齐后整批
+//! `set` 覆盖），实时成交按开平标志
 //! 做增量（`apply_trade`）；断线/重连后随快照重建，丢得起。
 
 use dashmap::DashMap;

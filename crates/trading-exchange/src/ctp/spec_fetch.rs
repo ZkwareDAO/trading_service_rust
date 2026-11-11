@@ -33,8 +33,8 @@ use crate::ctp::core::account::CtpAccount;
 use crate::ctp::core::encoding::{decode_fixed, encode_fixed};
 use crate::ctp::core::event::InstrumentInfo;
 
-/// CTP 产品类型常量（ThostFtdcUserApiDataType.h 的 THOST_FTDC_PC_Future，ASCII '1'）。
-pub const PRODUCT_FUTURES: u8 = b'1';
+// 产品类型常量统一由合约目录定义并对外复用（'1' 期货 / '2' 期权）。
+pub use crate::ctp::instrument_dir::{PRODUCT_FUTURES, PRODUCT_OPTIONS};
 
 /// 登录三步总窗口（结算确认在换日时可能要下载结算单，放宽到 5 分钟）。
 const LOGIN_DEADLINE: Duration = Duration::from_secs(300);
@@ -106,7 +106,7 @@ pub struct FetchedCommission {
 /// 一次全量拉取的结果（合约 + 投资者手续费率）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SpecSnapshot {
-    /// 全量合约（含期权；内存目录只收期货）。
+    /// 全量合约（含期权；内存目录收在交易期货 + 期权）。
     pub instruments: Vec<FetchedInstrument>,
     /// 投资者手续费率（按合约去重）。
     pub commissions: Vec<FetchedCommission>,
@@ -181,20 +181,24 @@ pub fn product_representatives(
 }
 
 /// 把拉取到的全量合约收敛为可重灌共享 [`InstrumentDir`] 的静态信息行：
-/// **仅当前在交易的期货**（`product_class='1'` 且 `is_trading`），与冷启动
-/// `InstrumentDir::load_from_csv` 的过滤口径一致（期权/组合/摘牌一律剔除）。
+/// **当前在交易的期货与期权**（`product_class∈{'1','2'}` 且 `is_trading`），
+/// 与冷启动 `InstrumentDir::load_from_csv` 的过滤口径一致（组合/摘牌剔除）。
+///
+/// 期权入目录是期权成本（OpenCost）折算与期权市价单转限价的前置；K 线品种
+/// 展开仍由目录按 `product_class='1'` 再过滤。
 ///
 /// 这是纯函数（不触碰 FFI/文件），刷新后「以最新快照替换内存目录」的重灌逻辑
 /// 借此可单测：宿主把返回行逐条 `remember` 进新建目录，再原子替换共享实例。
-pub fn to_trading_futures_dir_rows(snapshot: &SpecSnapshot) -> Vec<InstrumentInfo> {
+pub fn to_trading_dir_rows(snapshot: &SpecSnapshot) -> Vec<InstrumentInfo> {
     snapshot
         .instruments
         .iter()
-        .filter(|i| i.product_class == PRODUCT_FUTURES && i.is_trading)
+        .filter(|i| matches!(i.product_class, PRODUCT_FUTURES | PRODUCT_OPTIONS) && i.is_trading)
         .map(|i| InstrumentInfo {
             instrument: i.instrument_id.clone(),
             exchange_id: i.exchange_id.clone(),
             product_id: i.product_id.clone(),
+            product_class: i.product_class,
             is_trading: true,
             volume_multiple: i.volume_multiple,
             price_tick: i.price_tick,
@@ -711,24 +715,32 @@ mod tests {
     }
 
     #[test]
-    fn dir_rows_keep_only_trading_futures_and_map_fields() {
-        // 全量含：在交易期货 / 摘牌期货 / 期权。重灌目录只应收 1 行且字段映射正确。
+    fn dir_rows_keep_trading_futures_and_options_and_map_fields() {
+        // 全量含：在交易期货 / 摘牌期货 / 在交易期权 / 摘牌期权 / 组合。
+        // 重灌目录应收期货 + 期权，并保留 product_class 供后续成本/市价分支。
         let active = futures("cu2611", "SHFE", "cu");
         let delisted = inst("cu2512", "SHFE", "cu", PRODUCT_FUTURES, false);
-        let option = inst("cu2611C80000", "SHFE", "cu_o", b'2', true);
+        let option = inst("cu2611C80000", "SHFE", "cu_o", PRODUCT_OPTIONS, true);
+        let delisted_option = inst("cu2512C80000", "SHFE", "cu_o", PRODUCT_OPTIONS, false);
+        let combo = inst("SP cu2611&cu2612", "SHFE", "SP", b'3', true);
         let snap = SpecSnapshot {
-            instruments: vec![active, delisted, option],
+            instruments: vec![active, delisted, option, delisted_option, combo],
             commissions: vec![],
         };
 
-        let rows = to_trading_futures_dir_rows(&snap);
+        let rows = to_trading_dir_rows(&snap);
 
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].instrument, "cu2611");
         assert_eq!(rows[0].exchange_id, "SHFE");
         assert_eq!(rows[0].product_id, "cu");
+        assert_eq!(rows[0].product_class, PRODUCT_FUTURES);
         assert!(rows[0].is_trading);
         assert_eq!(rows[0].volume_multiple, 10);
         assert!((rows[0].long_margin_ratio - 0.08).abs() < 1e-12);
+        // 期权乘数同样映射（成本折算/平仓路由都需要）。
+        assert_eq!(rows[1].instrument, "cu2611C80000");
+        assert_eq!(rows[1].product_class, PRODUCT_OPTIONS);
+        assert_eq!(rows[1].volume_multiple, 10);
     }
 }

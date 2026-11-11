@@ -28,15 +28,17 @@ pub struct CtpConfig {
     pub md_anon: bool,
     /// 行情登录形态：Password 字段填认证码（部分柜台行情鉴权形态）。
     pub md_pass_is_authcode: bool,
-    /// SHFE 市价单转穿价限价时，开仓价相对对手价向外漂移的最小变动价位档数
+    /// 市价单转穿价限价时，开仓价相对对手价向外漂移的最小变动价位档数
     /// （买开=ask+n·tick、卖开=bid−n·tick）；**CTP 独立配置，与 deribit 漂移无关**。
+    /// 适用于“SHFE 期货 + 全部期权”（期权无论交易所一律转限价）。
     /// 平仓不漂移（取 best bid/ask）。默认 1；0 = 纯对手价。
     pub shfe_market_drift_ticks: i64,
     /// SHFE 平仓腿先后顺序：`today_first`（默认，先平今）/ `yesterday_first`
     /// （旧行为，先平昨）。两腿的实际 `ReqOrderInsert` 调用顺序即由此决定。
     pub shfe_close_priority: ShfeClosePriority,
-    /// 哪些交易所的市价单必须转对手价限价（这些交易所不支持 CTP `AnyPrice`）。
+    /// 哪些交易所的**期货**市价单必须转对手价限价（这些交易所不支持 CTP `AnyPrice`）。
     /// 默认 `["SHFE"]`；CFFEX 不支持 AnyPrice，需显式加入。
+    /// 期权不受本集合限制：全部期权市价单一律转对手价限价。
     pub market_limit_exchanges: Vec<String>,
     /// 哪些交易所需要显式拆平今/平昨（复用 SHFE 平仓路由逻辑）。
     /// 默认 `["SHFE"]`；CFFEX 不需要；INE 真机验证后可加入。

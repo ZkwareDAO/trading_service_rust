@@ -1,11 +1,12 @@
-//! 进程级「合约静态信息」目录：`合约 → {交易所, 乘数, 最小变动价位}`。
+//! 进程级「合约静态信息」目录：`合约 → {交易所, 产品类型, 乘数, 最小变动价位}`。
 //!
 //! 登录后 `ReqQryInstrument` 全量预热（与持仓/委托查询不同：合约规格是**全局一致**
 //! 的静态数据，不随账户变化），故由 [`crate::ctp::provider::CtpProvider`] 持有**一份
 //! 进程级共享实例**注入各账户会话，避免多账户重复预热。用途：
+//! * 区分期货/期权（`product_class`），决定成本与市价单口径；
 //! * 持仓成本折算单价（乘数）；
 //! * SHFE 平今/平昨路由前判定合约所属交易所（交易所代码）；
-//! * SHFE 市价单转穿价限价时按最小变动价位取整（price_tick）。
+//! * 市价单转穿价限价时按最小变动价位取整（price_tick）。
 //!
 //! 生命周期：进程内存（DashMap），重连可重新预热；不挂在持久 Position 上，
 //! 每账户的今/昨路由明细仍由各自私有的 `PositionDir` 保存。
@@ -13,6 +14,11 @@
 use dashmap::DashMap;
 
 use crate::ctp::core::event::InstrumentInfo;
+
+/// CTP 产品类型：期货（ThostFtdcUserApiDataType.h 的 `THOST_FTDC_PC_Future`，ASCII '1'）。
+pub const PRODUCT_FUTURES: u8 = b'1';
+/// CTP 产品类型：期权（`THOST_FTDC_PC_Options`，ASCII '2'）。
+pub const PRODUCT_OPTIONS: u8 = b'2';
 
 /// 合约静态信息目录（线程安全）。
 #[derive(Default)]
@@ -49,6 +55,18 @@ impl InstrumentDir {
             .map(|e| e.value().exchange_id.clone())
     }
 
+    /// 产品类型（'1'期货/'2'期权；未预热返回 None）。
+    pub fn product_class(&self, instrument: &str) -> Option<u8> {
+        self.by_instrument
+            .get(instrument.trim())
+            .map(|e| e.value().product_class)
+    }
+
+    /// 是否为期权（未预热返回 false；此时乘数通常也未就绪，持仓聚合会整桶跳过）。
+    pub fn is_option(&self, instrument: &str) -> bool {
+        self.product_class(instrument) == Some(PRODUCT_OPTIONS)
+    }
+
     /// 合约乘数（未预热/非正返回 0，调用方据此判乘数未就绪）。
     pub fn multiple(&self, instrument: &str) -> i32 {
         self.by_instrument
@@ -68,8 +86,11 @@ impl InstrumentDir {
             })
     }
 
-    /// 列出属于给定产品代码集合且当前 `is_trading` 的合约（有序、去重）。
+    /// 列出属于给定产品代码集合且当前 `is_trading` 的**期货**合约（有序、去重）。
     /// 供品种（如 cu）展开为该品种全部在交易合约（K线订阅）。
+    ///
+    /// 显式按 `product_class='1'` 过滤：期权即便 product_id 与期货相同也不展开
+    /// （K 线订阅只收期货）。
     pub fn trading_instruments_for(
         &self,
         products: &std::collections::HashSet<String>,
@@ -77,7 +98,11 @@ impl InstrumentDir {
         let mut out: Vec<String> = self
             .by_instrument
             .iter()
-            .filter(|e| e.value().is_trading && products.contains(e.value().product_id.as_str()))
+            .filter(|e| {
+                e.value().is_trading
+                    && e.value().product_class == PRODUCT_FUTURES
+                    && products.contains(e.value().product_id.as_str())
+            })
             .map(|e| e.key().clone())
             .collect();
         out.sort();
@@ -99,8 +124,10 @@ impl InstrumentDir {
     ///  5 volume_multiple, 6 price_tick, 11 long_margin_ratio,
     ///  12 short_margin_ratio, 13 is_trading`。
     ///
-    /// 过滤口径：**仅收 product_class=1（期货）且 is_trading=1**；期权(2)/
-    /// 组合(3,5,6,7) 与摘牌合约一律不入内存表（K线品种展开只需在交易期货）。
+    /// 过滤口径：**收 product_class=1（期货）或 2（期权）且 is_trading=1**；
+    /// 组合(3,5,6,7) 与摘牌合约不入内存表。期权入表是期权成本（OpenCost）折算
+    /// 与市价单转限价的前置；K 线品种展开由 [`Self::trading_instruments_for`]
+    /// 再按期货过滤。
     /// 表头（含可能的 UTF-8 BOM）与缺列/坏行跳过，不致命；返回实际入表条数。
     pub fn load_from_csv(&self, reader: impl std::io::Read) -> std::io::Result<usize> {
         use std::io::{BufRead, BufReader};
@@ -119,7 +146,7 @@ impl InstrumentDir {
         Ok(loaded)
     }
 
-    /// 以最新快照**整体重灌**：先剔除新集合中已不存在（摘牌/不再是在交易期货）
+    /// 以最新快照**整体重灌**：先剔除新集合中已不存在（摘牌/不再可交易）
     /// 的旧合约，再逐条 upsert（[`Self::remember`] 负责 trim/规范化/后到覆盖），
     /// 返回新集合写入条数。
     ///
@@ -156,8 +183,8 @@ impl InstrumentDir {
 }
 
 /// 解析 instruments.csv 的一行（固定列序，见 [`InstrumentDir::load_from_csv`]）。
-/// 仅当 product_class=1（期货）且 is_trading=1 时返回 [`InstrumentInfo`]；
-/// 期权/组合/摘牌/缺列/数值非法返回 None（跳过）。
+/// 仅当 product_class 为 1（期货）或 2（期权）且 is_trading=1 时返回
+/// [`InstrumentInfo`]；组合/摘牌/缺列/数值非法返回 None（跳过）。
 fn parse_instrument_csv_row(line: &str) -> Option<InstrumentInfo> {
     let f: Vec<&str> = line.split(',').collect();
     // 至少需要到 is_trading（第 14 列，索引 13）。
@@ -168,10 +195,12 @@ fn parse_instrument_csv_row(line: &str) -> Option<InstrumentInfo> {
     if instrument.is_empty() {
         return None;
     }
-    // product_class=1 期货；其余（2 期权、3 组合、5/6/7 等）不收。
-    if f[4].trim() != "1" {
-        return None;
-    }
+    // product_class=1 期货、2 期权；其余（3 组合、5/6/7 等）不收。
+    let product_class = match f[4].trim() {
+        "1" => PRODUCT_FUTURES,
+        "2" => PRODUCT_OPTIONS,
+        _ => return None,
+    };
     // is_trading=1 才在交易。
     if f[13].trim() != "1" {
         return None;
@@ -188,6 +217,7 @@ fn parse_instrument_csv_row(line: &str) -> Option<InstrumentInfo> {
         instrument: instrument.to_string(),
         exchange_id: f[1].trim().to_string(),
         product_id: f[2].trim().to_string(),
+        product_class,
         is_trading: true,
         volume_multiple: parse_i32(f[5]),
         price_tick: parse_f64(f[6]),
@@ -207,6 +237,7 @@ mod tests {
             instrument: instrument.into(),
             exchange_id: exchange.into(),
             product_id: "rb".into(),
+            product_class: PRODUCT_FUTURES,
             is_trading: true,
             volume_multiple: multiple,
             price_tick: tick,
@@ -274,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn load_from_csv_ingests_only_futures_and_maps_fields() {
+    fn load_from_csv_ingests_trading_futures_and_options_and_maps_fields() {
         // 列序与 data/ctp-specs/instruments.csv 一致（BOM 仅在表头首列，按列索引取）。
         let csv = "\u{feff}instrument_id,exchange_id,product_id,instrument_name,product_class,volume_multiple,price_tick,min_limit_volume,max_limit_volume,min_market_volume,max_market_volume,long_margin_ratio,short_margin_ratio,is_trading,open_date,expire_date\n\
 cu2611,SHFE,cu,cu2611,1,5,10,1,500,1,60,0.1,0.1,1,20251118,20261116\n\
@@ -283,33 +314,80 @@ cu2612C146000,SHFE,cu_o,cu2612C146000,2,5,2,1,100,1,30,0.2,0.2,1,20260402,202611
 zz9999,XXXX,zz,zz9999,3,1,1,1,10,1,10,0,0,1,20260101,20261231\n";
         let dir = InstrumentDir::new();
         let n = dir.load_from_csv(csv.as_bytes()).expect("parse ok");
-        // 仅 product_class=1 期货（2 条）；期权(2)/组合(3) 剔除。
-        assert_eq!(n, 2);
-        assert_eq!(dir.len(), 2);
+        // 收在交易期货与在交易期权（2 + 1）；组合(3) 剔除。
+        assert_eq!(n, 3);
+        assert_eq!(dir.len(), 3);
         let cu2611 = dir.get("cu2611").expect("cu2611 loaded");
         assert_eq!(cu2611.exchange_id, "SHFE");
         assert_eq!(cu2611.product_id, "cu");
+        assert_eq!(cu2611.product_class, PRODUCT_FUTURES);
         assert!(cu2611.is_trading);
         assert_eq!(cu2611.volume_multiple, 5);
         assert_eq!(cu2611.price_tick as i64, 10);
         assert_eq!(cu2611.max_limit_volume, 500);
         assert_eq!(cu2611.max_market_volume, 60);
         assert!((cu2611.long_margin_ratio - 0.1).abs() < 1e-12);
-        assert!(dir.get("cu2612C146000").is_none(), "期权不入内存表");
-        assert!(dir.get("zz9999").is_none(), "非期货不入内存表");
+        // 期权与期货同表：保留 product_class 供成本/市价分支判定。
+        let option = dir.get("cu2612C146000").expect("期权应入内存表");
+        assert_eq!(option.product_class, PRODUCT_OPTIONS);
+        assert_eq!(option.volume_multiple, 5);
+        assert_eq!(option.price_tick as i64, 2);
+        assert!(dir.get("zz9999").is_none(), "组合(3) 不入内存表");
+    }
+
+    #[test]
+    fn product_class_accessors_distinguish_futures_option_and_unknown() {
+        let dir = InstrumentDir::new();
+        dir.remember(info("cu2611", "SHFE", 5, 10.0));
+        dir.remember(InstrumentInfo {
+            product_class: PRODUCT_OPTIONS,
+            ..info("cu2612C146000", "SHFE", 5, 2.0)
+        });
+
+        assert_eq!(dir.product_class("cu2611"), Some(PRODUCT_FUTURES));
+        assert_eq!(dir.product_class("cu2612C146000"), Some(PRODUCT_OPTIONS));
+        assert_eq!(dir.product_class("unknown"), None);
+        assert!(!dir.is_option("cu2611"));
+        assert!(dir.is_option("cu2612C146000"));
+        assert!(!dir.is_option("unknown"), "未预热不能判定为期权");
+    }
+
+    #[test]
+    fn replace_all_keeps_trading_options() {
+        // 规格刷新重灌：期权必须与期货一同保留，不能被 retain 剔除。
+        let dir = InstrumentDir::new();
+        dir.remember(info("cu2511", "SHFE", 5, 10.0));
+        let loaded = dir.replace_all([
+            info("cu2611", "SHFE", 5, 10.0),
+            InstrumentInfo {
+                product_class: PRODUCT_OPTIONS,
+                ..info("cu2612C146000", "SHFE", 5, 2.0)
+            },
+        ]);
+
+        assert_eq!(loaded, 2);
+        assert!(dir.get("cu2511").is_none(), "消失合约被剔除");
+        assert_eq!(
+            dir.get("cu2612C146000").map(|i| i.product_class),
+            Some(PRODUCT_OPTIONS),
+            "刷新后期权仍在目录"
+        );
+        assert_eq!(dir.multiple("cu2612C146000"), 5, "期权乘数可查");
     }
 
     #[test]
     fn load_from_csv_skips_non_trading_and_bad_rows() {
-        // is_trading=0 的摘牌期货不收；缺列/坏行跳过不致命。
+        // is_trading=0 的摘牌期货/期权不收；缺列/坏行跳过不致命。
         let csv = "instrument_id,exchange_id,product_id,instrument_name,product_class,volume_multiple,price_tick,min_limit_volume,max_limit_volume,min_market_volume,max_market_volume,long_margin_ratio,short_margin_ratio,is_trading,open_date,expire_date\n\
 rb2610,SHFE,rb,rb2610,1,10,1,1,500,1,60,0.1,0.1,0,20251018,20261016\n\
 ag2612,SHFE,ag,ag2612,1,15,1,1,500,1,60,0.1,0.1,1,20251216,20261215\n\
+ag2612C9000,SHFE,ag_o,ag2612C9000,2,15,1,1,100,1,30,0.1,0.1,0,20251216,20261215\n\
 broken,row\n";
         let dir = InstrumentDir::new();
         let n = dir.load_from_csv(csv.as_bytes()).expect("parse ok");
         assert_eq!(n, 1, "只收在交易期货 ag2612");
         assert!(dir.get("rb2610").is_none());
+        assert!(dir.get("ag2612C9000").is_none(), "摘牌期权不收");
         assert!(dir.get("ag2612").is_some());
     }
 
@@ -344,12 +422,14 @@ broken,row\n";
     }
 
     #[test]
-    fn load_from_csv_trading_instruments_filters_product() {
-        // 品种展开只得到该 product_id 的在交易期货合约（排除期权 product_id）。
+    fn load_from_csv_trading_instruments_filters_product_and_product_class() {
+        // 品种展开只得到该 product_id 的在交易期货合约：即便期权 product_id
+        // 与期货相同（cu），也必须按 product_class 排除。
         let csv = "\u{feff}instrument_id,exchange_id,product_id,instrument_name,product_class,volume_multiple,price_tick,min_limit_volume,max_limit_volume,min_market_volume,max_market_volume,long_margin_ratio,short_margin_ratio,is_trading,open_date,expire_date\n\
 cu2611,SHFE,cu,cu2611,1,5,10,1,500,1,60,0.1,0.1,1,20251118,20261116\n\
 cu2612,SHFE,cu,cu2612,1,5,10,1,500,1,60,0.1,0.1,1,20251216,20261215\n\
-cu2612C146000,SHFE,cu_o,cu2612C146000,2,5,2,1,100,1,30,0.2,0.2,1,20260402,20261124\n";
+cu2612C146000,SHFE,cu_o,cu2612C146000,2,5,2,1,100,1,30,0.2,0.2,1,20260402,20261124\n\
+cu2613C150000,SHFE,cu,cu2613C150000,2,5,2,1,100,1,30,0.2,0.2,1,20260402,20261124\n";
         let dir = InstrumentDir::new();
         dir.load_from_csv(csv.as_bytes()).unwrap();
         let got = dir.trading_instruments_for(&std::collections::HashSet::from(["cu".to_string()]));

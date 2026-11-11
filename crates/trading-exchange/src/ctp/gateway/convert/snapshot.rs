@@ -75,6 +75,8 @@ pub fn position_snapshot(position: &CThostFtdcInvestorPositionField) -> Position
         yd_position: position.YdPosition,
         today_position: position.TodayPosition,
         position_cost: position.PositionCost,
+        // 最初开仓成本：期权成本基准（PositionCost 是逐日盯市口径，期权不适用）。
+        open_cost: position.OpenCost,
         use_margin: position.UseMargin,
         position_profit: position.PositionProfit,
     }
@@ -82,10 +84,12 @@ pub fn position_snapshot(position: &CThostFtdcInvestorPositionField) -> Position
 
 #[cfg(test)]
 mod tests {
-    use super::{order_snapshot, trade_snapshot, trading_account_snapshot};
+    use super::{order_snapshot, position_snapshot, trade_snapshot, trading_account_snapshot};
     use crate::ctp::core::encoding::encode_fixed;
     use crate::ctp::core::types::{Direction, Offset, OrderStatus};
-    use ctp2rs::v1alpha1::{CThostFtdcOrderField, CThostFtdcTradeField};
+    use ctp2rs::v1alpha1::{
+        CThostFtdcInvestorPositionField, CThostFtdcOrderField, CThostFtdcTradeField,
+    };
     use std::os::raw::c_char;
 
     #[test]
@@ -183,6 +187,26 @@ mod tests {
         encode_fixed(&mut t.TradeDate, "20261009");
         encode_fixed(&mut t.TradeTime, "10:30:00");
         t
+    }
+
+    #[test]
+    fn maps_position_cost_and_open_cost_separately() {
+        // 期权昨仓：PositionCost 是昨结算价口径（120），OpenCost 是最初开仓成本（130）。
+        // 两者都必须原样拷贝，成本口径由映射层按产品类型选择。
+        let mut p = CThostFtdcInvestorPositionField::default();
+        encode_fixed(&mut p.InstrumentID, "cu2612C146000");
+        p.PosiDirection = '2' as c_char;
+        p.Position = 2;
+        p.YdPosition = 2;
+        p.PositionCost = 120.0;
+        p.OpenCost = 130.0;
+        p.UseMargin = 0.0;
+
+        let s = position_snapshot(&p);
+
+        assert_eq!(s.instrument, "cu2612C146000");
+        assert_eq!(s.position_cost, 120.0);
+        assert_eq!(s.open_cost, 130.0, "期权成本基准取最初开仓成本");
     }
 
     #[test]

@@ -179,6 +179,8 @@ impl TraderSpi for EventTraderSpi {
                 instrument: decode_fixed(&i.InstrumentID),
                 exchange_id: decode_fixed(&i.ExchangeID),
                 product_id: decode_fixed(&i.ProductID),
+                // 产品类型（'1' 期货/'2' 期权）：期权成本与市价单分支依据。
+                product_class: i.ProductClass as u8,
                 is_trading: i.IsTrading != 0,
                 volume_multiple: i.VolumeMultiple,
                 // 最小变动价位（SHFE 市价转穿价限价取整用）；柜台缺省 0.0 时预检判未就绪。

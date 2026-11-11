@@ -327,6 +327,7 @@ impl ExchangeApi for CtpApi {
 mod tests {
     use super::*;
     use crate::api::OrderPositionSide;
+    use crate::ctp::instrument_dir::PRODUCT_FUTURES;
     use rust_decimal::Decimal;
     use trading_models::{InstrumentType, OrderType, Side, TimeInForce};
     fn place_req() -> PlaceOrderRequest {
@@ -379,6 +380,7 @@ mod tests {
             instrument: "rb2510".into(),
             exchange_id: "SHFE".into(),
             product_id: "rb".into(),
+            product_class: PRODUCT_FUTURES,
             is_trading: true,
             volume_multiple: 10,
             price_tick: 1.0,
@@ -484,6 +486,7 @@ mod tests {
             instrument: "rb2510".into(),
             exchange_id: "DCE".into(),
             product_id: "i".into(),
+            product_class: PRODUCT_FUTURES,
             is_trading: true,
             volume_multiple: 100,
             price_tick: 0.5,
@@ -539,6 +542,7 @@ mod tests {
             instrument: "rb2510".into(),
             exchange_id: "DCE".into(),
             product_id: "rb".into(),
+            product_class: PRODUCT_FUTURES,
             is_trading: true,
             volume_multiple: 10,
             price_tick: 1.0,

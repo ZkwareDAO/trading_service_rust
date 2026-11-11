@@ -168,8 +168,13 @@ pub struct PositionSnapshot {
     pub yd_position: i32,
     /// 今仓（手）。
     pub today_position: i32,
-    /// 持仓成本。
+    /// 持仓成本（CTP `PositionCost`，逐日盯市口径：昨仓按昨结算价重算）。
     pub position_cost: f64,
+    /// 当前持仓的最初开仓成本（CTP `OpenCost`：Σ 最初开仓价 × 乘数 × 手数）。
+    ///
+    /// 期权不参与逐日盯市，成本基准必须用本字段；期货仍用 `position_cost`。
+    /// 0/负/NaN 视为缺失，映射层按行回退 `position_cost`。
+    pub open_cost: f64,
     /// 占用保证金。
     pub use_margin: f64,
     /// 持仓盈亏。
@@ -185,6 +190,11 @@ pub struct InstrumentInfo {
     pub exchange_id: String,
     /// 产品代码。
     pub product_id: String,
+    /// 产品类型（CTP `ProductClass`：'1'=期货、'2'=期权）。
+    ///
+    /// 依旧归属 `exchange="ctp"`、`instrument_type=futures` 的“场内合约”类别；
+    /// 期权与期货的成本/保证金/市价单差异只在本字段上做内部语义分支，不新开类型。
+    pub product_class: u8,
     /// 是否交易中。
     pub is_trading: bool,
     /// 合约乘数（每手对应的标的数量；持仓成本折算单价必需）。

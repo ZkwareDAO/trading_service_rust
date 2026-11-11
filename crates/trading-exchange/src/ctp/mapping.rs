@@ -200,6 +200,74 @@ pub fn merge_position_snapshots(
     long_margin_ratio: f64,
     short_margin_ratio: f64,
 ) -> Option<MergedPosition> {
+    merge_position_group(
+        group,
+        volume_multiple,
+        // 期货：逐日盯市成本 Σ PositionCost。
+        |valid| valid.iter().map(|p| p.position_cost).sum(),
+        // 期货：柜台正数分片 + 缺失分片按成本×方向比率补齐（防重复记账）。
+        |valid| {
+            Some(effective_total_margin(
+                valid,
+                long_margin_ratio,
+                short_margin_ratio,
+            ))
+        },
+    )
+}
+
+/// 期权持仓聚合：与期货共用同一条聚合实现，仅成本/保证金口径不同。
+///
+/// * 成本：逐行取 `OpenCost`（有限且 > 0），缺失/非法行回退 `PositionCost`；
+///   仍“先求和再除”：`entry = Σ成本 / (总手数 × 乘数)`。期权不参与逐日盯市，
+///   用 `PositionCost` 会把昨仓成本覆盖成昨结算价，导致 ROI 失真。
+/// * 保证金：只取各行正 `UseMargin` 之和，**不做**“成本 × 方向保证金率”估算；
+///   结果 <= 0 时输出 `None`，由仓位引擎按 OpenCost（买方权利金成本）兜底。
+///
+/// 其余（乘数校验、空壳行过滤、今/昨明细、量纲）与 [`merge_position_snapshots`] 一致。
+pub fn merge_option_position_snapshots(
+    group: &[PositionSnapshot],
+    volume_multiple: i32,
+) -> Option<MergedPosition> {
+    merge_position_group(
+        group,
+        volume_multiple,
+        |valid| valid.iter().map(|p| option_cost_basis(p)).sum(),
+        option_total_margin,
+    )
+}
+
+/// 期权单行成本基准：最初开仓成本有效则用之，否则回退逐日盯市成本。
+fn option_cost_basis(p: &PositionSnapshot) -> f64 {
+    if p.open_cost.is_finite() && p.open_cost > 0.0 {
+        p.open_cost
+    } else {
+        p.position_cost
+    }
+}
+
+/// 期权占用保证金：只取各行正 `UseMargin` 之和；无有效值时返回 `None`
+/// （交引擎兜底，绝不用结算成本×比率臆造买方保证金）。
+fn option_total_margin(rows: &[&PositionSnapshot]) -> Option<f64> {
+    let total: f64 = rows
+        .iter()
+        .map(|p| p.use_margin)
+        .filter(|m| m.is_finite() && *m > 0.0)
+        .sum();
+    (total > 0.0).then_some(total)
+}
+
+/// 持仓分片聚合的共用实现：成本与保证金口径由调用方以闭包注入。
+///
+/// 乘数缺失/非法、过滤后无有效行、或总手数 <= 0 时返回 `None`（宁漏一批，
+/// 待下轮对账补齐）。`total_margin_of` 返回 `None` 表示该口径下保证金不可用，
+/// 输出的 `PositionInfo.margin` 随之为 `None`（由上层按成本兜底）。
+fn merge_position_group(
+    group: &[PositionSnapshot],
+    volume_multiple: i32,
+    total_cost_of: impl FnOnce(&[&PositionSnapshot]) -> f64,
+    total_margin_of: impl FnOnce(&[&PositionSnapshot]) -> Option<f64>,
+) -> Option<MergedPosition> {
     // 乘数缺失/非法：整组不产出（避免退化为"每手成本"污染单价口径）。
     if volume_multiple <= 0 {
         return None;
@@ -219,9 +287,8 @@ pub fn merge_position_snapshots(
     if total <= 0 {
         return None;
     }
-    let total_cost: f64 = valid.iter().map(|p| p.position_cost).sum();
-    // 占用保证金：柜台正数分片 + 缺失分片按成本×方向比率补齐（见纯函数，防重复记账）。
-    let total_margin: f64 = effective_total_margin(&valid, long_margin_ratio, short_margin_ratio);
+    let total_cost = total_cost_of(&valid);
+    let total_margin = total_margin_of(&valid);
     let today = saturating_sum(|p| p.today_position.max(0));
     let yesterday = saturating_sum(|p| p.yd_position.max(0));
     let signed = match head.direction {
@@ -245,7 +312,7 @@ pub fn merge_position_snapshots(
             leverage: None,
             multiplier: Some(Decimal::from(volume_multiple)),
             notional: None,
-            margin: Decimal::try_from(total_margin).ok(),
+            margin: total_margin.and_then(|m| Decimal::try_from(m).ok()),
             update_ms: None,
         },
         today,
@@ -616,6 +683,7 @@ mod tests {
             yd_position: 1,
             today_position: 2,
             position_cost: 96_150.0,
+            open_cost: 96_150.0,
             use_margin: 32_050.0,
             position_profit: 55.0,
         }
@@ -685,6 +753,7 @@ mod tests {
             yd_position: yd,
             today_position: today,
             position_cost: cost,
+            open_cost: cost,
             use_margin: margin,
             position_profit: 0.0,
         }
@@ -881,6 +950,7 @@ mod tests {
             yd_position: 1,
             today_position: 0,
             position_cost: cost,
+            open_cost: cost,
             use_margin,
             position_profit: 0.0,
         }
@@ -1000,6 +1070,104 @@ mod tests {
             (got - expected).abs() < Decimal::new(1, 6),
             "2 手保证金应≈5527.2，got={got}"
         );
+    }
+
+    // ---- 期权成本口径：用 OpenCost（最初开仓成本）而非逐日盯市的 PositionCost ----
+
+    /// 期权持仓分片：`position_cost`（柜台逐日盯市成本）与 `open_cost`
+    /// （最初开仓成本）分别给出。
+    fn option_shard(
+        direction: char,
+        position: i32,
+        today: i32,
+        yd: i32,
+        position_cost: f64,
+        open_cost: f64,
+        use_margin: f64,
+    ) -> PositionSnapshot {
+        PositionSnapshot {
+            instrument: "cu2612C146000".into(),
+            direction,
+            position,
+            yd_position: yd,
+            today_position: today,
+            position_cost,
+            open_cost,
+            use_margin,
+            position_profit: 0.0,
+        }
+    }
+
+    #[test]
+    fn option_yesterday_cost_uses_open_cost_not_position_cost() {
+        // 昨仓期权 2 手、乘数 5：PositionCost=12×5×2=120（昨结算价），
+        // OpenCost=13×5×2=130（最初开仓价）→ entry 必须为 13 而非 12。
+        let group = vec![option_shard('2', 2, 0, 2, 120.0, 130.0, 0.0)];
+
+        let merged = merge_option_position_snapshots(&group, 5).expect("应聚合成功");
+
+        assert_eq!(merged.info.entry_price, Decimal::try_from(13.0).unwrap());
+    }
+
+    #[test]
+    fn option_today_yesterday_weighted_by_open_cost() {
+        // 今 1 手 @14（OpenCost=14×5×1=70）+ 昨 2 手 @13（130）→ 200/(3×5)=13.333…。
+        let group = vec![
+            option_shard('2', 1, 1, 0, 60.0, 70.0, 0.0),
+            option_shard('2', 2, 0, 2, 120.0, 130.0, 0.0),
+        ];
+
+        let merged = merge_option_position_snapshots(&group, 5).unwrap();
+
+        let expected = Decimal::from(200) / Decimal::from(15);
+        assert!(
+            (merged.info.entry_price - expected).abs() < Decimal::new(1, 6),
+            "entry={} 应≈{expected}",
+            merged.info.entry_price
+        );
+        assert_eq!((merged.today, merged.yesterday), (1, 2));
+    }
+
+    #[test]
+    fn option_invalid_open_cost_falls_back_to_position_cost_per_row() {
+        // OpenCost 为 0/负/NaN 视为缺失：按行回退 PositionCost。
+        for bad in [0.0_f64, -1.0, f64::NAN] {
+            let group = vec![option_shard('2', 2, 0, 2, 120.0, bad, 0.0)];
+            let merged = merge_option_position_snapshots(&group, 5).unwrap();
+            assert_eq!(
+                merged.info.entry_price,
+                Decimal::try_from(12.0).unwrap(),
+                "OpenCost={bad} 应回退 PositionCost"
+            );
+        }
+    }
+
+    #[test]
+    fn futures_ignore_open_cost_and_keep_position_cost() {
+        // 期货口径不变：即便柜台给了不同 OpenCost，仍用 PositionCost 折算。
+        let group = vec![PositionSnapshot {
+            open_cost: 130.0,
+            ..rb_shard('2', 2, 0, 2, 120.0, 0.0)
+        }];
+        let merged = merge_position_snapshots(&group, 5, 0.0, 0.0).unwrap();
+        assert_eq!(merged.info.entry_price, Decimal::try_from(12.0).unwrap());
+    }
+
+    #[test]
+    fn option_zero_use_margin_yields_none_margin_for_engine_fallback() {
+        // 买方 UseMargin=0：适配层不臆造“成本×比率”，交由引擎按 OpenCost 兜底。
+        let group = vec![option_shard('2', 2, 0, 2, 120.0, 130.0, 0.0)];
+        let merged = merge_option_position_snapshots(&group, 5).unwrap();
+        assert_eq!(merged.info.margin, None);
+    }
+
+    #[test]
+    fn option_positive_use_margin_uses_counter_value() {
+        // 卖方柜台给真实 UseMargin：原样采用。
+        let group = vec![option_shard('3', 2, 0, 2, 120.0, 130.0, 80.0)];
+        let merged = merge_option_position_snapshots(&group, 5).unwrap();
+        assert_eq!(merged.info.margin, Some(Decimal::try_from(80.0).unwrap()));
+        assert_eq!(merged.info.signed_quantity, -Decimal::from(2));
     }
 
     #[test]

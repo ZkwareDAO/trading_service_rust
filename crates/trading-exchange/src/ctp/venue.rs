@@ -1766,7 +1766,8 @@ fn release_terminal_cid(ctx: &EventContext, handle: &Arc<CtpUserHandle>, cid: &s
 }
 
 /// 持仓批次收尾（前台查仓/后台对账共用）：把柜台原始持仓行按 `(合约, 持仓方向)`
-/// 分桶，逐桶经 [`mapping::merge_position_snapshots`] 聚合成**一条**整合 PositionInfo，
+/// 分桶，逐桶按产品类型聚合（期货 [`mapping::merge_position_snapshots`]、
+/// 期权 [`mapping::merge_option_position_snapshots`]）成**一条**整合 PositionInfo，
 /// 同时把 (Σ今, Σ昨) 写会话内存 PositionDir（不落盘）。
 ///
 /// 乘数未预热的合约整桶跳过（宁漏一批，等下轮对账）；position=0 空壳行用于把
@@ -1775,7 +1776,8 @@ fn finalize_position_batch(
     ctx: &EventContext,
     rows: Vec<crate::ctp::core::event::PositionSnapshot>,
 ) -> Vec<crate::api::PositionInfo> {
-    use crate::ctp::mapping::merge_position_snapshots;
+    use crate::ctp::instrument_dir::PRODUCT_OPTIONS;
+    use crate::ctp::mapping::{merge_option_position_snapshots, merge_position_snapshots};
     use crate::ctp::position_dir::PositionSide;
 
     let (mut groups, order) = group_position_rows(rows);
@@ -1790,26 +1792,57 @@ fn finalize_position_batch(
             continue;
         };
         let mult = ctx.instrument_dir.multiple(&instrument);
-        // 合约多/空保证金率与乘数同源（InstrumentDir）；UseMargin=0 时供 merge 兜底估算。
+        // 产品类型决定成本/保证金口径：期权用 OpenCost、只取柜台正 UseMargin；
+        // 期货沿用逐日盯市 PositionCost + 成本×比率兜底。
+        let product_class = ctx.instrument_dir.product_class(&instrument);
+        let is_option = product_class == Some(PRODUCT_OPTIONS);
+        // 合约多/空保证金率与乘数同源（InstrumentDir）；仅期货的 merge 兜底使用。
         let (long_ratio, short_ratio) = ctx.instrument_dir.margin_ratios(&instrument);
         // 原始分片取证：柜台可能只在一行记保证金。下一轮对账据此判断是
         // “1 手有值 + 1 手 0”还是“单行 position=2 只给半额”，用于验证补齐口径。
+        // 每组只告警一次（避免今/昨多行重复刷屏）；逐行明细保留在 debug。
+        let missing_open_cost = is_option
+            && group
+                .iter()
+                .any(|r| !(r.open_cost.is_finite() && r.open_cost > 0.0));
+        if missing_open_cost {
+            tracing::warn!(
+                account = %ctx.account,
+                instrument = %instrument,
+                rows = group.len(),
+                "CTP 期权持仓存在 OpenCost 缺失/非法，缺失行按 PositionCost 回退"
+            );
+        }
         for row in &group {
+            let open_cost_valid = row.open_cost.is_finite() && row.open_cost > 0.0;
+            let cost_basis = if is_option && open_cost_valid {
+                "open_cost"
+            } else {
+                "position_cost"
+            };
             tracing::debug!(
                 account = %ctx.account,
                 instrument = %instrument,
                 direction = %dir_char,
+                product_class = ?product_class,
                 position = row.position,
                 today = row.today_position,
                 yd = row.yd_position,
                 position_cost = row.position_cost,
+                open_cost = row.open_cost,
+                cost_basis,
                 use_margin = row.use_margin,
                 long_margin_ratio = long_ratio,
                 short_margin_ratio = short_ratio,
                 "CTP 持仓原始分片"
             );
         }
-        match merge_position_snapshots(&group, mult, long_ratio, short_ratio) {
+        let merged = if is_option {
+            merge_option_position_snapshots(&group, mult)
+        } else {
+            merge_position_snapshots(&group, mult, long_ratio, short_ratio)
+        };
+        match merged {
             Some(merged) => {
                 // 快照是真相源：整批覆盖该 (合约,方向) 的今/昨。
                 ctx.position_dir
@@ -2096,6 +2129,7 @@ mod tests {
     use crate::ctp::core::account::CtpAccount;
     use crate::ctp::core::event::OrderSnapshot;
     use crate::ctp::core::types::{Direction, OrderStatus};
+    use crate::ctp::instrument_dir::{PRODUCT_FUTURES, PRODUCT_OPTIONS};
     use crate::ctp::order_ref::OrderRefRegistry;
 
     fn account() -> CtpAccount {
@@ -3283,6 +3317,7 @@ mod tests {
                 instrument: "rb2510".into(),
                 exchange_id: "SHFE".into(),
                 product_id: "rb".into(),
+                product_class: PRODUCT_FUTURES,
                 is_trading: true,
                 volume_multiple: 10,
                 price_tick: 1.0,
@@ -4042,6 +4077,7 @@ mod tests {
             instrument: "rb2510".into(),
             exchange_id: "CFFEX".into(),
             product_id: "rb".into(),
+            product_class: PRODUCT_FUTURES,
             is_trading: true,
             volume_multiple: 10,
             price_tick: 1.0,
@@ -4206,6 +4242,7 @@ mod tests {
             yd_position: 1,
             today_position: 2,
             position_cost: 96_150.0,
+            open_cost: 96_150.0,
             use_margin: 32_050.0,
             position_profit: 55.0,
         }
@@ -4217,6 +4254,7 @@ mod tests {
             instrument: "rb2510".into(),
             exchange_id: "SHFE".into(),
             product_id: "rb".into(),
+            product_class: PRODUCT_FUTURES,
             is_trading: true,
             volume_multiple: 10,
             price_tick: 1.0,
@@ -4526,6 +4564,7 @@ mod tests {
                 instrument: "rb2510".into(),
                 exchange_id: "SHFE".into(),
                 product_id: "rb".into(),
+                product_class: PRODUCT_FUTURES,
                 is_trading: true,
                 volume_multiple: 10,
                 price_tick: 1.0,
@@ -4608,6 +4647,7 @@ mod tests {
             yd_position: yd,
             today_position: today,
             position_cost: cost,
+            open_cost: cost,
             use_margin: margin,
             position_profit: 0.0,
         }
@@ -4672,6 +4712,7 @@ mod tests {
             instrument: "rb2510".into(),
             exchange_id: "SHFE".into(),
             product_id: "rb".into(),
+            product_class: PRODUCT_FUTURES,
             is_trading: true,
             volume_multiple: 10,
             price_tick: 1.0,
@@ -4708,6 +4749,104 @@ mod tests {
                 );
             }
             other => panic!("expected merged positions, got {other:?}"),
+        }
+    }
+
+    /// 给共享合约目录预热一条期权（乘数 5、tick 2、买方保证金率 0.2）。
+    fn warm_option(ctx: &EventContext) {
+        ctx.instrument_dir.remember(InstrumentInfo {
+            instrument: "cu2612C146000".into(),
+            exchange_id: "SHFE".into(),
+            product_id: "cu_o".into(),
+            product_class: PRODUCT_OPTIONS,
+            is_trading: true,
+            volume_multiple: 5,
+            price_tick: 2.0,
+            max_limit_volume: 0,
+            max_market_volume: 0,
+            long_margin_ratio: 0.2,
+            short_margin_ratio: 0.2,
+        });
+    }
+
+    /// 构造一条期权多头分片（昨仓 2 手；PositionCost 为昨结算口径、OpenCost 为开仓口径）。
+    fn option_row(
+        position: i32,
+        yd: i32,
+        position_cost: f64,
+        open_cost: f64,
+        margin: f64,
+    ) -> PositionSnapshot {
+        PositionSnapshot {
+            instrument: "cu2612C146000".into(),
+            direction: '2',
+            position,
+            yd_position: yd,
+            today_position: 0,
+            position_cost,
+            open_cost,
+            use_margin: margin,
+            position_profit: 0.0,
+        }
+    }
+
+    #[test]
+    fn back_positions_option_buyer_uses_open_cost_and_no_margin() {
+        // 买方 UseMargin=0：entry 取 OpenCost（13），margin 留空交引擎按成本兜底；
+        // 即便合约目录给非 0 保证金率也绝不用于期权买方估算。
+        let (ctx, mut bridge_rx) = ctx_and_rx();
+        let h = handle();
+        let mut active = Some(ActiveQuery::BackPositions { rows: Vec::new() });
+        warm_option(&ctx);
+        dispatch_event(
+            CtpEvent::Position(option_row(2, 2, 120.0, 130.0, 0.0)),
+            &h,
+            &ctx,
+            &mut active,
+        );
+
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+
+        match bridge_rx.try_recv() {
+            Ok(BridgeEvent::Positions(ps)) => {
+                assert_eq!(
+                    ps[0].entry_price,
+                    rust_decimal::Decimal::try_from(13.0).unwrap()
+                );
+                assert_eq!(ps[0].margin, None, "买方不得用结算成本×比率臆造保证金");
+            }
+            other => panic!("expected merged option position, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn back_positions_option_seller_keeps_counter_margin() {
+        // 卖方柜台给真实 UseMargin=80：原样采用，成本仍按 OpenCost 折算。
+        let (ctx, mut bridge_rx) = ctx_and_rx();
+        let h = handle();
+        let mut active = Some(ActiveQuery::BackPositions { rows: Vec::new() });
+        warm_option(&ctx);
+        dispatch_event(
+            CtpEvent::Position(option_row(2, 2, 120.0, 130.0, 80.0)),
+            &h,
+            &ctx,
+            &mut active,
+        );
+
+        dispatch_event(CtpEvent::QueryEnd, &h, &ctx, &mut active);
+
+        match bridge_rx.try_recv() {
+            Ok(BridgeEvent::Positions(ps)) => {
+                assert_eq!(
+                    ps[0].entry_price,
+                    rust_decimal::Decimal::try_from(13.0).unwrap()
+                );
+                assert_eq!(
+                    ps[0].margin,
+                    Some(rust_decimal::Decimal::try_from(80.0).unwrap())
+                );
+            }
+            other => panic!("expected merged option position, got {other:?}"),
         }
     }
 

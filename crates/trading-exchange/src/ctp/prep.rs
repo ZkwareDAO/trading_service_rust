@@ -15,6 +15,7 @@ use rust_decimal::Decimal;
 use crate::api::{PlaceDefer, PlaceErrorKind, PlaceOrderRequest};
 use crate::ctp::core::order::OrderRequest;
 use crate::ctp::core::types::{Offset, PriceType, TimeCondition};
+use crate::ctp::instrument_dir::PRODUCT_OPTIONS;
 use crate::ctp::mapping::{direction_from_side, price_to_f64, volume_to_i32};
 use trading_models::{OrderType, Side};
 
@@ -69,7 +70,8 @@ fn snap_to_tick(price: Decimal, tick: Decimal, side: Side) -> Decimal {
     snapped_units * tick
 }
 
-/// SHFE 市价单 → 穿价限价（GFD）纯转换：仅处理**调用方已判定为 SHFE** 的请求。
+/// 市价单 → 穿价限价（GFD）纯转换：仅处理**调用方已判定需要转限价**的请求
+/// （SHFE 期货，或任意交易所的期权）。
 ///
 /// * 限价单（开/平）原样返回，不读盘口/tick；
 /// * 按委托方向只取**对手侧**（开平一致）：`Buy` 吃卖一 → `ask`，
@@ -84,7 +86,7 @@ fn snap_to_tick(price: Decimal, tick: Decimal, side: Side) -> Decimal {
 ///
 /// 转换结果仅改 `order_type=Limit` 与 `price`，数量/方向/reduce_only 不变；
 /// 有效期沿用限价分支的 GFD（build_open_or_close 产出 LimitPrice+GFD）。
-pub fn prepare_shfe_market_limit(
+pub fn prepare_market_to_limit(
     mut req: PlaceOrderRequest,
     book: Option<MarketRef>,
     tick: Decimal,
@@ -261,7 +263,7 @@ pub fn build_open_or_close(
     })
 }
 
-/// 从共享行情表读 CTP 期货某合约的 best bid/ask。
+/// 从共享行情表读 CTP 某合约（期货/期权）的 best bid/ask。
 ///
 /// 单边盘口是合法状态：涨停可能只有买一、跌停可能只有卖一，因此返回
 /// [`MarketRef`] 的可选两侧，由调用方按委托方向只校验所需侧。零/负价视为缺侧；
@@ -288,8 +290,9 @@ pub(crate) fn read_ctp_book(
 /// * **不在 `market_limit_exchanges` 内**（DCE/CZCE 等）：走原生 `AnyPrice+IOC`，
 ///   但先按委托方向预检对手盘（`Buy` 需 ask、`Sell` 需 bid）；缺失 →
 ///   `DataNotReady`，规则保活下轮重试，避免柜台无对手盘立即全撤、0 成交被收敛为终态；
-/// * **在 `market_limit_exchanges` 内**（默认 SHFE；CFFEX 不支持 AnyPrice 需加入）：
-///   读盘口 + 最小变动价位，交 [`prepare_shfe_market_limit`] 转穿价限价 GFD。
+/// * **期权（`product_class='2'`）或交易所位于 `market_limit_exchanges` 内**
+///   （默认 SHFE；CFFEX 不支持 AnyPrice 需加入）：读盘口 + 最小变动价位，
+///   交 [`prepare_market_to_limit`] 转穿价限价 GFD。期权不受交易所集合限制。
 pub(crate) fn prepare_ctp_market(
     dir: &crate::ctp::instrument_dir::InstrumentDir,
     quotes: &trading_core::quote::QuoteTable,
@@ -304,8 +307,10 @@ pub(crate) fn prepare_ctp_market(
         return Err(PlaceDefer::DataNotReady);
     };
     let book = read_ctp_book(quotes, &request.instrument);
-    let should_limit =
-        crate::ctp::config::exchange_in_set(&info.exchange_id, market_limit_exchanges);
+    // 期权无论所属交易所一律转对手价限价（不依赖 market_limit_exchanges）；
+    // 期货维持现有交易所集合语义。
+    let should_limit = info.product_class == PRODUCT_OPTIONS
+        || crate::ctp::config::exchange_in_set(&info.exchange_id, market_limit_exchanges);
     if !should_limit {
         // 不转限价，只校验对手侧是否存在（开平一致：Buy 吃卖一、Sell 吃买一）。
         if book.and_then(|b| b.opposite(request.side)).is_none() {
@@ -314,7 +319,7 @@ pub(crate) fn prepare_ctp_market(
         return Ok(request);
     }
     let tick = Decimal::try_from(info.price_tick).unwrap_or(Decimal::ZERO);
-    prepare_shfe_market_limit(request, book, tick, drift_ticks)
+    prepare_market_to_limit(request, book, tick, drift_ticks)
 }
 
 #[cfg(test)]
@@ -323,7 +328,7 @@ mod tests {
     use crate::api::OrderPositionSide;
     use crate::ctp::core::event::InstrumentInfo;
     use crate::ctp::core::types::Direction;
-    use crate::ctp::instrument_dir::InstrumentDir;
+    use crate::ctp::instrument_dir::{InstrumentDir, PRODUCT_FUTURES, PRODUCT_OPTIONS};
     use trading_core::quote::{QuoteTable, QuoteUpdate};
     use trading_models::{
         Instrument, InstrumentType, MarketKind, OrderType, Side, TimeInForce, TopOfBook, Venue,
@@ -725,7 +730,7 @@ mod tests {
     fn shfe_market_buy_open_uses_ask_plus_drift_ceiled_to_tick() {
         // 买开：ask 3205 + 1 tick（tick=1）= 3206，向上取整不劣于穿价。
         let req = market_req(Side::Buy, false);
-        let out = prepare_shfe_market_limit(req, Some(both_sides()), d(1.0), 1).unwrap();
+        let out = prepare_market_to_limit(req, Some(both_sides()), d(1.0), 1).unwrap();
         assert_eq!(out.order_type, OrderType::Limit);
         assert_eq!(out.price, Some(d(3206.0)));
         assert_eq!(out.quantity, Decimal::from(2));
@@ -735,7 +740,7 @@ mod tests {
     fn shfe_market_sell_open_uses_bid_minus_drift_floored_to_tick() {
         // 卖开：bid 3204 − 2 tick（tick=0.5）= 3203，向下取整。
         let req = market_req(Side::Sell, false);
-        let out = prepare_shfe_market_limit(req, Some(both_sides()), d(0.5), 2).unwrap();
+        let out = prepare_market_to_limit(req, Some(both_sides()), d(0.5), 2).unwrap();
         assert_eq!(out.price, Some(d(3203.0)));
     }
 
@@ -743,7 +748,7 @@ mod tests {
     fn shfe_market_close_long_uses_best_bid_no_drift() {
         // 平多 = sell+reduce_only：best bid，不漂移（漂移只作用于开仓）。
         let req = market_req(Side::Sell, true);
-        let out = prepare_shfe_market_limit(req, Some(both_sides()), d(1.0), 5).unwrap();
+        let out = prepare_market_to_limit(req, Some(both_sides()), d(1.0), 5).unwrap();
         assert_eq!(out.price, Some(d(3204.0)));
     }
 
@@ -751,7 +756,7 @@ mod tests {
     fn shfe_market_close_short_uses_best_ask_no_drift() {
         // 平空 = buy+reduce_only：best ask，不漂移。
         let req = market_req(Side::Buy, true);
-        let out = prepare_shfe_market_limit(req, Some(both_sides()), d(1.0), 5).unwrap();
+        let out = prepare_market_to_limit(req, Some(both_sides()), d(1.0), 5).unwrap();
         assert_eq!(out.price, Some(d(3205.0)));
     }
 
@@ -759,7 +764,7 @@ mod tests {
     fn shfe_market_price_snaps_to_tick_grid() {
         // ask=3205.3、tick=1、漂移 0：买单向上取整到 3206（保证穿价不被取整削弱）。
         let req = market_req(Side::Buy, false);
-        let out = prepare_shfe_market_limit(req, Some(book(Some(3204.7), Some(3205.3))), d(1.0), 0)
+        let out = prepare_market_to_limit(req, Some(book(Some(3204.7), Some(3205.3))), d(1.0), 0)
             .unwrap();
         assert_eq!(out.price, Some(d(3206.0)));
     }
@@ -768,8 +773,7 @@ mod tests {
     fn shfe_market_close_long_with_only_bid_converts_at_limit_up() {
         // 涨停平多：只有买一（涨停价），按买一限价卖出。
         let req = market_req(Side::Sell, true);
-        let out =
-            prepare_shfe_market_limit(req, Some(book(Some(3204.0), None)), d(1.0), 5).unwrap();
+        let out = prepare_market_to_limit(req, Some(book(Some(3204.0), None)), d(1.0), 5).unwrap();
         assert_eq!(out.order_type, OrderType::Limit);
         assert_eq!(out.price, Some(d(3204.0)));
     }
@@ -778,8 +782,7 @@ mod tests {
     fn shfe_market_close_short_with_only_ask_converts_at_limit_down() {
         // 跌停平空：只有卖一（跌停价），按卖一限价买入。
         let req = market_req(Side::Buy, true);
-        let out =
-            prepare_shfe_market_limit(req, Some(book(None, Some(3205.0))), d(1.0), 5).unwrap();
+        let out = prepare_market_to_limit(req, Some(book(None, Some(3205.0))), d(1.0), 5).unwrap();
         assert_eq!(out.order_type, OrderType::Limit);
         assert_eq!(out.price, Some(d(3205.0)));
     }
@@ -788,8 +791,7 @@ mod tests {
     fn shfe_market_sell_open_with_only_bid_converts() {
         // 涨停卖开：只有买一，仍可按买一−漂移转限价。
         let req = market_req(Side::Sell, false);
-        let out =
-            prepare_shfe_market_limit(req, Some(book(Some(3204.0), None)), d(1.0), 1).unwrap();
+        let out = prepare_market_to_limit(req, Some(book(Some(3204.0), None)), d(1.0), 1).unwrap();
         assert_eq!(out.order_type, OrderType::Limit);
         assert_eq!(out.price, Some(d(3203.0)));
     }
@@ -798,8 +800,7 @@ mod tests {
     fn shfe_market_buy_open_with_only_ask_converts() {
         // 跌停买开：只有卖一，仍可按卖一+漂移转限价。
         let req = market_req(Side::Buy, false);
-        let out =
-            prepare_shfe_market_limit(req, Some(book(None, Some(3205.0))), d(1.0), 1).unwrap();
+        let out = prepare_market_to_limit(req, Some(book(None, Some(3205.0))), d(1.0), 1).unwrap();
         assert_eq!(out.order_type, OrderType::Limit);
         assert_eq!(out.price, Some(d(3206.0)));
     }
@@ -809,7 +810,7 @@ mod tests {
         // 缺所需侧（平多需要 bid）：ask 存在也不能下单。
         let req = market_req(Side::Sell, true);
         assert_eq!(
-            prepare_shfe_market_limit(req, Some(book(None, Some(3205.0))), d(1.0), 1).unwrap_err(),
+            prepare_market_to_limit(req, Some(book(None, Some(3205.0))), d(1.0), 1).unwrap_err(),
             PlaceDefer::DataNotReady
         );
     }
@@ -818,7 +819,7 @@ mod tests {
     fn shfe_market_close_short_defers_without_ask_even_if_bid_present() {
         let req = market_req(Side::Buy, true);
         assert_eq!(
-            prepare_shfe_market_limit(req, Some(book(Some(3204.0), None)), d(1.0), 1).unwrap_err(),
+            prepare_market_to_limit(req, Some(book(Some(3204.0), None)), d(1.0), 1).unwrap_err(),
             PlaceDefer::DataNotReady
         );
     }
@@ -827,7 +828,7 @@ mod tests {
     fn shfe_market_buy_open_defers_without_ask_even_if_bid_present() {
         let req = market_req(Side::Buy, false);
         assert_eq!(
-            prepare_shfe_market_limit(req, Some(book(Some(3204.0), None)), d(1.0), 1).unwrap_err(),
+            prepare_market_to_limit(req, Some(book(Some(3204.0), None)), d(1.0), 1).unwrap_err(),
             PlaceDefer::DataNotReady
         );
     }
@@ -836,7 +837,7 @@ mod tests {
     fn shfe_market_sell_open_defers_without_bid_even_if_ask_present() {
         let req = market_req(Side::Sell, false);
         assert_eq!(
-            prepare_shfe_market_limit(req, Some(book(None, Some(3205.0))), d(1.0), 1).unwrap_err(),
+            prepare_market_to_limit(req, Some(book(None, Some(3205.0))), d(1.0), 1).unwrap_err(),
             PlaceDefer::DataNotReady
         );
     }
@@ -845,7 +846,7 @@ mod tests {
     fn shfe_market_empty_book_defers() {
         let req = market_req(Side::Buy, false);
         assert_eq!(
-            prepare_shfe_market_limit(req, Some(book(None, None)), d(1.0), 1).unwrap_err(),
+            prepare_market_to_limit(req, Some(book(None, None)), d(1.0), 1).unwrap_err(),
             PlaceDefer::DataNotReady
         );
     }
@@ -854,7 +855,7 @@ mod tests {
     fn shfe_market_without_book_defers() {
         let req = market_req(Side::Buy, false);
         assert_eq!(
-            prepare_shfe_market_limit(req, None, d(1.0), 1).unwrap_err(),
+            prepare_market_to_limit(req, None, d(1.0), 1).unwrap_err(),
             PlaceDefer::DataNotReady
         );
     }
@@ -863,7 +864,7 @@ mod tests {
     fn shfe_market_with_nonpositive_tick_defers() {
         let req = market_req(Side::Buy, false);
         assert_eq!(
-            prepare_shfe_market_limit(req, Some(both_sides()), d(0.0), 1).unwrap_err(),
+            prepare_market_to_limit(req, Some(both_sides()), d(0.0), 1).unwrap_err(),
             PlaceDefer::DataNotReady
         );
     }
@@ -872,29 +873,35 @@ mod tests {
     fn shfe_limit_request_passes_through() {
         // 限价单（开或平）原样返回，不读盘口/tick。
         let req = place_req();
-        let out = prepare_shfe_market_limit(req, None, d(0.0), 9).unwrap();
+        let out = prepare_market_to_limit(req, None, d(0.0), 9).unwrap();
         assert_eq!(out.order_type, OrderType::Limit);
         assert_eq!(out.price, Some(d(3205.0)));
     }
 
     // ---- 非 SHFE 市价单：按方向预检对手盘（原生 AnyPrice+IOC）----
 
-    /// DCE 合约目录（与 `place_req` 同合约号，交易所改为 DCE）。
-    fn non_shfe_dir() -> InstrumentDir {
+    /// 构造与 `place_req` 同合约号、指定交易所/tick/产品类型的合约目录。
+    fn dir_with(exchange: &str, tick: f64, product_class: u8) -> InstrumentDir {
         let dir = InstrumentDir::new();
         dir.remember(InstrumentInfo {
             instrument: "rb2510".into(),
-            exchange_id: "DCE".into(),
+            exchange_id: exchange.into(),
             product_id: "rb".into(),
+            product_class,
             is_trading: true,
             volume_multiple: 10,
-            price_tick: 1.0,
+            price_tick: tick,
             max_limit_volume: 0,
             max_market_volume: 0,
             long_margin_ratio: 0.0,
             short_margin_ratio: 0.0,
         });
         dir
+    }
+
+    /// DCE 期货合约目录（与 `place_req` 同合约号，交易所改为 DCE）。
+    fn non_shfe_dir() -> InstrumentDir {
+        dir_with("DCE", 1.0, PRODUCT_FUTURES)
     }
 
     fn non_shfe_market_req(side: Side, reduce_only: bool) -> PlaceOrderRequest {
@@ -1009,24 +1016,124 @@ mod tests {
 
     /// CFFEX 合约目录（与 `place_req` 同合约号，交易所改为 CFFEX）。
     fn cffex_dir() -> InstrumentDir {
-        let dir = InstrumentDir::new();
-        dir.remember(InstrumentInfo {
-            instrument: "rb2510".into(),
-            exchange_id: "CFFEX".into(),
-            product_id: "rb".into(),
-            is_trading: true,
-            volume_multiple: 10,
-            price_tick: 0.2,
-            max_limit_volume: 0,
-            max_market_volume: 0,
-            long_margin_ratio: 0.0,
-            short_margin_ratio: 0.0,
-        });
-        dir
+        dir_with("CFFEX", 0.2, PRODUCT_FUTURES)
     }
 
     fn shfe_and_cffex() -> Vec<String> {
         vec!["SHFE".into(), "CFFEX".into()]
+    }
+
+    /// DCE 期权合约目录（product_class='2'），交易所**不在**转限价集合内。
+    fn dce_option_dir() -> InstrumentDir {
+        dir_with("DCE", 0.5, PRODUCT_OPTIONS)
+    }
+
+    #[test]
+    fn dce_option_buy_open_converts_to_limit_even_when_exchange_not_configured() {
+        // 期权无论所属交易所：买开 = ask + drift，按 tick 向上取整转限价。
+        // ask=601、tick=0.5、drift=1 → 601.5。
+        let out = prepare_ctp_market(
+            &dce_option_dir(),
+            &quotes_with(Some(600.0), Some(601.0)),
+            1,
+            &shfe_only(),
+            non_shfe_market_req(Side::Buy, false),
+        )
+        .unwrap();
+        assert_eq!(out.order_type, OrderType::Limit);
+        assert_eq!(out.price, Some(d(601.5)));
+    }
+
+    #[test]
+    fn dce_option_sell_open_converts_bid_minus_drift() {
+        // 卖开 = bid − drift，按 tick 向下取整：600 − 2×0.5 = 599。
+        let out = prepare_ctp_market(
+            &dce_option_dir(),
+            &quotes_with(Some(600.0), Some(601.0)),
+            2,
+            &shfe_only(),
+            non_shfe_market_req(Side::Sell, false),
+        )
+        .unwrap();
+        assert_eq!(out.order_type, OrderType::Limit);
+        assert_eq!(out.price, Some(d(599.0)));
+    }
+
+    #[test]
+    fn dce_option_close_long_uses_bid_without_drift() {
+        // 平多（sell + reduce_only）= 对手价 bid，不加漂移。
+        let out = prepare_ctp_market(
+            &dce_option_dir(),
+            &quotes_with(Some(600.0), Some(601.0)),
+            5,
+            &shfe_only(),
+            non_shfe_market_req(Side::Sell, true),
+        )
+        .unwrap();
+        assert_eq!(out.order_type, OrderType::Limit);
+        assert_eq!(out.price, Some(d(600.0)));
+    }
+
+    #[test]
+    fn dce_option_close_short_uses_ask_without_drift() {
+        // 平空（buy + reduce_only）= 对手价 ask，不加漂移。
+        let out = prepare_ctp_market(
+            &dce_option_dir(),
+            &quotes_with(Some(600.0), Some(601.0)),
+            5,
+            &shfe_only(),
+            non_shfe_market_req(Side::Buy, true),
+        )
+        .unwrap();
+        assert_eq!(out.order_type, OrderType::Limit);
+        assert_eq!(out.price, Some(d(601.0)));
+    }
+
+    #[test]
+    fn dce_option_market_without_book_defers() {
+        // 期权无盘口（真实环境可能有做市商盘口；SimNow 全 0 不代表真实柜台）→ 推迟。
+        assert_eq!(
+            prepare_ctp_market(
+                &dce_option_dir(),
+                &QuoteTable::new(),
+                1,
+                &shfe_only(),
+                non_shfe_market_req(Side::Buy, false),
+            )
+            .unwrap_err(),
+            PlaceDefer::DataNotReady
+        );
+    }
+
+    #[test]
+    fn dce_option_market_unknown_instrument_defers() {
+        // 合约目录未预热 → DataNotReady（绝不猜测交易所/tick）。
+        assert_eq!(
+            prepare_ctp_market(
+                &InstrumentDir::new(),
+                &quotes_with(Some(600.0), Some(601.0)),
+                1,
+                &shfe_only(),
+                non_shfe_market_req(Side::Buy, false),
+            )
+            .unwrap_err(),
+            PlaceDefer::DataNotReady
+        );
+    }
+
+    #[test]
+    fn dce_futures_market_still_stays_market_when_not_configured() {
+        // 回归：DCE 期货仍走原生 AnyPrice+IOC，不因期权分支被误转限价。
+        let out = prepare_ctp_market(
+            &non_shfe_dir(),
+            &quotes_with(Some(600.0), Some(601.0)),
+            1,
+            &shfe_only(),
+            non_shfe_market_req(Side::Buy, false),
+        )
+        .unwrap();
+        assert_eq!(out.order_type, OrderType::Market);
+        assert_eq!(out.price, None);
     }
 
     #[test]

@@ -633,6 +633,56 @@ mod tests {
     }
 
     #[test]
+    fn ctp_option_buy_margin_falls_back_to_open_cost_and_roi_is_premium_yield() {
+        // 期权买方 UseMargin=0（适配层 margin=None）：引擎按建仓成本兜底。
+        // 权利金 10、2 手、乘数 5 → 成本 100；现价 12 → pnl=20，roi=20/100=0.2。
+        let ctp = PositionInfo {
+            instrument: "cu2612C146000".into(),
+            instrument_type: InstrumentType::Futures,
+            position_side: OrderPositionSide::Both,
+            signed_quantity: dec("2"),
+            entry_price: dec("10"),
+            mark_price: Some(dec("12")),
+            unrealized_pnl: None,
+            leverage: None,
+            multiplier: Some(dec("5")),
+            notional: None,
+            margin: None,
+            update_ms: Some(1_000),
+        };
+        let no_price = |_: &str| None;
+        let v = snapshot_positions(7, "ctp", &[ctp], &no_price, 2_000);
+        let p = &v[0];
+        assert_eq!(p.margin, dec("100"), "买方保证金兜底=OpenCost 成本口径");
+        assert_eq!(p.roi, dec("0.2"), "ROI=权利金收益/权利金成本");
+    }
+
+    #[test]
+    fn ctp_option_seller_roi_uses_counter_margin() {
+        // 卖方柜台回真实 UseMargin=80：roi=pnl/80。
+        let ctp = PositionInfo {
+            instrument: "cu2612C146000".into(),
+            instrument_type: InstrumentType::Futures,
+            position_side: OrderPositionSide::Both,
+            signed_quantity: dec("-2"),
+            entry_price: dec("10"),
+            mark_price: Some(dec("9")),
+            unrealized_pnl: None,
+            leverage: None,
+            multiplier: Some(dec("5")),
+            notional: None,
+            margin: Some(dec("80")),
+            update_ms: Some(1_000),
+        };
+        let no_price = |_: &str| None;
+        let v = snapshot_positions(7, "ctp", &[ctp], &no_price, 2_000);
+        let p = &v[0];
+        assert_eq!(p.margin, dec("80"), "卖方采用柜台保证金");
+        // 空头 pnl=(10−9)×2×5=10 → roi=10/80=0.125。
+        assert_eq!(p.roi, dec("0.125"));
+    }
+
+    #[test]
     fn ctp_real_quote_overrides_entry_fallback() {
         // 回归：行情 tick 到达后，QuoteTable 的真实现价必须覆盖 entry 兜底。
         let ctp = PositionInfo {

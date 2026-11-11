@@ -659,6 +659,7 @@ impl MarketDataStream for CtpMarketStream {
 mod tests {
     use super::*;
     use crate::ctp::core::event::InstrumentInfo;
+    use crate::ctp::instrument_dir::PRODUCT_FUTURES;
     use crate::market::FixedSymbols;
     use rust_decimal::Decimal;
 
@@ -675,6 +676,7 @@ mod tests {
             instrument: symbol.into(),
             exchange_id: "SHFE".into(),
             product_id: product.into(),
+            product_class: PRODUCT_FUTURES,
             is_trading: trading,
             volume_multiple: 5,
             price_tick: 10.0,
