@@ -24,6 +24,9 @@ use crate::port::QuoteObserver;
 /// 行情事件等待超时（空闲轮询粒度）。
 const MD_POLL_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// 会话内订阅集对账周期（业务 ∪ K线）；tick 很密，避免每个事件都扫仓储。
+const MD_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// 兴趣集为空时的保活重查间隔：线程不退出，睡一个分片周期后重读兴趣集。
 /// 固定间隔、**不走** [`ReconnectBackoff`]——兴趣集是冷启动竞态下的临时空窗
 /// （持仓对账尚未载入），不能被断线退避阶梯拖住；睡眠受停机标志分片打断。
@@ -389,15 +392,17 @@ fn run_md_session(
     }
     tracing::info!(count = symbols.len(), "CTP 行情订阅生效");
 
-    // 本会话业务兴趣集合（会话内不重订阅，与历史一致；预算成集合供每笔 O(1) 判定）。
-    let business_set: std::collections::HashSet<String> =
-        ctp_subscription_symbols(interests).into_iter().collect();
-    // K线期望集：会话开始预算当前已订合约，并在循环内按节拍动态对账（见下方
-    // reconcile_kline_subscriptions）——支持配置基线品种展开与客户端运行时订阅/
-    // 退订在会话内增删，无需断线重连。
-    let mut kline_set: std::collections::HashSet<String> = kline
-        .map(|k| k.stream.bar_symbols().into_iter().collect())
-        .unwrap_or_default();
+    // 本会话订阅状态：业务/K线 各自期望集（tick 路由用）+ 实际订阅并集（FFI 对账用）。
+    // 会话内按 ~1s 对账，新开/平仓、规则与 K 线订阅变化无需断线重连。
+    let mut subs = SubscriptionState {
+        business: ctp_subscription_symbols(interests).into_iter().collect(),
+        kline: kline
+            .map(|k| k.stream.bar_symbols().into_iter().collect())
+            .unwrap_or_default(),
+        subscribed: symbols.iter().cloned().collect(),
+    };
+    let mut last_reconcile = std::time::Instant::now();
+    let mut reconcile_due = true;
 
     // tick 消费：断开即结束本会话交外循环重连；停机即整体退出。
     while !stop.load(Ordering::SeqCst) {
@@ -424,9 +429,9 @@ fn run_md_session(
                     ask = t.asks[0].price,
                     "CTP 行情 tick 到达"
                 );
-                // 作用域判定：业务兴趣集 / K线期望集（均会话开始预算，O(1) 查询）。
-                let in_business = business_set.contains(&t.instrument);
-                let in_kline = kline_set.contains(&t.instrument);
+                // 作用域判定：业务兴趣集 / K线期望集（每拍对账更新，O(1) 查询）。
+                let in_business = subs.business.contains(&t.instrument);
+                let in_kline = subs.kline.contains(&t.instrument);
 
                 // 业务集 → QuoteTable + observer（原样）。
                 if in_business {
@@ -471,78 +476,195 @@ fn run_md_session(
                 tracing::warn!(reason, "CTP 行情前置断开，退避重连");
                 return md_session_end(stop.load(Ordering::SeqCst));
             }
+            Some(MdEvent::Error { code, msg }) => {
+                tracing::warn!(code, error = %msg, "CTP 行情错误");
+            }
             _ => {}
         }
-        // 每个 poll 节拍（约 1s，空闲超时拍也到此）：
+        // 每个事件后：
         // 1) 墙钟 sweep 定稿已到边界（grace=0：start+interval ≤ now）的上一周期 K线——
         //    稀疏成交也无需等下一周期首笔 tick，最坏定稿延迟 ≈ 一个 poll 节拍（约 1s）；
         //    不新增 sleep/线程（新周期首笔 tick 另在 on_tick 内以事件时间走同一墙钟判定）；
-        // 2) 对账 K线期望集：配置基线品种展开 ∪ 客户端运行时订阅发生增删时，会话内增量
-        //    subscribe/unsubscribe，不等断线重连。
+        // 2) 订阅对账按 ~1s 节流：tick 很密，不能每个事件都扫仓位/规则仓储；对账内容为
+        //    业务兴趣 ∪ K线期望 的并集，会话内增减无需断线重连。
         if let Some(k) = kline {
             let swept = k.stream.sweep_kline_finalized(now_ms());
             if !swept.is_empty() {
                 tracing::debug!(count = swept.len(), "CTP 墙钟 sweep 定稿 K线");
             }
-            reconcile_kline_subscriptions(&md, k, &business_set, &mut kline_set);
+        }
+        if reconcile_due || last_reconcile.elapsed() >= MD_RECONCILE_INTERVAL {
+            reconcile_due = false;
+            last_reconcile = std::time::Instant::now();
+            reconcile_subscriptions(&md, interests, kline, quotes, &mut subs);
         }
     }
     MdSessionOutcome::Stop
 }
 
-/// 会话内 K线订阅对账：把柜台实际订阅的 K线集合对齐到当前 `bar_symbols()`。
+/// 会话订阅状态：`business`/`kline` 是 tick 路由用的期望集；
+/// `subscribed` 是柜台实际订过的并集（FFI 对账基准）。
+#[derive(Debug)]
+struct SubscriptionState {
+    business: std::collections::HashSet<String>,
+    kline: std::collections::HashSet<String>,
+    subscribed: std::collections::HashSet<String>,
+}
+
+/// 业务 ∪ K线 的期望并集与实际订阅并集做差，返回排序后的 (add, remove)。
 ///
-/// - 新增（期望有、当前无）且不属于业务集合约 → 增量 `subscribe`；
-/// - 消失（当前有、期望无）且不属于业务集合约 → `unsubscribe`（业务兴趣集的
-///   合约即使 K线退订也不退，老路径仍在收）；
-/// - 合约目录尚未预热导致展开为空时不误退（保留当前集，等下一拍）。
-fn reconcile_kline_subscriptions(
-    md: &MdHandle,
-    kline: &MdKlineDeps,
-    business: &std::collections::HashSet<String>,
-    current: &mut std::collections::HashSet<String>,
-) {
-    let desired: std::collections::HashSet<String> =
-        kline.stream.bar_symbols().into_iter().collect();
-
-    // 目录未就绪：desired 可能暂空，跳过本拍以免误退已订合约。
-    // 判据：存在配置基线/客户端品种但目录展开为空——简单起见，仅当 desired 非空
-    // 或确无任何 K线需求时才动作；空需求且 current 非空属正常全退订，需区分。
-    // 这里用 stream 是否有任何 bar 客户端/基线来判断"空"是真空还是未就绪。
-    let has_demand = kline.stream.has_kline_demand();
-    if desired.is_empty() && has_demand {
-        return;
-    }
-
-    let to_add: Vec<String> = desired.difference(current).cloned().collect();
-    let to_remove: Vec<String> = current
-        .iter()
-        .filter(|s| !desired.contains(*s) && !business.contains(*s))
+/// H1/H2 修复：
+/// * 已在 K 线订阅、后新增为业务兴趣的符号不会重复 subscribe，但会由
+///   [`apply_subscription_state`] 进入 `business` 路由集；
+/// * 两边都不再需要的符号会进入 remove，不会被对方旧成员永久保留。
+fn plan_subscription_reconcile(
+    desired_business: &std::collections::HashSet<String>,
+    desired_kline: &std::collections::HashSet<String>,
+    subscribed: &std::collections::HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut add: Vec<String> = desired_business
+        .union(desired_kline)
+        .filter(|s| !subscribed.contains(*s))
         .cloned()
         .collect();
+    add.sort();
+    let mut remove: Vec<String> = subscribed
+        .iter()
+        .filter(|s| !desired_business.contains(*s) && !desired_kline.contains(*s))
+        .cloned()
+        .collect();
+    remove.sort();
+    (add, remove)
+}
 
-    if !to_add.is_empty() {
+/// 将本拍对账结果应用到会话状态（纯状态迁移，便于单测）。
+///
+/// 路由集始终更新为期望集（即使 FFI 受理失败）；实际订阅集只在成功时变更：
+/// * add 成功 → 加入 `subscribed`；
+/// * remove 成功 → 从 `subscribed` 移除。
+#[allow(clippy::too_many_arguments)]
+fn apply_subscription_state(
+    state: &mut SubscriptionState,
+    desired_business: std::collections::HashSet<String>,
+    desired_kline: std::collections::HashSet<String>,
+    add: &[String],
+    remove: &[String],
+    add_ok: bool,
+    remove_ok: bool,
+) {
+    if add_ok {
+        state.subscribed.extend(add.iter().cloned());
+    }
+    if remove_ok {
+        for s in remove {
+            state.subscribed.remove(s);
+        }
+    }
+    state.business = desired_business;
+    state.kline = desired_kline;
+}
+
+/// K 线期望集的目录未就绪保护：desired 为空但仍有 K 线需求时沿用上一拍集合，
+/// 避免把尚未展开的品种误退订。
+fn effective_kline(
+    desired: std::collections::HashSet<String>,
+    has_demand: bool,
+    previous: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    if desired.is_empty() && has_demand {
+        previous.clone()
+    } else {
+        desired
+    }
+}
+
+/// 业务路由释放的符号：清掉 QuoteTable 旧行，避免市价单/现金换算读取过期盘口。
+///
+/// 即使该符号仍被 K 线订阅（未进入退订），业务盘口也不应继续参与下单/估值；
+/// 后续 tick 只会走 K 线路径，不会重新写入业务盘口。
+fn remove_released_business_quotes(
+    quotes: &QuoteTable,
+    previous_business: &std::collections::HashSet<String>,
+    desired_business: &std::collections::HashSet<String>,
+) {
+    for s in previous_business.difference(desired_business) {
+        quotes.remove(&instrument_key(s));
+    }
+}
+
+/// 会话内订阅对账：重读业务兴趣与 K 线期望，按并集增量 subscribe/unsubscribe。
+///
+/// K 线目录未就绪（desired 为空但仍有 K 线需求）时保留当前 K 线路由集，避免误退。
+/// 注：`md.subscribe` 只返回批次受理码；单合约拒绝经 `MdEvent::Subscribed(code!=0)`
+/// 异步返回，本函数只记录日志、不回收 `subscribed`（与既有 K 线对账一致），
+/// 被拒合约需重连后重新构建订阅集才会重试（已知限制，后续可加拒单退避表）。
+fn reconcile_subscriptions(
+    md: &MdHandle,
+    interests: &dyn crate::port::MarketInterest,
+    kline: Option<&MdKlineDeps>,
+    quotes: &QuoteTable,
+    state: &mut SubscriptionState,
+) {
+    let desired_business: std::collections::HashSet<String> =
+        ctp_subscription_symbols(interests).into_iter().collect();
+    let (desired_kline, has_demand) = match kline {
+        Some(k) => (
+            k.stream
+                .bar_symbols()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            k.stream.has_kline_demand(),
+        ),
+        None => (std::collections::HashSet::new(), false),
+    };
+    let effective_kline = effective_kline(desired_kline, has_demand, &state.kline);
+    // 业务路由释放即清盘口（与是否成功退订无关）；仍被 K 线需要的符号保留订阅，
+    // 但业务侧不再使用旧 book。
+    remove_released_business_quotes(quotes, &state.business, &desired_business);
+    let (to_add, to_remove) =
+        plan_subscription_reconcile(&desired_business, &effective_kline, &state.subscribed);
+    // 退订意图即清盘口：即使柜台受理失败、tick 可能继续，路由集已不再需要它。
+    for s in &to_remove {
+        quotes.remove(&instrument_key(s));
+    }
+
+    let add_ok = if to_add.is_empty() {
+        true
+    } else {
         let refs: Vec<&str> = to_add.iter().map(|s| s.as_str()).collect();
         let code = md.subscribe(&refs);
         if code == 0 {
-            tracing::info!(symbols = to_add.len(), "CTP K线会话内增订合约");
-            current.extend(to_add);
+            tracing::info!(count = to_add.len(), "CTP 会话内增订合约");
+            true
         } else {
-            tracing::warn!(code, symbols = ?to_add, "CTP K线增订受理失败，下拍重试");
+            tracing::warn!(code, symbols = ?to_add, "CTP 会话内增订受理失败，下拍重试");
+            false
         }
-    }
-    if !to_remove.is_empty() {
+    };
+
+    let remove_ok = if to_remove.is_empty() {
+        true
+    } else {
         let refs: Vec<&str> = to_remove.iter().map(|s| s.as_str()).collect();
         let code = md.unsubscribe(&refs);
         if code == 0 {
-            tracing::info!(symbols = refs.len(), "CTP K线会话内退订合约");
-            for s in &to_remove {
-                current.remove(s);
-            }
+            tracing::info!(count = to_remove.len(), "CTP 会话内退订合约");
+            true
         } else {
-            tracing::warn!(code, symbols = ?to_remove, "CTP K线退订受理失败，下拍重试");
+            tracing::warn!(code, symbols = ?to_remove, "CTP 会话内退订受理失败，下拍重试");
+            false
         }
-    }
+    };
+
+    apply_subscription_state(
+        state,
+        desired_business,
+        effective_kline,
+        &to_add,
+        &to_remove,
+        add_ok,
+        remove_ok,
+    );
 }
 
 /// 受理码重试：`attempt` 返回 0 即成功；否则每秒重试直到累计 `max_secs` 秒。
@@ -845,5 +967,191 @@ mod tests {
         // 停机已置位：即使持续失败也应立即返回，不睡满窗口。
         let code = retry_until_accepted(|| -1, &stop, 60);
         assert_eq!(code, -1);
+    }
+
+    // ---- 订阅集合会话内增量对账（业务 ∪ K线） ----
+
+    fn set(items: &[&str]) -> std::collections::HashSet<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn plan_subscription_adds_new_business_symbol() {
+        let (add, remove) = plan_subscription_reconcile(&set(&["rb2510"]), &set(&[]), &set(&[]));
+        assert_eq!(add, vec!["rb2510".to_string()]);
+        assert!(remove.is_empty());
+    }
+
+    #[test]
+    fn plan_subscription_adds_overlap_symbol_once() {
+        // 业务与 K 线同时需要、但当前未订：只增订一次。
+        let (add, remove) =
+            plan_subscription_reconcile(&set(&["rb2510"]), &set(&["rb2510"]), &set(&[]));
+        assert_eq!(add, vec!["rb2510".to_string()]);
+        assert!(remove.is_empty());
+    }
+
+    #[test]
+    fn plan_subscription_removes_symbol_released_by_both_sets() {
+        // H2：业务与 K 线都不再需要 → 必须退订，不能因对方旧集残留而永久保留。
+        let (add, remove) = plan_subscription_reconcile(&set(&[]), &set(&[]), &set(&["rb2510"]));
+        assert!(add.is_empty());
+        assert_eq!(remove, vec!["rb2510".to_string()]);
+    }
+
+    #[test]
+    fn plan_subscription_keeps_symbol_still_desired_by_kline() {
+        // 业务释放但 K 线仍需要：不退订。
+        let (add, remove) =
+            plan_subscription_reconcile(&set(&[]), &set(&["rb2510"]), &set(&["rb2510"]));
+        assert!(add.is_empty());
+        assert!(remove.is_empty());
+    }
+
+    #[test]
+    fn plan_subscription_does_not_resubscribe_overlap_already_subscribed() {
+        // H1：已在 K 线订阅的符号新增为业务兴趣：不重复增订；
+        // 路由集由 apply_subscription_state 更新为 desired_business。
+        let (add, remove) =
+            plan_subscription_reconcile(&set(&["rb2510"]), &set(&["rb2510"]), &set(&["rb2510"]));
+        assert!(add.is_empty());
+        assert!(remove.is_empty());
+    }
+
+    #[test]
+    fn plan_subscription_sorts_multi_element_increments() {
+        let (add, remove) =
+            plan_subscription_reconcile(&set(&["b", "a"]), &set(&["c"]), &set(&["d", "e"]));
+        assert_eq!(add, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(remove, vec!["d".to_string(), "e".to_string()]);
+    }
+
+    #[test]
+    fn plan_subscription_empty_sets_are_noop() {
+        let (add, remove) = plan_subscription_reconcile(&set(&[]), &set(&[]), &set(&[]));
+        assert!(add.is_empty());
+        assert!(remove.is_empty());
+    }
+
+    #[test]
+    fn apply_state_overlap_symbol_becomes_business_routable_without_resubscribe() {
+        // H1：符号已在 K 线订阅，新增为业务兴趣后必须进入 business 路由集。
+        let mut st = SubscriptionState {
+            business: set(&[]),
+            kline: set(&["rb2510"]),
+            subscribed: set(&["rb2510"]),
+        };
+        apply_subscription_state(
+            &mut st,
+            set(&["rb2510"]),
+            set(&["rb2510"]),
+            &[],
+            &[],
+            true,
+            true,
+        );
+        assert!(st.business.contains("rb2510"), "业务路由集必须包含该符号");
+        assert!(st.kline.contains("rb2510"));
+        assert!(st.subscribed.contains("rb2510"));
+    }
+
+    #[test]
+    fn apply_state_removes_symbol_released_by_both_sets() {
+        // H2：退订成功且两边都不再需要 → 实际订阅集与路由集都应清空。
+        let mut st = SubscriptionState {
+            business: set(&["rb2510"]),
+            kline: set(&["rb2510"]),
+            subscribed: set(&["rb2510"]),
+        };
+        apply_subscription_state(
+            &mut st,
+            set(&[]),
+            set(&[]),
+            &[],
+            &["rb2510".to_string()],
+            true,
+            true,
+        );
+        assert!(st.business.is_empty());
+        assert!(st.kline.is_empty());
+        assert!(st.subscribed.is_empty());
+    }
+
+    #[test]
+    fn apply_state_add_failure_keeps_subscribed_unchanged() {
+        let mut st = SubscriptionState {
+            business: set(&[]),
+            kline: set(&[]),
+            subscribed: set(&[]),
+        };
+        apply_subscription_state(
+            &mut st,
+            set(&["rb2510"]),
+            set(&[]),
+            &["rb2510".to_string()],
+            &[],
+            false,
+            true,
+        );
+        assert!(st.subscribed.is_empty(), "增订失败不得记入已订阅");
+        assert!(st.business.contains("rb2510"), "路由集仍按期望更新");
+    }
+
+    #[test]
+    fn apply_state_remove_failure_keeps_subscribed_and_stops_routing() {
+        let mut st = SubscriptionState {
+            business: set(&["rb2510"]),
+            kline: set(&["rb2510"]),
+            subscribed: set(&["rb2510"]),
+        };
+        apply_subscription_state(
+            &mut st,
+            set(&[]),
+            set(&[]),
+            &[],
+            &["rb2510".to_string()],
+            true,
+            false,
+        );
+        assert!(st.subscribed.contains("rb2510"), "退订失败保留实际订阅");
+        assert!(st.business.is_empty(), "退订后先停止业务路由");
+        assert!(st.kline.is_empty(), "退订后先停止 K 线路由");
+    }
+
+    #[test]
+    fn effective_kline_keeps_previous_when_desired_empty_but_demand_exists() {
+        // 目录未就绪：desired 展开为空但仍有 K 线需求 → 沿用上一拍，避免误退。
+        let got = effective_kline(set(&[]), true, &set(&["rb2510"]));
+        assert_eq!(got, set(&["rb2510"]));
+    }
+
+    #[test]
+    fn effective_kline_uses_empty_desired_when_no_demand() {
+        // 真空需求：desired 为空且无 K 线消费者 → 允许退订。
+        let got = effective_kline(set(&[]), false, &set(&["rb2510"]));
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn effective_kline_uses_non_empty_desired_over_previous() {
+        let got = effective_kline(set(&["cu2512"]), true, &set(&["rb2510"]));
+        assert_eq!(got, set(&["cu2512"]));
+    }
+
+    #[test]
+    fn released_business_quote_is_removed_but_still_desired_is_kept() {
+        let quotes = QuoteTable::new();
+        let a = instrument_key("rb2510");
+        let b = instrument_key("cu2512");
+        for inst in [&a, &b] {
+            let mut u = QuoteUpdate::new(1);
+            u.book = Some(TopOfBook::new(Some(Decimal::ONE), Some(Decimal::ONE)));
+            quotes.apply(inst, u);
+        }
+
+        remove_released_business_quotes(&quotes, &set(&["rb2510", "cu2512"]), &set(&["rb2510"]));
+
+        assert!(quotes.get(&a).is_some(), "仍在业务集的盘口必须保留");
+        assert!(quotes.get(&b).is_none(), "业务释放的盘口必须清理");
     }
 }
