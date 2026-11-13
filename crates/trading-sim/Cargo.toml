@@ -1,0 +1,16 @@
+[package]
+name = "trading-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "M1 全链路 E2E 的可编程模拟交易所（dev-only 测试替身）"
+
+[dependencies]
+trading-models.workspace = true
+trading-core.workspace = true
+trading-exchange.workspace = true
+rust_decimal.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

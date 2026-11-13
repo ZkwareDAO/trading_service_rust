@@ -3416,6 +3416,7 @@ dependencies = [
  "tracing",
  "trading-core",
  "trading-models",
+ "trading-sim",
  "webpki-roots 0.26.11",
 ]
 
@@ -3462,7 +3463,22 @@ dependencies = [
  "trading-core",
  "trading-exchange",
  "trading-models",
+ "trading-sim",
  "trading-store",
+]
+
+[[package]]
+name = "trading-sim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures-util",
+ "rust_decimal",
+ "tokio",
+ "trading-core",
+ "trading-exchange",
+ "trading-models",
 ]
 
 [[package]]

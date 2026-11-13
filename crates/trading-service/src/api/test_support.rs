@@ -80,6 +80,8 @@ pub async fn app_with_accounts(csv_body: &str) -> TestApp {
             crate::notify::report::default_roi_alert_threshold(),
         )),
         venue: crate::venue_config::default_configs(),
+        // 单测沿用生产内置注册表（不联网：账户表默认为空，不建公共行情连接）。
+        registry_factory: crate::state::builtin_registry_factory(),
     });
 
     let router = super::router().with_state(state.clone());

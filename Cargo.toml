@@ -1,10 +1,16 @@
 [workspace]
 resolver = "2"
+# vendored ctp2rs 是 path 依赖，但其目录在 workspace 根下会被 Cargo 自动视为
+# 隐式成员，导致 `--all-features` 同时打开互斥的 v1alpha1/v1alpha2。显式排除后
+# 它仍作为 path 依赖参与构建，但只接收依赖边声明的 features。
+exclude = ["third_party/ctp2rs/ctp-dyn"]
 members = [
     # 本服务（v0）
     "crates/trading-core",
     "crates/trading-exchange",
     "crates/trading-service",
+    # M1 全链路 E2E 的模拟交易所测试替身（dev-only）
+    "crates/trading-sim",
     # 远端合入的通用存储框架（原 store-tokio 已并入 trading-store::async_rt）
     "crates/store-core",
     "crates/trading-models",
@@ -21,6 +27,7 @@ license = "Apache-2.0"
 # ---- 本服务（v0）----
 trading-core = { path = "crates/trading-core" }
 trading-exchange = { path = "crates/trading-exchange" }
+trading-sim = { path = "crates/trading-sim" }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"

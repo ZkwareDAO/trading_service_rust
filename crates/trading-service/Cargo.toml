@@ -60,3 +60,5 @@ ctp = ["trading-exchange/ctp"]
 [dev-dependencies]
 tower = { workspace = true }
 tempfile = { workspace = true }
+# M1 全链路 E2E：可编程模拟交易所（dev-only）。
+trading-sim.workspace = true
