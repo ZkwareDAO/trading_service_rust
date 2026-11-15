@@ -3,7 +3,9 @@
 //! 与 [`crate::trader`] 同型：柜台行情回调线程 → mpsc → 主循环；
 //! 回调内即时拷贝 owned 快照，不跨回调持有 C++ 指针。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::ctp::core::account::CtpAccount;
@@ -80,14 +82,35 @@ pub enum MdEvent {
     Error { code: i32, msg: String },
 }
 
+/// 行情回调侧诊断计数（SPI 回调线程写、drain 线程读）。
+///
+/// * `tick_callbacks`：深度行情回调**入口**次数——与落盘 tick 数对比，可判定丢点
+///   发生在本进程之前（柜台/前置丢包）还是之后；
+/// * `send_blocked_nanos`：往有界事件通道投递累计阻塞时长。持续非零说明 drain
+///   消费不过来（背压传导到柜台回调线程，前置会主动丢快照）。
+#[derive(Clone, Default)]
+struct MdCounters {
+    tick_callbacks: Arc<AtomicU64>,
+    send_blocked_nanos: Arc<AtomicU64>,
+}
+
 /// 事件转发 SPI。
 struct EventMdSpi {
     tx: SyncSender<MdEvent>,
+    counters: MdCounters,
 }
 
 impl EventMdSpi {
     fn emit(&self, event: MdEvent) {
+        let started = std::time::Instant::now();
         let _ = self.tx.send(event);
+        let waited = started.elapsed().as_nanos() as u64;
+        // 正常投递是纳秒级；>100µs 视为一次背压阻塞。
+        if waited > 100_000 {
+            self.counters
+                .send_blocked_nanos
+                .fetch_add(waited, Ordering::Relaxed);
+        }
     }
 }
 
@@ -150,6 +173,8 @@ impl MdSpi for EventMdSpi {
         data: Option<&ctp2rs::v1alpha1::CThostFtdcDepthMarketDataField>,
     ) {
         if let Some(d) = data {
+            // 回调入口计数：与落盘 tick 数对比定位丢点边界。
+            self.counters.tick_callbacks.fetch_add(1, Ordering::Relaxed);
             self.emit(MdEvent::Tick(Box::new(depth_to_snapshot(d))));
         }
     }
@@ -168,6 +193,8 @@ pub struct MdHandle {
     account: CtpAccount,
     /// 自定义 SPI 裸指针；Drop 时在柜台线程退出后回收。
     spi_raw: *mut dyn MdSpi,
+    /// 回调侧诊断计数（与 SPI 共享）。
+    counters: MdCounters,
 }
 
 impl MdHandle {
@@ -191,7 +218,11 @@ impl MdHandle {
         let api = MdApi::create_api(lib_path, flow_path, false, false, is_production_mode);
 
         let (tx, rx): (SyncSender<MdEvent>, Receiver<MdEvent>) = sync_channel(4096);
-        let spi_raw = Box::into_raw(Box::new(EventMdSpi { tx })) as *mut dyn MdSpi;
+        let counters = MdCounters::default();
+        let spi_raw = Box::into_raw(Box::new(EventMdSpi {
+            tx,
+            counters: counters.clone(),
+        })) as *mut dyn MdSpi;
 
         api.register_spi(spi_raw);
         // 行情前置与交易前置端口分离（如瑞达 42213/42205），由部署配置传入。
@@ -214,7 +245,18 @@ impl MdHandle {
                 is_production_mode: account.is_production_mode,
             },
             spi_raw,
+            counters,
         })
+    }
+
+    /// 深度行情回调入口累计次数（含所有已订阅合约）。
+    pub fn tick_callback_count(&self) -> u64 {
+        self.counters.tick_callbacks.load(Ordering::Relaxed)
+    }
+
+    /// 事件通道投递累计阻塞纳秒数（背压诊断；持续非零说明 drain 消费不过来）。
+    pub fn send_blocked_nanos(&self) -> u64 {
+        self.counters.send_blocked_nanos.load(Ordering::Relaxed)
     }
 
     /// 等待下一个行情事件；超时返回 `None`。
@@ -286,8 +328,10 @@ impl Drop for MdHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{MdEvent, MdHandle};
+    use super::{EventMdSpi, MdCounters, MdEvent, MdHandle, MdSpi};
     use crate::ctp::core::account::CtpAccount;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::sync_channel;
 
     fn account() -> CtpAccount {
         CtpAccount {
@@ -423,5 +467,21 @@ mod tests {
         assert_eq!(s.asks[0].price, 0.0);
         assert_eq!(s.day_open, 0.0);
         assert_eq!(s.day_high, 0.0);
+    }
+
+    // 回调计数只在深度行情入口累加，普通事件不计数；tick 照常转发。
+    #[test]
+    fn depth_callback_counts_and_forwards_ticks() {
+        let (tx, rx) = sync_channel(8);
+        let counters = MdCounters::default();
+        let mut spi = EventMdSpi {
+            tx,
+            counters: counters.clone(),
+        };
+        spi.on_rtn_depth_market_data(Some(&Depth::default()));
+        spi.emit(MdEvent::FrontConnected);
+        assert_eq!(counters.tick_callbacks.load(Ordering::Relaxed), 1);
+        assert!(matches!(rx.try_recv(), Ok(MdEvent::Tick(_))));
+        assert!(matches!(rx.try_recv(), Ok(MdEvent::FrontConnected)));
     }
 }

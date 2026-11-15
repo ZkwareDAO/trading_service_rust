@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use rust_decimal::Decimal;
 
-use crate::ctp::candle::{CandleAggregator, CandleTick};
+use crate::ctp::candle::{CandleAggregator, CandleDiagnostics, CandleTick};
 use crate::market::{BarSink, Kline, KlineInterval};
 use crate::market_hub::UnconditionalSinkSet;
 
@@ -36,6 +36,12 @@ pub struct BarAggSink {
     /// （含非主力、零订阅）都通知；策略/边沿告警/panic 摘除与自愈统一由
     /// [`UnconditionalSinkSet`] 处理，不牵连主下游。
     unconditional: UnconditionalSinkSet,
+    /// 已处理 tick 的最大事件时间（行情时钟水位）；0 = 尚无 tick。
+    /// 定稿判定用它而非本机 SystemTime，避免行情/处理滞后时提前收口。
+    watermark_ms: i64,
+    /// 全局最早到期边界（各在途桶 `start + interval` 的最小值）；无在途桶 = `i64::MAX`。
+    /// 水位 sweep 据此 O(1) 短路，把遍历从「每 tick」降到「每分钟边界一次」。
+    next_due_ms: i64,
 }
 
 impl BarAggSink {
@@ -46,6 +52,8 @@ impl BarAggSink {
             aggregators: BTreeMap::new(),
             sink,
             unconditional: UnconditionalSinkSet::new(),
+            watermark_ms: 0,
+            next_due_ms: i64::MAX,
         }
     }
 
@@ -63,7 +71,7 @@ impl BarAggSink {
     }
 
     /// 定稿 bar 的统一双下游出口：先全量持久化（绕过订阅/主力路由），再交 Router 分发。
-    /// 墙钟定稿（tick 事件时间触发 / poll 拍 sweep）与停机/日切 flush 都必须经此，
+    /// 定稿（tick 事件时间触发 / 水位或空闲拍 sweep）与停机/日切 flush 都必须经此，
     /// 保证每根 bar 恰好各一次、顺序一致，杜绝重复 append。
     fn emit_finalized(&mut self, bar: &Kline) {
         tracing::debug!(
@@ -89,33 +97,84 @@ impl BarAggSink {
     pub fn on_tick(&mut self, symbol: &str, t: &CandleTick) {
         let venue = self.venue.clone();
         let interval = self.interval;
-        let agg = self
-            .aggregators
-            .entry(symbol.to_string())
-            .or_insert_with(|| CandleAggregator::new(venue, symbol, interval));
-        if let Some(bar) = agg.on_tick(t) {
+        // 水位 = 已处理 tick 的最大事件时间（行情时钟）；与 SystemTime 无关。
+        self.watermark_ms = self.watermark_ms.max(t.update_ms);
+        let (bar, due) = {
+            let agg = self
+                .aggregators
+                .entry(symbol.to_string())
+                .or_insert_with(|| CandleAggregator::new(venue, symbol, interval));
+            // 事件时间本笔跨边界时的定稿走这里；其余静默合约由 sweep 按水位收口。
+            (agg.on_tick(t), agg.next_due_ms())
+        };
+        if let Some(due) = due {
+            self.next_due_ms = self.next_due_ms.min(due);
+        }
+        if let Some(bar) = bar {
             self.emit_finalized(&bar);
         }
     }
 
-    /// 墙钟到边界 sweep（grace=0；md 线程每 poll 节拍调用，空闲超时拍也调）：把**所有已收到
-    /// 过 tick** 且到点（`start + interval <= now_ms`）的合约上一周期桶一次性定稿。
+    /// 行情时间水位 sweep（md 线程每个事件后调用，O(1) 短路）：只有水位越过全局最早
+    /// 到期边界时才遍历全部聚合器，把所有到点（`start + interval <= watermark`）的
+    /// 在途桶收口。
     ///
-    /// - 只遍历已存在聚合器的在途桶：没 tick 的合约/分钟无桶，天然跳过、不补空 bar；
-    /// - BTreeMap 按符号有序定稿，多合约天然聚成一条有序 `kline_1m_batch`；
-    /// - 先取出全部定稿 bar（结束聚合器借用）再做下游通知，避免自借用冲突；
-    /// - 同一桶若已被 `on_tick` 的事件时间墙钟 take，则此处为 `None`，最多定稿一次。
-    pub fn sweep_finalized(&mut self, now_ms: i64) -> Vec<Kline> {
+    /// 与 [`Self::sweep_finalized`]（墙钟）的根本区别：判定用**已处理 tick 的最大事件
+    /// 时间**，而不是本机 `SystemTime`。行情到达/处理滞后或本机时钟相对行情偏移时，
+    /// 不会在桶尾 tick 尚未处理前提前定稿，因此不会产生旧实现的“每分钟只吃到前
+    /// 20–40 秒”的截断。
+    pub fn sweep_by_watermark(&mut self) -> Vec<Kline> {
+        let watermark = self.watermark_ms;
+        if watermark <= 0 || watermark < self.next_due_ms {
+            return Vec::new();
+        }
+        self.sweep_due(watermark)
+    }
+
+    /// 统一 sweep 内核：定稿所有到点（`start + interval <= now_ms`）的在途桶，
+    /// 刷新全局到期边界并通知下游。水位/空闲拍两条路径共用，保证定稿语义一致。
+    fn sweep_due(&mut self, now_ms: i64) -> Vec<Kline> {
         let mut finished = Vec::new();
+        let mut next_due = i64::MAX;
         for agg in self.aggregators.values_mut() {
             if let Some(bar) = agg.finalize_if_due(now_ms) {
                 finished.push(bar);
             }
+            if let Some(due) = agg.next_due_ms() {
+                next_due = next_due.min(due);
+            }
         }
+        self.next_due_ms = next_due;
         for bar in &finished {
             self.emit_finalized(bar);
         }
         finished
+    }
+
+    /// 已处理 tick 的最大事件时间（行情时钟水位）；0 表示尚无 tick。
+    pub fn watermark_ms(&self) -> i64 {
+        self.watermark_ms
+    }
+
+    /// 读取并清零各合约聚合器的诊断计数（迟到/乱序/疑似丢快照，周期告警取增量）。
+    pub fn take_diagnostics(&mut self) -> CandleDiagnostics {
+        let mut total = CandleDiagnostics::default();
+        for agg in self.aggregators.values_mut() {
+            total.merge(agg.take_diagnostics());
+        }
+        total
+    }
+
+    /// 墙钟到边界 sweep（**仅空闲拍兜底**：md 线程在 `next_event` 超时、队列已空时调用，
+    /// 用于收盘/静默收口最后一根；活跃行情请用 [`Self::sweep_by_watermark`]）：把所有
+    /// **已收到过 tick** 且到点（`start + interval <= now_ms`）的合约上一周期桶一次性定稿。
+    ///
+    /// - 只遍历已存在聚合器的在途桶：没 tick 的合约/分钟无桶，天然跳过、不补空 bar；
+    /// - BTreeMap 按符号有序定稿，多合约天然聚成一条有序 `kline_1m_batch`；
+    /// - 先取出全部定稿 bar（结束聚合器借用）再做下游通知，避免自借用冲突；
+    /// - 同一桶若已被 `on_tick` 的事件时间收口 take，则此处为 `None`，最多定稿一次。
+    pub fn sweep_finalized(&mut self, now_ms: i64) -> Vec<Kline> {
+        self.sweep_due(now_ms)
     }
 
     /// 强制定稿所有未闭桶（日切/停机/测试）：返回全部定稿 bar，先全量持久化再交路由。
@@ -127,6 +186,8 @@ impl BarAggSink {
                 finished.push(bar);
             }
         }
+        // 全部在途桶已收口：水位 sweep 的到期边界回到“无”。
+        self.next_due_ms = i64::MAX;
         for bar in &finished {
             self.emit_finalized(bar);
         }
@@ -417,6 +478,57 @@ mod tests {
         assert_eq!(good.bars.lock().unwrap().len(), 2);
     }
 
+    // ===== 事件时间水位 sweep（替代墙钟定稿，防止滞后把桶尾巴截掉）=====
+
+    #[test]
+    fn watermark_sweep_does_not_close_before_boundary() {
+        let sink = Arc::new(RecSink::default());
+        let mut agg = BarAggSink::new("ctp", sink.clone() as Arc<dyn BarSink>, KlineInterval::M1);
+        agg.on_tick("cu2612", &tick(20261023, 600_000, 100, 10));
+        agg.on_tick("cu2612", &tick(20261023, 659_500, 101, 12));
+        // 水位 659_500 未越过 660_000：即使本机墙钟早已过点也不得定稿。
+        assert!(agg.sweep_by_watermark().is_empty());
+        assert!(sink.bars.lock().unwrap().is_empty());
+        assert_eq!(agg.watermark_ms(), 659_500);
+    }
+
+    #[test]
+    fn watermark_crossing_finalizes_quiet_symbol_with_full_volume() {
+        let sink = Arc::new(RecSink::default());
+        let mut agg = BarAggSink::new("ctp", sink.clone() as Arc<dyn BarSink>, KlineInterval::M1);
+        // cu 的桶在 10:00，末尾 tick 到 10:00:59.5（完整一分钟）。
+        agg.on_tick("cu2612", &tick(20261023, 600_000, 100, 10));
+        agg.on_tick("cu2612", &tick(20261023, 659_500, 101, 20));
+        // 另一合约跨过边界，把全局水位推到 660_000，cu 桶由 sweep 收口。
+        agg.on_tick("rb2701", &tick(20261023, 660_000, 3800, 5));
+        let bars = agg.sweep_by_watermark();
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].symbol, "cu2612");
+        assert_eq!(bars[0].start_ms, 600_000);
+        // 完整一分钟的量：20 − 首笔基线 10 = 10（未被墙钟提前收口截掉尾段）。
+        assert_eq!(bars[0].volume, 10);
+        assert_eq!(sink.bars.lock().unwrap().clone(), vec!["cu2612"]);
+    }
+
+    #[test]
+    fn watermark_sweep_is_noop_without_ticks() {
+        let sink = Arc::new(RecSink::default());
+        let mut agg = BarAggSink::new("ctp", sink.clone() as Arc<dyn BarSink>, KlineInterval::M1);
+        assert!(agg.sweep_by_watermark().is_empty());
+        assert_eq!(agg.watermark_ms(), 0);
+    }
+
+    #[test]
+    fn late_tick_after_watermark_finalize_is_counted() {
+        let sink = Arc::new(RecSink::default());
+        let mut agg = BarAggSink::new("ctp", sink.clone() as Arc<dyn BarSink>, KlineInterval::M1);
+        agg.on_tick("cu2612", &tick(20261023, 600_000, 100, 10));
+        agg.on_tick("cu2612", &tick(20261023, 660_000, 101, 11)); // 事件时间收口 10:00
+        agg.on_tick("cu2612", &tick(20261023, 600_500, 99, 12)); // 定稿后的迟到 tick
+        let d = agg.take_diagnostics();
+        assert_eq!(d.late_dropped, 1);
+    }
+
     #[test]
     fn to_candle_tick_carries_fields() {
         let t = to_candle_tick(
@@ -432,5 +544,95 @@ mod tests {
         assert_eq!(t.exchange_id, "DCE");
         assert_eq!(t.cum_volume, 4);
         assert_eq!(t.open_interest, Decimal::from(6));
+    }
+
+    /// 真实 tick 回放（默认忽略；需本地数据）：
+    /// `CTP_TICK_CSV=... CTP_EXPECT_CSV=... cargo test -p trading-exchange --features ctp --lib \
+    ///   ctp::bar_agg::tests::replay_real_ticks_against_expected_bars -- --ignored --nocapture`
+    ///
+    /// 期望 CSV 由独立口径（事件时间聚合 oracle）生成；逐 bar 比对 7 个数值字段，
+    /// 用于验证线上水位定稿链路与交易所口径一致。
+    #[test]
+    #[ignore = "需要 CTP_TICK_CSV / CTP_EXPECT_CSV 本地数据"]
+    fn replay_real_ticks_against_expected_bars() {
+        struct Collect {
+            bars: Mutex<Vec<Kline>>,
+        }
+        impl BarSink for Collect {
+            fn on_bar(&self, bar: &Kline) {
+                self.bars.lock().unwrap().push(bar.clone());
+            }
+        }
+
+        let tick_path = std::env::var("CTP_TICK_CSV").expect("CTP_TICK_CSV");
+        let expect_path = std::env::var("CTP_EXPECT_CSV").expect("CTP_EXPECT_CSV");
+        let begin: i64 = std::env::var("CTP_REPLAY_BEGIN_MS")
+            .unwrap_or_else(|_| "1794531600000".into())
+            .parse()
+            .unwrap();
+        let end: i64 = std::env::var("CTP_REPLAY_END_MS")
+            .unwrap_or_else(|_| "1794535200000".into())
+            .parse()
+            .unwrap();
+
+        let out = Arc::new(Collect {
+            bars: Mutex::new(Vec::new()),
+        });
+        let mut agg = BarAggSink::new("ctp", out.clone() as Arc<dyn BarSink>, KlineInterval::M1);
+        let text = std::fs::read_to_string(&tick_path).unwrap();
+        for line in text.lines().skip(1) {
+            let c: Vec<&str> = line.split(',').collect();
+            if c.len() < 13 {
+                continue;
+            }
+            let t = CandleTick {
+                trading_day: c[4].parse().unwrap(),
+                exchange_id: c[1].to_string(),
+                update_ms: c[3].parse().unwrap(),
+                price: c[5].parse().unwrap(),
+                cum_volume: c[10].parse().unwrap(),
+                cum_turnover: c[11].parse().unwrap(),
+                open_interest: c[12].parse().unwrap(),
+            };
+            // 与 md 线程同型：每笔 tick 后按水位 sweep，停机 flush 收尾。
+            agg.on_tick(c[2], &t);
+            let _ = agg.sweep_by_watermark();
+        }
+        let _ = agg.flush_all();
+
+        let got: Vec<Kline> = out
+            .bars
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| begin <= b.start_ms && b.start_ms < end)
+            .cloned()
+            .collect();
+        let expect = std::fs::read_to_string(&expect_path).unwrap();
+        let exp: Vec<(&str, [&str; 7])> = expect
+            .lines()
+            .skip(1)
+            .map(|l| l.split(',').collect::<Vec<_>>())
+            .map(|c| (c[9], [c[3], c[4], c[5], c[6], c[7], c[8], c[12]]))
+            .collect();
+        assert_eq!(got.len(), exp.len(), "bar 数量不一致");
+        for (b, (start, fields)) in got.iter().zip(&exp) {
+            assert_eq!(b.start_ms.to_string(), *start);
+            let oi = b
+                .extras
+                .get("open_interest")
+                .and_then(|e| e.as_decimal())
+                .unwrap();
+            let mine = [
+                b.open.to_string(),
+                b.high.to_string(),
+                b.low.to_string(),
+                b.close.to_string(),
+                b.volume.to_string(),
+                b.quote_volume.to_string(),
+                oi.to_string(),
+            ];
+            assert_eq!(mine, (*fields).map(str::to_string), "bar {start} 不一致");
+        }
     }
 }

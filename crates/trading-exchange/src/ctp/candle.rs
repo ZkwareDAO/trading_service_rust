@@ -26,6 +26,47 @@ use crate::market::{Kline, KlineExtra, KlineInterval};
 #[cfg(test)]
 const MINUTE_MS: i64 = 60_000;
 
+/// 疑似丢快照的最小间隔：同合约相邻已接受 tick 间隔超过它、且累计量仍有增量，
+/// 说明期间有成交但快照没收到（CTP 快照约 500ms 一笔）。
+const SNAPSHOT_GAP_MIN_MS: i64 = 1_000;
+
+/// 超过该间隔视为跨时段/断线空档（午休、夜盘-日盘、重连），不计入丢快照诊断。
+const SNAPSHOT_GAP_MAX_MS: i64 = 60_000;
+
+/// 尾段截断诊断阈值：有成交的桶，最后一笔 tick 距桶结束超过它即计一次。
+const TAIL_GAP_MIN_MS: i64 = 1_000;
+
+/// 聚合器诊断计数（周期告警用）：迟到/乱序丢弃与疑似丢快照。
+///
+/// 与 bar 数据正交：只做可观测性，不参与聚合判定。读取即清零（取增量）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CandleDiagnostics {
+    /// 所属桶已定稿后才到达、被丢弃的 tick 数。
+    pub late_dropped: u64,
+    /// 落在“最近定稿桶与在途桶之间空窗”的乱序 tick 数（被丢弃）。
+    pub reorder_dropped: u64,
+    /// 同一合约相邻 tick 间隔 >1s 且累计量有增量的次数（疑似丢快照）。
+    pub snapshot_gaps: u64,
+    /// 上述空档中的最大间隔（毫秒）。
+    pub worst_gap_ms: i64,
+    /// 有成交但桶内最后一笔 tick 距边界 >1s 的 bar 数（尾段截断上限；稀疏合约也会抬高）。
+    pub tail_gap_bars: u64,
+    /// 上述尾段缺口的最大值（毫秒）。
+    pub worst_tail_gap_ms: i64,
+}
+
+impl CandleDiagnostics {
+    /// 合并另一份增量：计数相加、最大值取大（跨合约周期汇总用）。
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.late_dropped += other.late_dropped;
+        self.reorder_dropped += other.reorder_dropped;
+        self.snapshot_gaps += other.snapshot_gaps;
+        self.worst_gap_ms = self.worst_gap_ms.max(other.worst_gap_ms);
+        self.tail_gap_bars += other.tail_gap_bars;
+        self.worst_tail_gap_ms = self.worst_tail_gap_ms.max(other.worst_tail_gap_ms);
+    }
+}
+
 /// 聚合器输入：一笔已映射好的 tick（B4 由 FFI 快照转换）。
 #[derive(Debug, Clone)]
 pub struct CandleTick {
@@ -94,6 +135,8 @@ struct OpenCandle {
     quote_volume: Decimal,
     /// 桶末持仓量（每笔覆盖；定稿进 extras.open_interest）。
     open_interest: Decimal,
+    /// 本桶最后一笔**已接受** tick 的事件时间（尾段截断诊断用）。
+    last_event_ms: i64,
 }
 
 impl OpenCandle {
@@ -131,12 +174,14 @@ impl OpenCandle {
             volume: volume_delta(t.cum_volume, base_volume),
             quote_volume: turnover_delta(t.cum_turnover, base_turnover),
             open_interest: t.open_interest,
+            last_event_ms: t.update_ms,
         }
     }
 
     /// 同桶内追加一笔：仅真实成交更新 OHLC；任何 tick 都刷新持仓/量额差分与最新价。
     fn fold(&mut self, t: &CandleTick, is_trade: bool) {
         self.last_price = t.price;
+        self.last_event_ms = t.update_ms;
         if is_trade {
             if self.has_trade {
                 // 已有成交：扩展 high/low、close 前移，open 保持不变。
@@ -207,6 +252,22 @@ impl OpenCandle {
     }
 }
 
+/// tick 丢弃原因（迟到 / 乱序）：分别计数，日志共用同一格式。
+#[derive(Debug, Clone, Copy)]
+enum DropReason {
+    Late,
+    OutOfOrder,
+}
+
+impl DropReason {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Late => "迟到：所属桶已定稿",
+            Self::OutOfOrder => "乱序：早于当前在途桶",
+        }
+    }
+}
+
 /// 单合约周期聚合器（本期仅 1 分钟；周期由 [`KlineInterval`] 参数化）。
 pub struct CandleAggregator {
     /// 交易所标识（写入 Kline.venue）。
@@ -219,13 +280,17 @@ pub struct CandleAggregator {
     /// 最近一次已定稿桶的（交易日, 绝对起点）；用于丢弃定稿后到达的迟到 tick。
     last_finalized: Option<(u32, i64)>,
     /// 最近一笔已并入 tick 的差分基线 `(交易日, 当日累计量, 当日累计额)`。**独立于在途桶
-    /// 存活**：墙钟 take 走桶后仍保留，使同日下一桶（含跨空档首笔）正确差分、量守恒；
+    /// 存活**：定稿 take 走桶后仍保留，使同日下一桶（含跨空档首笔）正确差分、量守恒；
     /// 交易日变化时按本笔重置。`None` = 尚无 tick。该元组同时是「成交判定」基线：
     /// 当日累计量严格增加才算真实成交。
     baseline: Option<(u32, i64, Decimal)>,
     /// 最近一根已定稿 bar 的 `(交易日, 收盘价)`：零成交桶的延续价来源。
     /// 跨交易日后不再沿用（定稿时按交易日过滤）。
     last_close: Option<(u32, Decimal)>,
+    /// 最近一笔**被接受** tick 的事件时间（丢快照诊断用；被迟到/乱序丢弃的 tick 不更新）。
+    last_event_ms: Option<i64>,
+    /// 诊断计数累加器（周期上报取增量）。
+    diag: CandleDiagnostics,
 }
 
 impl CandleAggregator {
@@ -242,6 +307,40 @@ impl CandleAggregator {
             last_finalized: None,
             baseline: None,
             last_close: None,
+            last_event_ms: None,
+            diag: CandleDiagnostics::default(),
+        }
+    }
+
+    /// 在途桶的当前到期边界（绝对起点 + 周期）；无在途桶返回 `None`。
+    ///
+    /// 供上层 [`crate::ctp::bar_agg::BarAggSink`] 维护“全局最小到期边界”：只有行情
+    /// 时间水位越过它时才需要遍历各合约 sweep，从而把定稿从「每 tick O(N)」降到
+    /// 「每分钟边界一次」。
+    pub fn next_due_ms(&self) -> Option<i64> {
+        self.open
+            .as_ref()
+            .map(|c| c.start_ms + self.interval.duration_ms())
+    }
+
+    /// 读取并清零诊断计数（周期日志取增量；不参与聚合判定）。
+    pub fn take_diagnostics(&mut self) -> CandleDiagnostics {
+        std::mem::take(&mut self.diag)
+    }
+
+    /// 疑似丢快照诊断：同合约相邻**已接受** tick 间隔 >1s 且累计量有增量，说明期间
+    /// 有成交但快照没收到。跨时段/断线空档（>60s）由调用方按交易时段天然排除。
+    fn note_snapshot_gap(&mut self, t: &CandleTick) {
+        let (Some(prev_ms), Some(ref base)) = (self.last_event_ms, self.baseline) else {
+            return;
+        };
+        let gap = t.update_ms - prev_ms;
+        if base.0 == t.trading_day
+            && (SNAPSHOT_GAP_MIN_MS..SNAPSHOT_GAP_MAX_MS).contains(&gap)
+            && t.cum_volume > base.1
+        {
+            self.diag.snapshot_gaps += 1;
+            self.diag.worst_gap_ms = self.diag.worst_gap_ms.max(gap);
         }
     }
 
@@ -251,7 +350,7 @@ impl CandleAggregator {
         matches!(self.last_finalized, Some((d, s)) if d == trading_day && start <= s)
     }
 
-    /// 记录某桶已定稿（事件时间墙钟 / poll 拍墙钟 / flush 收口都经此，防重复出棒）。
+    /// 记录某桶已定稿（事件时间收口 / 水位或空闲拍 sweep / flush 都经此，防重复出棒）。
     fn mark_finalized(&mut self, trading_day: u32, start: i64) {
         self.last_finalized = Some((trading_day, start));
     }
@@ -268,25 +367,30 @@ impl CandleAggregator {
         }
     }
 
-    /// 丢弃 tick 的统一 debug 日志（迟到 / 乱序两路共用），不改动任何状态。
-    fn trace_drop(&self, t: &CandleTick, start: i64, reason: &str) {
+    /// 丢弃 tick 的统一 debug 日志 + 计数（迟到 / 乱序两路共用），不改动聚合状态。
+    fn trace_drop(&mut self, t: &CandleTick, start: i64, reason: DropReason) {
+        match reason {
+            DropReason::Late => self.diag.late_dropped += 1,
+            DropReason::OutOfOrder => self.diag.reorder_dropped += 1,
+        }
         tracing::debug!(
             venue = %self.venue,
             symbol = %self.symbol,
             trading_day = t.trading_day,
             tick_ms = t.update_ms,
             bucket_start = start,
-            "丢弃 CTP tick：{reason}"
+            "丢弃 CTP tick：{}",
+            reason.text()
         );
     }
 
-    /// 喂入一笔 tick。**定稿唯一由墙钟判定**（grace=0，到 `start+interval` 边界即定稿）：
+    /// 喂入一笔 tick。**定稿由事件时间驱动**（到 `start+interval` 边界即到点）：
     /// 1. 先以本笔事件时间 [`Self::finalize_if_due`] 收口到边界的旧桶；若在途桶属上一交易日
-    ///    （trading_day 独立于分钟墙钟、跨日 ms 不可比）再按日切收口——两处都是 take，最多出一根；
+    ///    （trading_day 独立于分钟、跨日 ms 不可比）再按日切收口——两处都是 take，最多出一根；
     /// 2. 迟到 tick（所属 `(交易日,起点)` 已定稿）丢弃并 `debug!`，不重开/不并入；
     /// 3. 同桶 fold，否则开新桶。
     ///
-    /// 差分基线独立存在聚合器外层 `baseline`（见 [`Self::open_candle`]），故墙钟 take 走旧桶后
+    /// 差分基线独立存在聚合器外层 `baseline`（见 [`Self::open_candle`]），故定稿 take 走旧桶后
     /// 跨空档首笔的增量仍正确并入、量守恒。返回本笔触发收口的定稿 [`Kline`]（否则 `None`）。
     pub fn on_tick(&mut self, t: &CandleTick) -> Option<Kline> {
         let start = floor_interval(t.update_ms, self.interval.duration_ms());
@@ -297,13 +401,13 @@ impl CandleAggregator {
         }
         // 2) 迟到防护：收口后本笔仍落在已定稿桶 → 丢弃（刚收口的更早桶定稿照常上抛）。
         if self.is_late(t.trading_day, start) {
-            self.trace_drop(t, start, "迟到：所属桶已墙钟定稿");
+            self.trace_drop(t, start, DropReason::Late);
             return finished;
         }
         // 2b) 乱序防护：同交易日、tick 桶起点早于**当前在途桶**（介于最近定稿桶与在途桶之间的
         // 空窗乱序/重连快照）。它无桶可并，丢弃并保留在途桶与基线，绝不用旧桶覆盖在途桶。
         if matches!(&self.open, Some(c) if c.trading_day == t.trading_day && start < c.start_ms) {
-            self.trace_drop(t, start, "乱序：早于当前在途桶");
+            self.trace_drop(t, start, DropReason::OutOfOrder);
             return finished;
         }
         // 3) 同桶 fold；否则（首笔/墙钟已收口/跨日，在途必为空）开新桶。
@@ -316,12 +420,15 @@ impl CandleAggregator {
             }
             _ => self.open = Some(self.open_candle(t, start, is_trade)),
         }
-        // 推进外层差分基线（独立于在途桶存活，墙钟 take 不清它）。
+        // 丢快照诊断只统计**已接受**的相邻 tick（迟到/乱序不得抬高计数）。
+        self.note_snapshot_gap(t);
+        // 推进外层差分基线（独立于在途桶存活，定稿 take 不清它）。
         self.baseline = Some((t.trading_day, t.cum_volume, t.cum_turnover));
+        self.last_event_ms = Some(t.update_ms);
         finished
     }
 
-    /// 开新桶并定差分基线：同交易日接上一笔累计量（该笔可能属于已被墙钟 take 的旧桶，
+    /// 开新桶并定差分基线：同交易日接上一笔累计量（该笔可能属于已被定稿 take 的旧桶，
     /// 故基线存聚合器外层而非桶内）；跨交易日或当日首笔则累计归零、基线取本笔。
     fn open_candle(&self, t: &CandleTick, start: i64, is_trade: bool) -> OpenCandle {
         let (base_volume, base_turnover) = match self.baseline {
@@ -350,6 +457,12 @@ impl CandleAggregator {
                 _ => None,
             };
             let bar = c.finalize(&self.venue, &self.symbol, prev_close);
+            // 尾段截断诊断：有成交却在本分钟很早就停止收到 tick（旧墙钟 bug 的形态）。
+            let tail_gap = bar.end_ms - c.last_event_ms;
+            if c.has_trade && tail_gap >= TAIL_GAP_MIN_MS {
+                self.diag.tail_gap_bars += 1;
+                self.diag.worst_tail_gap_ms = self.diag.worst_tail_gap_ms.max(tail_gap);
+            }
             self.last_close = Some((c.trading_day, bar.close));
             bar
         })
@@ -1067,5 +1180,69 @@ mod tests {
         assert_eq!(b2.high, dec(1000));
         assert_eq!(b2.low, dec(1000));
         assert_eq!(b2.close, dec(1000));
+    }
+
+    // ===== 事件时间水位定稿 + 诊断计数（1m 与交易所口径对齐）=====
+
+    // 在途桶的到期边界 = start + interval，供 BarAggSink 做 O(1) 水位短路。
+    #[test]
+    fn next_due_ms_tracks_open_bucket_boundary() {
+        let mut agg = CandleAggregator::new("ctp", "cu2612", KlineInterval::M1);
+        assert_eq!(agg.next_due_ms(), None);
+        agg.on_tick(&tick(20261023, 600_000, 100, 10, 0, 0));
+        assert_eq!(agg.next_due_ms(), Some(660_000));
+        // 事件时间跨分钟收口后，边界推进到新桶。
+        agg.on_tick(&tick(20261023, 660_000, 101, 11, 0, 0));
+        assert_eq!(agg.next_due_ms(), Some(720_000));
+    }
+
+    // 定稿后的迟到 tick 丢弃并计数；读取即清零（周期告警取增量）。
+    #[test]
+    fn late_drop_is_counted_in_diagnostics() {
+        let mut agg = CandleAggregator::new("ctp", "cu2612", KlineInterval::M1);
+        agg.on_tick(&tick(20261023, 600_500, 100, 10, 0, 0));
+        assert!(agg.finalize_if_due(660_000).is_some());
+        agg.on_tick(&tick(20261023, 600_600, 99, 11, 0, 0));
+        let d = agg.take_diagnostics();
+        assert_eq!(d.late_dropped, 1);
+        assert_eq!(d.reorder_dropped, 0);
+        // 读取即清零，周期日志取的是增量。
+        assert_eq!(agg.take_diagnostics().late_dropped, 0);
+    }
+
+    // 疑似丢快照：相邻 tick 间隔 >1s 且累计量有增量才计数（无成交空档不算）。
+    #[test]
+    fn snapshot_gap_counted_only_when_cum_volume_advanced() {
+        let mut agg = CandleAggregator::new("ctp", "cu2612", KlineInterval::M1);
+        agg.on_tick(&tick(20261023, 600_000, 100, 10, 0, 0));
+        agg.on_tick(&tick(20261023, 602_500, 101, 15, 0, 0)); // 2.5s 空档且有成交
+        agg.on_tick(&tick(20261023, 604_500, 101, 15, 0, 0)); // 2s 空档但累计量不变
+        let d = agg.take_diagnostics();
+        assert_eq!(d.snapshot_gaps, 1);
+        assert_eq!(d.worst_gap_ms, 2_500);
+    }
+
+    // 迟到 tick 不得抬高丢快照计数（诊断只统计已接受 tick 的相邻间隔）。
+    #[test]
+    fn late_ticks_do_not_inflate_snapshot_gap_counter() {
+        let mut agg = CandleAggregator::new("ctp", "cu2612", KlineInterval::M1);
+        agg.on_tick(&tick(20261023, 600_000, 100, 10, 0, 0));
+        assert!(agg.finalize_if_due(660_000).is_some());
+        // 桶已定稿后的迟到 tick：间隔看似 >1s 且有成交，但必须不计入丢快照。
+        agg.on_tick(&tick(20261023, 602_000, 101, 11, 0, 0));
+        agg.on_tick(&tick(20261023, 603_500, 101, 12, 0, 0));
+        assert_eq!(agg.take_diagnostics().snapshot_gaps, 0);
+    }
+
+    // 尾段截断诊断：桶内最后一笔成交远早于边界即计数（旧墙钟 bug 会每根都触发）。
+    #[test]
+    fn tail_gap_counted_when_bar_ends_well_before_boundary() {
+        let mut agg = CandleAggregator::new("ctp", "cu2612", KlineInterval::M1);
+        agg.on_tick(&tick(20261023, 600_000, 100, 10, 0, 0));
+        agg.on_tick(&tick(20261023, 643_000, 101, 15, 0, 0)); // 10:00:43 后无 tick
+        assert!(agg.finalize_if_due(660_000).is_some());
+        let d = agg.take_diagnostics();
+        assert_eq!(d.tail_gap_bars, 1);
+        assert_eq!(d.worst_tail_gap_ms, 17_000);
     }
 }

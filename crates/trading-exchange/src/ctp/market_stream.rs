@@ -26,7 +26,7 @@ use trading_core::kline::{
 use trading_models::RawTick;
 
 use crate::ctp::bar_agg::BarAggSink;
-use crate::ctp::candle::CandleTick;
+use crate::ctp::candle::{CandleDiagnostics, CandleTick};
 use crate::ctp::dominant::{
     candidate_month_advances, contract_month, pick_dominant, product_prefix, ContractStat,
     DominantMetric,
@@ -347,14 +347,32 @@ impl CtpMarketStream {
         self.bar_agg.lock().unwrap().flush_all()
     }
 
-    /// 墙钟到点 sweep（md 线程每个 poll 节拍调一次，空闲超时拍也调）：把所有已收到过
-    /// tick 且到收盘边界（grace=0：start+interval ≤ now）的合约上一周期桶一次性定稿，先落盘再路由。
+    /// 墙钟到点 sweep：**仅限空闲拍**（`next_event` 超时、队列已空）由 md 线程调用，
+    /// 用于收盘/静默时收口最后一根，活跃行情一律走 [`Self::sweep_kline_by_watermark`]。
     ///
-    /// 与 [`Self::on_kline_tick`] 内的事件时间墙钟是同一判定——稀疏成交也由每拍 sweep 到边界定稿；
-    /// 两者对同一在途桶 `Option::take`，最多定稿一次。`now_ms` 由调用方按 SystemTime 注入，
-    /// 判定本身是纯函数，便于单测；锁内只做内存取桶/聚合（守 `BarSink::on_bar` 同步廉价契约）。
+    /// 调用方负责把本机墙钟按“已观测最小行情滞后”校正并减去 grace；否则时钟相对行情
+    /// 偏移时会在桶尾 tick 到达前提前定稿（旧实现“每分钟只吃到前 20–40 秒”的成因）。
+    /// 与 [`Self::on_kline_tick`] 的事件时间收口对同一在途桶 `Option::take`，最多定稿一次；
+    /// 锁内只做内存取桶/聚合（守 `BarSink::on_bar` 同步廉价契约）。
     pub fn sweep_kline_finalized(&self, now_ms: i64) -> Vec<Kline> {
         self.bar_agg.lock().unwrap().sweep_finalized(now_ms)
+    }
+
+    /// 行情时间水位 sweep（md 线程每个事件后调用；O(1) 短路）：用已处理 tick 的最大
+    /// 事件时间收口到点的在途桶，**不依赖本机 SystemTime**——行情滞后或本机时钟相对
+    /// 行情偏移时不会提前定稿截断桶尾。静默合约在别的合约推进水位后随之收口。
+    pub fn sweep_kline_by_watermark(&self) -> Vec<Kline> {
+        self.bar_agg.lock().unwrap().sweep_by_watermark()
+    }
+
+    /// 已处理 K线 tick 的最大事件时间（行情时钟水位）；0 表示尚无 tick。
+    pub fn kline_watermark_ms(&self) -> i64 {
+        self.bar_agg.lock().unwrap().watermark_ms()
+    }
+
+    /// K线聚合诊断增量（迟到/乱序丢弃、疑似丢快照）；读取即清零。
+    pub fn take_kline_diagnostics(&self) -> CandleDiagnostics {
+        self.bar_agg.lock().unwrap().take_diagnostics()
     }
 
     /// 收盘选举一轮（每日每品种一次）。
@@ -1386,5 +1404,28 @@ mod tests {
         assert_eq!(e.metric_value, Decimal::ZERO);
         assert!(e.pending.is_none());
         assert!(e.trading_day >= 20261026); // 北京当日
+    }
+
+    // 水位 sweep：静默合约在别的合约越过分钟边界后被完整收口，不依赖本机墙钟。
+    #[test]
+    fn sweep_kline_by_watermark_finalizes_complete_bucket() {
+        let (ticks, vols, doms) = tables();
+        let s = CtpMarketStream::new(ticks, vols, doms, dir_with(vec![]), Vec::new());
+        let persist = Arc::new(CountSink::default());
+        s.register_persistent_bar_sink(persist.clone() as Arc<dyn BarSink>);
+
+        s.on_kline_tick("cu2701", &mk(10, 600_000), &RawTickDepth::default());
+        s.on_kline_tick("cu2701", &mk(11, 659_500), &RawTickDepth::default());
+        // 水位尚未越过 660_000：不得定稿。
+        assert!(s.sweep_kline_by_watermark().is_empty());
+        assert_eq!(persist.count(), 0);
+
+        // 另一合约跨过边界推进水位，cu2701 完整一分钟被收口。
+        s.on_kline_tick("rb2701", &mk(3800, 660_000), &RawTickDepth::default());
+        let bars = s.sweep_kline_by_watermark();
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].symbol, "cu2701");
+        assert_eq!(bars[0].start_ms, 600_000);
+        assert_eq!(persist.count(), 1);
     }
 }

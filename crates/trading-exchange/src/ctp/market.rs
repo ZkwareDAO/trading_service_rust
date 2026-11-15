@@ -24,6 +24,23 @@ use crate::port::QuoteObserver;
 /// 行情事件等待超时（空闲轮询粒度）。
 const MD_POLL_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// 空闲拍（队列已空）墙钟收口的额外余量：本地行情时间越过桶边界后再等这么久才收口。
+/// 只用于收盘/静默的最后一根；活跃行情一律由事件时间水位定稿。
+const KLINE_IDLE_GRACE_MS: i64 = 2_000;
+
+/// K线聚合诊断上报间隔（迟到/乱序/疑似丢快照/行情滞后）。
+const KLINE_DIAG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 行情静默超过该时长（休市/长空档）时不再周期上报，避免刷屏。
+const KLINE_DIAG_SILENT_MS: i64 = 60_000;
+
+/// K线静默判定：业务 tick 仍在、但 K线超过该时长无 tick 时，允许墙钟兜底收口。
+const KLINE_IDLE_SWEEP_AFTER: Duration = Duration::from_secs(1);
+
+/// 未来时间戳上限：超过 `now + 该值` 的 K线 tick 视为柜台 ActionDay 脏数据。
+/// 取 30 分钟：正常时钟偏差不会被误杀，又能挡住“次日/下周一”量级的跳变。
+const KLINE_MAX_FUTURE_MS: i64 = 30 * 60_000;
+
 /// 会话内订阅集对账周期（业务 ∪ K线）；tick 很密，避免每个事件都扫仓储。
 const MD_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -403,10 +420,28 @@ fn run_md_session(
     };
     let mut last_reconcile = std::time::Instant::now();
     let mut reconcile_due = true;
+    // 已观测到的最小“本机墙钟 − 行情事件时间”（毫秒）：只用于空闲拍墙钟校正，
+    // 时钟/行情持续滞后时不会把桶边界误判为已过；`i64::MAX` = 尚未观测到 tick。
+    let mut min_lag_ms = i64::MAX;
+    let mut last_kline_diag = std::time::Instant::now();
+    // K线最近一次有 tick / 最近一次空闲拍墙钟 sweep：业务 tick 仍活跃但 K线静默时，
+    // 仍需收口 K线最后一根（否则 `idle` 永远为 false）。
+    let mut last_kline_tick = std::time::Instant::now();
+    let mut last_wallclock_sweep = std::time::Instant::now();
+    // 诊断增量基准：FFI 回调数 / 已 drain 事件数 / 通道阻塞纳秒。
+    let mut drained_ticks: u64 = 0;
+    let mut last_cb: u64 = 0;
+    let mut last_drained: u64 = 0;
+    let mut last_blocked: u64 = 0;
+    let mut kline_ticks: u64 = 0;
+    let mut last_kline: u64 = 0;
 
     // tick 消费：断开即结束本会话交外循环重连；停机即整体退出。
     while !stop.load(Ordering::SeqCst) {
-        match md.next_event(MD_POLL_TIMEOUT) {
+        let event = md.next_event(MD_POLL_TIMEOUT);
+        // 队列为空（超时）即“空闲拍”：唯一允许用墙钟兜底收口的时机。
+        let idle = event.is_none();
+        match event {
             // 逐符号订阅应答：成功码 0 记 debug（避免 62 条刷屏），非 0 显式 warn，
             // 用于定位「整批订阅中部分合约（如某交易所批次）被柜台静默拒绝」。
             Some(MdEvent::Subscribed {
@@ -421,6 +456,13 @@ fn run_md_session(
                 }
             }
             Some(MdEvent::Tick(t)) => {
+                drained_ticks += 1;
+                // 事件时间只合成一次：既做空闲拍滞后校正，也用于 K 线聚合与脏时间戳防护。
+                let tick_ms = t.update_utc_ms();
+                if let Some(ms) = tick_ms {
+                    let lag = now_ms().saturating_sub(ms).max(0);
+                    min_lag_ms = min_lag_ms.min(lag);
+                }
                 // 诊断：逐笔 tick 合约/最新价/买卖一（debug，用于确认各所实时行情是否进表）。
                 tracing::debug!(
                     instrument = %t.instrument,
@@ -432,6 +474,9 @@ fn run_md_session(
                 // 作用域判定：业务兴趣集 / K线期望集（每拍对账更新，O(1) 查询）。
                 let in_business = subs.business.contains(&t.instrument);
                 let in_kline = subs.kline.contains(&t.instrument);
+                if in_kline {
+                    kline_ticks += 1;
+                }
 
                 // 业务集 → QuoteTable + observer（原样）。
                 if in_business {
@@ -452,21 +497,33 @@ fn run_md_session(
                         let day = t.trading_day_u32();
                         if day != 0 {
                             if let (Some(update_ms), Some(price)) =
-                                (t.update_utc_ms(), Decimal::try_from(t.last_price).ok())
+                                (tick_ms, Decimal::try_from(t.last_price).ok())
                             {
-                                let candle = crate::ctp::bar_agg::to_candle_tick(
-                                    day,
-                                    t.exchange_id.clone(),
-                                    update_ms,
-                                    price,
-                                    t.volume as i64,
-                                    Decimal::try_from(t.turnover).unwrap_or(Decimal::ZERO),
-                                    Decimal::try_from(t.open_interest).unwrap_or(Decimal::ZERO),
-                                );
-                                // 日 OHLC + 五档随同一快照落 RawTick（CandleTick 不扩字段）。
-                                let depth =
-                                    crate::ctp::market_stream::RawTickDepth::from(t.as_ref());
-                                k.stream.on_kline_tick(&t.instrument, &candle, &depth);
+                                if is_future_tick(update_ms, now_ms()) {
+                                    // 柜台把 ActionDay 填成 TradingDay（次日/下周一）时，单条
+                                    // 快照会把全局水位永久推到未来，随后当日 tick 全被判迟到。
+                                    // 此类脏时间戳不进 K 线聚合（业务报价路径不受影响）。
+                                    tracing::warn!(
+                                        instrument = %t.instrument,
+                                        tick_ms = update_ms,
+                                        "丢弃未来时间戳的 K线 tick（疑似 ActionDay 脏数据）"
+                                    );
+                                } else {
+                                    let candle = crate::ctp::bar_agg::to_candle_tick(
+                                        day,
+                                        t.exchange_id.clone(),
+                                        update_ms,
+                                        price,
+                                        t.volume as i64,
+                                        Decimal::try_from(t.turnover).unwrap_or(Decimal::ZERO),
+                                        Decimal::try_from(t.open_interest).unwrap_or(Decimal::ZERO),
+                                    );
+                                    // 日 OHLC + 五档随同一快照落 RawTick（CandleTick 不扩字段）。
+                                    let depth =
+                                        crate::ctp::market_stream::RawTickDepth::from(t.as_ref());
+                                    k.stream.on_kline_tick(&t.instrument, &candle, &depth);
+                                    last_kline_tick = std::time::Instant::now();
+                                }
                             }
                         }
                     }
@@ -482,15 +539,52 @@ fn run_md_session(
             _ => {}
         }
         // 每个事件后：
-        // 1) 墙钟 sweep 定稿已到边界（grace=0：start+interval ≤ now）的上一周期 K线——
-        //    稀疏成交也无需等下一周期首笔 tick，最坏定稿延迟 ≈ 一个 poll 节拍（约 1s）；
-        //    不新增 sleep/线程（新周期首笔 tick 另在 on_tick 内以事件时间走同一墙钟判定）；
+        // 1) K线定稿：事件拍走事件时间水位（不读 SystemTime）；仅当“队列空”或“K线已
+        //    静默 ≥1s”（业务 tick 仍在跑）时，才用校正后的墙钟兜底收口最后一根；
         // 2) 订阅对账按 ~1s 节流：tick 很密，不能每个事件都扫仓位/规则仓储；对账内容为
         //    业务兴趣 ∪ K线期望 的并集，会话内增减无需断线重连。
         if let Some(k) = kline {
-            let swept = k.stream.sweep_kline_finalized(now_ms());
-            if !swept.is_empty() {
-                tracing::debug!(count = swept.len(), "CTP 墙钟 sweep 定稿 K线");
+            let kline_idle = last_kline_tick.elapsed() >= KLINE_IDLE_SWEEP_AFTER;
+            if idle || (kline_idle && last_wallclock_sweep.elapsed() >= KLINE_IDLE_SWEEP_AFTER) {
+                last_wallclock_sweep = std::time::Instant::now();
+                // 先把本机墙钟按“已观测最小行情滞后”校正成行情时间，再留 grace——即便
+                // 本机时钟相对行情偏移，也不会在桶尾 tick 到达前提前定稿。
+                let feed_now = now_ms().saturating_sub(feed_offset_ms(min_lag_ms));
+                let swept = k
+                    .stream
+                    .sweep_kline_finalized(feed_now.saturating_sub(KLINE_IDLE_GRACE_MS));
+                if !swept.is_empty() {
+                    tracing::debug!(count = swept.len(), "CTP 空闲拍墙钟 sweep 定稿 K线");
+                }
+            } else {
+                // 事件拍：水位定稿（水位未越界时 O(1) 返回），绝不读本机墙钟。
+                let swept = k.stream.sweep_kline_by_watermark();
+                if !swept.is_empty() {
+                    tracing::debug!(count = swept.len(), "CTP 水位 sweep 定稿 K线");
+                }
+            }
+            // 周期诊断：迟到/乱序/疑似丢快照 + 行情滞后 + 回调/消费/背压增量
+            // （休市静默不上报，避免刷屏）。
+            if last_kline_diag.elapsed() >= KLINE_DIAG_INTERVAL {
+                last_kline_diag = std::time::Instant::now();
+                let cb = md.tick_callback_count();
+                let blocked = md.send_blocked_nanos();
+                let cb_delta = cb.saturating_sub(last_cb);
+                let drained_delta = drained_ticks.saturating_sub(last_drained);
+                let blocked_delta = blocked.saturating_sub(last_blocked);
+                let kline_delta = kline_ticks.saturating_sub(last_kline);
+                last_cb = cb;
+                last_drained = drained_ticks;
+                last_blocked = blocked;
+                last_kline = kline_ticks;
+                report_kline_diagnostics(
+                    &k.stream,
+                    min_lag_ms,
+                    cb_delta,
+                    drained_delta,
+                    kline_delta,
+                    blocked_delta,
+                );
             }
         }
         if reconcile_due || last_reconcile.elapsed() >= MD_RECONCILE_INTERVAL {
@@ -694,6 +788,76 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// 是否未来时间戳脏数据：柜台把 `ActionDay` 误填成 `TradingDay`（次日/下周一）时，
+/// 单条快照会把全局水位永久推到未来，随后当日 tick 全被判迟到。
+fn is_future_tick(tick_ms: i64, now_ms: i64) -> bool {
+    tick_ms > now_ms.saturating_add(KLINE_MAX_FUTURE_MS)
+}
+
+/// 空闲拍墙钟校正量：已观测到的“本机墙钟 − 行情事件时间”最小值。
+/// `i64::MAX`（尚未观测到任何 tick）与负值都按 0 处理（不校正）。
+fn feed_offset_ms(min_lag_ms: i64) -> i64 {
+    if min_lag_ms == i64::MAX {
+        0
+    } else {
+        min_lag_ms.max(0)
+    }
+}
+
+/// K线聚合诊断上报：迟到/乱序丢弃、疑似丢快照、行情水位滞后与时钟偏移。
+/// 行情静默（休市/长空档）时直接跳过，避免周期刷屏。
+fn report_kline_diagnostics(
+    stream: &crate::ctp::market_stream::CtpMarketStream,
+    min_lag_ms: i64,
+    tick_cb_delta: u64,
+    drained_delta: u64,
+    kline_delta: u64,
+    blocked_ns_delta: u64,
+) {
+    let watermark = stream.kline_watermark_ms();
+    if watermark <= 0 {
+        return;
+    }
+    let drain_lag = now_ms().saturating_sub(watermark).max(0);
+    if drain_lag > KLINE_DIAG_SILENT_MS {
+        return;
+    }
+    let d = stream.take_kline_diagnostics();
+    // 回调数 − 已消费数：窗口内通道积压增量（>0 说明 drain 落后）。
+    let backlog = tick_cb_delta as i64 - drained_delta as i64;
+    let blocked_ms = blocked_ns_delta as f64 / 1_000_000.0;
+    if d.late_dropped > 0 || d.reorder_dropped > 0 || d.snapshot_gaps > 0 || blocked_ns_delta > 0 {
+        tracing::warn!(
+            late_dropped = d.late_dropped,
+            reorder_dropped = d.reorder_dropped,
+            snapshot_gaps = d.snapshot_gaps,
+            worst_gap_ms = d.worst_gap_ms,
+            tail_gap_bars = d.tail_gap_bars,
+            worst_tail_gap_ms = d.worst_tail_gap_ms,
+            tick_callbacks = tick_cb_delta,
+            drained_ticks = drained_delta,
+            kline_ticks = kline_delta,
+            tick_queue_backlog_delta = backlog,
+            send_blocked_ms = blocked_ms,
+            drain_lag_ms = drain_lag,
+            feed_offset_ms = feed_offset_ms(min_lag_ms),
+            "CTP K线聚合诊断：存在丢弃/疑似丢快照/背压"
+        );
+    } else {
+        tracing::info!(
+            tail_gap_bars = d.tail_gap_bars,
+            worst_tail_gap_ms = d.worst_tail_gap_ms,
+            tick_callbacks = tick_cb_delta,
+            drained_ticks = drained_delta,
+            kline_ticks = kline_delta,
+            tick_queue_backlog_delta = backlog,
+            drain_lag_ms = drain_lag,
+            feed_offset_ms = feed_offset_ms(min_lag_ms),
+            "CTP K线聚合诊断正常"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1153,5 +1317,28 @@ mod tests {
 
         assert!(quotes.get(&a).is_some(), "仍在业务集的盘口必须保留");
         assert!(quotes.get(&b).is_none(), "业务释放的盘口必须清理");
+    }
+
+    #[test]
+    fn future_tick_guard_allows_skew_rejects_day_jump() {
+        let now = 1_000_000_000;
+        assert!(!is_future_tick(now, now));
+        assert!(!is_future_tick(now - 5_000, now));
+        // 上限内（含边界）放行：正常时钟偏差不能误杀。
+        assert!(!is_future_tick(now + KLINE_MAX_FUTURE_MS, now));
+        assert!(is_future_tick(now + KLINE_MAX_FUTURE_MS + 1, now));
+        // ActionDay 填成次日：跳变数小时 → 拒绝。
+        assert!(is_future_tick(now + 3 * 3_600_000, now));
+    }
+
+    #[test]
+    fn feed_offset_defaults_to_zero_and_clamps_negative() {
+        // 尚未观测到 tick：不校正。
+        assert_eq!(feed_offset_ms(i64::MAX), 0);
+        // 本机时钟落后行情（负滞后）：不校正，宁可晚收口也不提前定稿。
+        assert_eq!(feed_offset_ms(-5), 0);
+        // 观测到的最小滞后照常扣除。
+        assert_eq!(feed_offset_ms(1_500), 1_500);
+        assert_eq!(feed_offset_ms(0), 0);
     }
 }
