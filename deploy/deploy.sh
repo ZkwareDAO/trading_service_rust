@@ -156,6 +156,9 @@ chown "$RUN_USER:$RUN_USER" "${OPT_ROOT}/bin/manage.sh"
 ln -sf "${OPT_ROOT}/bin/manage.sh" "$MANAGE_LINK"
 # start.sh：deploy 本身不启动服务；配置完成后由用户执行本脚本。
 install -m 0755 -o "$RUN_USER" -g "$RUN_USER" "$SCRIPT_DIR/start.sh" "${OPT_ROOT}/bin/start.sh"
+# venue.toml 缺失键合并脚本（方案 B：只补缺键，不改已有值/注释）。
+# 仅由 deploy（root）执行，安装为 root 属主，避免运行用户可篡改后被 root 执行。
+install -m 0755 "$SCRIPT_DIR/merge_venue_config.py" "${OPT_ROOT}/bin/merge_venue_config.py"
 
 # ——— 4. 配置文件（已存在则不动，保留用户调优） ———
 # 首次安装时向 [ctp] 注入 .so 安装路径；不触碰 md_front/md_account。
@@ -194,6 +197,21 @@ if [ ! -f "$CONF_DIR/venue.toml" ]; then
   echo "          脚本不会修改；请确认属于本机柜台并手动替换。"
 else
   echo "    $CONF_DIR/venue.toml 已存在，跳过（如需更新 [ctp] .so 路径请手动编辑）"
+fi
+
+# 方案 B：模板每次部署都落一份 venue.toml.example（可覆盖），live 只补缺失键：
+# 新增配置会自动到位，已有用户值/注释一律不动；live 多出的废弃键保留（代码宽容）。
+install -m 0644 "$PROJECT_DIR/config/venue.toml" "$CONF_DIR/venue.toml.example"
+if [ -f "$CONF_DIR/venue.toml" ]; then
+  if python3 -c 'import tomllib' >/dev/null 2>&1; then
+    if ! python3 "${OPT_ROOT}/bin/merge_venue_config.py" \
+      --template "$PROJECT_DIR/config/venue.toml" \
+      --live "$CONF_DIR/venue.toml"; then
+      echo "    配置合并失败：请对照 $CONF_DIR/venue.toml.example 手动补充新增键" >&2
+    fi
+  else
+    echo "    未检测到 python3 + tomllib：已安装 venue.toml.example，请手动对照补充新增键"
+  fi
 fi
 
 # ——— 5. account.csv 初始化（不存在则只建表头，存在则不动） ———
