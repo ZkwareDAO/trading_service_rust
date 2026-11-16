@@ -89,21 +89,19 @@ struct BarClient {
 /// bar 定稿路由器：bar 到达时分发给期望集命中的 K线消费者，坏/慢者摘除。
 /// 同时作为 [`BarAggSink`] 的下游 [`BarSink`]。
 ///
-/// 主力过滤在此按**每个消费者的订阅意图**判定：精确订阅某合约（如 cu2611）无条件
-/// 收它的 bar（即便不是主力）；仅订阅品种（如 cu）时，才要求该 bar 合约是当前主力。
+/// 本层只做**订阅成员过滤**：精确订阅某合约（如 cu2611）或订阅了其品种前缀
+/// （如 cu）即放行。“品种订阅是否只推当前主力 / 全部合约”由南向路由层按订阅
+/// 开关（`all_contracts`）与主力表判定，适配层不再过滤。
 struct BarRouter {
     next_id: Mutex<u64>,
     clients: Mutex<Vec<BarClient>>,
-    /// 主力表（品种 → 当前主力），仅对「品种」订阅做过滤；具体合约订阅不查它。
-    dominants: Arc<DominantTable>,
 }
 
 impl BarRouter {
-    fn new(dominants: Arc<DominantTable>) -> Self {
+    fn new() -> Self {
         Self {
             next_id: Mutex::new(0),
             clients: Mutex::new(Vec::new()),
-            dominants,
         }
     }
 
@@ -123,26 +121,13 @@ impl BarRouter {
         self.clients.lock().unwrap().retain(|c| c.id != id);
     }
 
-    /// 某消费者是否应收该 bar：
-    /// 1) 精确订阅该合约（source 含合约号）→ 无条件放行（具体合约订阅直收，不查主力）；
-    /// 2) 仅订阅了该合约所属**品种**（source 含 cu 这样的前缀）→ 合约必须是当前主力，
-    ///    无主力记录则暂不放行（等收盘选举/重启沿用值）。
-    fn client_accepts(
-        source_symbols: &HashSet<String>,
-        symbol: &str,
-        dominants: &DominantTable,
-    ) -> bool {
+    /// 某消费者是否应收该 bar：精确订阅该合约，或订阅了该合约所属**品种**前缀
+    /// （如 cu）即放行。主力/全部合约的范围过滤在下游南向路由层完成。
+    fn client_accepts(source_symbols: &HashSet<String>, symbol: &str) -> bool {
         if source_symbols.contains(symbol) {
             return true;
         }
-        if let Some(product) = product_prefix(symbol) {
-            if source_symbols.contains(&product) {
-                return dominants
-                    .dominant_symbol(&product)
-                    .is_some_and(|dom| dom == symbol);
-            }
-        }
-        false
+        product_prefix(symbol).is_some_and(|product| source_symbols.contains(&product))
     }
 
     fn dispatch(&self, bar: &Kline) -> usize {
@@ -153,7 +138,7 @@ impl BarRouter {
                 .iter()
                 .filter(|c| {
                     let syms: HashSet<String> = c.source.symbols().into_iter().collect();
-                    Self::client_accepts(&syms, &bar.symbol, &self.dominants)
+                    Self::client_accepts(&syms, &bar.symbol)
                 })
                 .map(|c| (c.id, Arc::clone(&c.sink)))
                 .collect()
@@ -207,7 +192,7 @@ impl CtpMarketStream {
         instrument_dir: Arc<InstrumentDir>,
         kline_products: Vec<String>,
     ) -> Arc<Self> {
-        let router = Arc::new(BarRouter::new(Arc::clone(&dominants)));
+        let router = Arc::new(BarRouter::new());
         let bar_agg = BarAggSink::new("ctp", router.clone() as Arc<dyn BarSink>, KlineInterval::M1);
         Arc::new(Self {
             next_price_id: Mutex::new(0),
@@ -813,7 +798,9 @@ mod tests {
     }
 
     #[test]
-    fn kline_tick_writes_tables_and_routes_only_dominant() {
+    fn kline_tick_writes_tables_and_routes_all_subscribed_contracts() {
+        // 主力表照常写入（选举/诊断用），但 BarRouter 不再按主力过滤：品种订阅
+        // 下主力与非主力合约的定稿 bar 都放行，范围取舍交给南向路由层。
         let (ticks, vols, doms) = tables();
         doms.put(
             "cu",
@@ -831,13 +818,13 @@ mod tests {
             .subscribe_klines(Arc::new(FixedSymbols::new(vec!["cu".into()])), sink.clone())
             .unwrap();
 
-        // 非主力 cu2511 跨分钟：聚合但不路由。
+        // 非主力 cu2511 跨分钟：聚合且放行 1 根。
         s.on_kline_tick("cu2511", &mk(10, 600_000), &RawTickDepth::default());
         s.on_kline_tick("cu2511", &mk(11, 660_000), &RawTickDepth::default());
-        // 主力 cu2512 跨分钟：定稿路由 1 根。
+        // 主力 cu2512 跨分钟：定稿放行 1 根。
         s.on_kline_tick("cu2512", &mk(20, 600_000), &RawTickDepth::default());
         s.on_kline_tick("cu2512", &mk(25, 660_000), &RawTickDepth::default());
-        assert_eq!(sink.count(), 1);
+        assert_eq!(sink.count(), 2);
 
         // WAL 每笔留档：cu2511×2（非主力也留）+ cu2512×2，共 4 行待刷盘。
         let pending = s.ticks.snapshot();
@@ -855,32 +842,22 @@ mod tests {
     }
 
     #[test]
-    fn bar_routing_keeps_exact_but_filters_product_by_dominant() {
-        // 纯判定：精确合约订阅不查主力；品种订阅仅放行主力；无主力记录暂不放行。
-        let doms = Arc::new(DominantTable::new());
-        doms.put(
-            "cu",
-            DominantEntry {
-                symbol: "cu2512".into(),
-                trading_day: 20261023,
-                metric_value: Decimal::ZERO,
-                pending: None,
-            },
-        );
+    fn bar_routing_passes_exact_and_product_subscribed_contracts() {
+        // 纯判定：精确订阅直收；品种订阅放行该品种全部合约（主力/范围由南向判定）。
         let want = |syms: &[&str], bar: &str| {
             let set: HashSet<String> = syms.iter().map(|s| s.to_string()).collect();
-            BarRouter::client_accepts(&set, bar, &doms)
+            BarRouter::client_accepts(&set, bar)
         };
 
-        // 精确订阅非主力 cu2611：放行。
+        // 精确订阅 cu2611：只收自身。
         assert!(want(&["cu2611"], "cu2611"));
-        // 品种订阅 cu：主力 cu2512 放行、非主力 cu2611 拦截。
+        assert!(!want(&["cu2611"], "cu2512"));
+        // 品种订阅 cu：主力/非主力都放行。
         assert!(want(&["cu"], "cu2512"));
-        assert!(!want(&["cu"], "cu2611"));
-        // 完全不相关：拦截。
+        assert!(want(&["cu"], "cu2611"));
+        // 完全不相关：拦截（品种订阅 rb 不收 cu 的 bar）。
         assert!(!want(&["rb"], "cu2512"));
-        // 未选举品种 rb：品种订阅暂无主力记录，不放行。
-        assert!(!want(&["rb"], "rb2611"));
+        assert!(want(&["rb"], "rb2611"));
     }
 
     #[test]

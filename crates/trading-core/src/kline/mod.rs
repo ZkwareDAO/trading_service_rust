@@ -26,6 +26,6 @@ pub use gap::{
     coalesce_starts, detect_tail_gap, scan_gaps, stall_gap, GapRange, GapRegistry, GapSeries,
     PendingGap,
 };
-pub use registry::{KlineKey, KlineRegistry};
+pub use registry::{product_prefix, BarTarget, KlineKey, KlineRegistry};
 pub use source::RegistrySource;
 pub use tick::TickTable;

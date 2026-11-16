@@ -143,6 +143,11 @@ pub struct SouthCommand {
     /// K线周期；缺省/仅支持 "1m"。
     #[serde(default)]
     pub interval: Option<String>,
+    /// K线订阅范围开关：false/缺省＝品种前缀订阅只推当前主力合约；
+    /// true＝推该品种全部在交易合约。仅对品种前缀（如 CTP `cu`）生效，
+    /// 具体合约订阅（如 `cu2512`）不受影响；非 CTP 所无品种语义，开关为 no-op。
+    #[serde(default, alias = "allContracts")]
+    pub all_contracts: Option<bool>,
 
     // —— get_klines 专用（其余命令忽略；全部可选）——
     /// 历史 K线查询起点（UTC 毫秒，含）；缺省=取最近 N 根。
@@ -762,6 +767,23 @@ mod tests {
         let old: SouthCommand = serde_json::from_str(r#"{"option":"place_order"}"#).unwrap();
         assert!(old.symbols.is_empty());
         assert_eq!(old.interval, None);
+    }
+
+    #[test]
+    fn subscribe_kline_all_contracts_defaults_none_and_parses_alias() {
+        // 缺省＝只推主力（None）；显式 true/false 与驼峰别名都要能解析。
+        let raw = r#"{"option":"subscribe_kline","exchange":"ctp","symbols":["cu"]}"#;
+        let cmd: SouthCommand = serde_json::from_str(raw).unwrap();
+        assert_eq!(cmd.all_contracts, None);
+
+        let raw = r#"{"option":"subscribe_kline","exchange":"ctp","symbols":["cu"],"all_contracts":true}"#;
+        let cmd: SouthCommand = serde_json::from_str(raw).unwrap();
+        assert_eq!(cmd.all_contracts, Some(true));
+
+        let raw =
+            r#"{"option":"subscribe_kline","exchange":"ctp","symbols":["cu"],"allContracts":true}"#;
+        let cmd: SouthCommand = serde_json::from_str(raw).unwrap();
+        assert_eq!(cmd.all_contracts, Some(true));
     }
 
     #[test]

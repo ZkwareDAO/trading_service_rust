@@ -4,8 +4,8 @@
 //! 定稿 [`Kline`]，**一律**经注入的 [`BarSink`]（即 [`crate::ctp::market_stream::BarRouter`]）
 //! 上抛；本类型不做主力过滤。
 //!
-//! 「品种订阅只收主力 / 具体合约订阅直收」的路由判定在 `BarRouter::dispatch`：
-//! 它掌握每个消费者的订阅符号，精确合约命中无条件放行，仅品种前缀命中才查主力表。
+//! `BarRouter` 只做**订阅成员过滤**（精确合约或品种前缀命中即放行）；「品种订阅
+//! 只收主力 / 全部合约」的范围判定在南向 K线服务（`trading-service::kline`）。
 //! 聚合器对 K线集内所有合约（含非主力）一律聚合，使 tick→bar 采集不因过滤丢失。
 //!
 //! 本类型**不做主力选举**（选举在 [`crate::ctp::dominant`] + 收盘任务）。
@@ -30,7 +30,7 @@ pub struct BarAggSink {
     /// 合约 → 聚合器（按出现的合约懒创建）。用 BTreeMap 使 sweep/flush 定稿序确定
     /// （按符号有序），多合约定稿聚成一条有序 `kline_1m_batch`。
     aggregators: BTreeMap<String, CandleAggregator>,
-    /// 定稿 bar 的下游（BarRouter 按订阅意图 + 主力表路由给 K线消费者）。
+    /// 定稿 bar 的下游（BarRouter 按订阅成员放行；范围/主力由南向 K线服务判定）。
     sink: Arc<dyn BarSink>,
     /// 无条件下游（如全量持久化 sink）：**绕过订阅/主力路由**，每根定稿 bar
     /// （含非主力、零订阅）都通知；策略/边沿告警/panic 摘除与自愈统一由
@@ -92,7 +92,7 @@ impl BarAggSink {
     }
 
     /// 喂入一笔 K线集 tick：更新对应合约聚合器，分钟翻转即把定稿 bar 交下游路由。
-    /// 是否真正推给某消费者（品种订阅需主力）由下游 BarRouter 判定。
+    /// 是否真正推给某消费者（品种订阅的主力/全合约范围）由南向 K线服务判定。
     /// 同路径的 TickTable/LastVolume 写入由 drain 调用点负责。
     pub fn on_tick(&mut self, symbol: &str, t: &CandleTick) {
         let venue = self.venue.clone();
@@ -273,7 +273,8 @@ mod tests {
 
     #[test]
     fn finalized_bar_emitted_for_every_contract_without_dominant_filter() {
-        // 聚合层不再懂主力：任何 K线集合约跨分钟定稿都上抛下游（过滤在 BarRouter）。
+        // 聚合层不管主力/订阅范围：任何 K线集合约跨分钟定稿都上抛下游（成员过滤在
+        // BarRouter，范围过滤在南向 K线服务）。
         let sink = Arc::new(RecSink::default());
         let mut agg = BarAggSink::new("ctp", sink.clone() as Arc<dyn BarSink>, KlineInterval::M1);
 

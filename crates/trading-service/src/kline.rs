@@ -23,7 +23,8 @@ use std::thread;
 use std::time::Duration;
 
 use trading_core::kline::{
-    detect_tail_gap, BarTable, GapRegistry, KlineRegistry, RegistrySource, SeriesKey, TickTable,
+    detect_tail_gap, product_prefix, BarTable, BarTarget, DominantTable, GapRegistry,
+    KlineRegistry, RegistrySource, SeriesKey, TickTable,
 };
 use trading_core::protocol::{ClientEvent, KlineEvent};
 use trading_exchange::market::{
@@ -524,29 +525,52 @@ impl BarSink for PersistenceBarSink {
 /// 单独负责，避免重复 append。
 struct FanoutBarSink {
     registry: Arc<KlineRegistry>,
+    /// CTP 主力表：仅用于「品种订阅且未开 all_contracts」时的主力过滤；其余所不查。
+    dominants: Arc<DominantTable>,
     /// 命中策略的 bar 入此聚合缓冲（service 与推送线程共享同一句柄）。
     batcher: KlineBatcher,
 }
 
 impl FanoutBarSink {
+    /// 某订阅目标是否应收该 bar：精确订阅无条件收；品种订阅在 all_contracts=true
+    /// 时全收，false 时仅收当前主力（CTP 语义；非 CTP 无品种展开，保持原样放行）。
+    fn accepts(&self, target: &BarTarget, bar: &StreamKline) -> bool {
+        if target.exact || target.all_contracts || bar.venue != "ctp" {
+            return true;
+        }
+        let Some(product) = product_prefix(&bar.symbol) else {
+            return false;
+        };
+        self.dominants
+            .dominant_symbol(&product)
+            .is_some_and(|dom| dom == bar.symbol)
+    }
+
     fn fan_out(&self, bar: &StreamKline) {
-        // 查订阅者（精确/品种前缀），逐连接把 bar 入批量缓冲；发送（满/断即丢）延后到
-        // 后台推送线程，保证 on_bar 同步纯内存、绝不阻塞行情 drain（safe_notify <1ms 契约）。
+        // 查订阅目标（精确/品种前缀 + 订阅范围），逐连接把 bar 入批量缓冲；发送（满/断
+        // 即丢）延后到后台推送线程，保证 on_bar 同步纯内存、绝不阻塞行情 drain
+        //（safe_notify <1ms 契约）。登记表已按客户端合并，同一 bar 不会重复入缓冲。
         let itype = venue_itype(&bar.venue);
         let targets =
             self.registry
-                .strategies_for_bar(&bar.venue, itype, bar.interval.as_str(), &bar.symbol);
+                .targets_for_bar(&bar.venue, itype, bar.interval.as_str(), &bar.symbol);
+        let mut recipients = 0usize;
+        for target in targets {
+            if !self.accepts(&target, bar) {
+                continue;
+            }
+            recipients += 1;
+            self.batcher
+                .push(&target.client, &bar.venue, kline_event(bar));
+        }
         tracing::debug!(
             venue = %bar.venue,
             symbol = %bar.symbol,
             trading_day = bar.trading_day,
             volume = bar.volume,
-            recipients = targets.len(),
+            recipients,
             "定稿 bar fan-out（入批量推送缓冲）"
         );
-        for strategy in targets {
-            self.batcher.push(&strategy, &bar.venue, kline_event(bar));
-        }
     }
 }
 
@@ -581,6 +605,8 @@ impl DesiredSource for BaselineDesired {
 pub struct KlineService {
     /// 客户端订阅登记表（南向命令写入；sink 读路由、来源读快照）。
     registry: Arc<KlineRegistry>,
+    /// CTP 主力表（南向品种订阅的“只推主力”判定；仅 fanout 读）。
+    dominants: Arc<DominantTable>,
     /// 定稿 bar 待刷盘窗口。
     bars: Arc<BarTable>,
     /// CTP 原始 tick WAL（仅 CTP 适配层写；flush 线程读）。
@@ -633,9 +659,11 @@ impl KlineService {
     ) -> Self {
         let bars = store.bar_table();
         let gaps = store.gap_registry();
+        let dominants = store.ctp_dominants();
         let gap_scanner = GapScanner::new(Arc::clone(&bars), Arc::clone(&gaps), gap_cfg);
         Self {
             registry: store.kline_registry(),
+            dominants,
             bars,
             ticks: store.ctp_ticks(),
             repo: store.kline_repo(),
@@ -723,6 +751,7 @@ impl KlineService {
     fn fanout_sink_inner(&self) -> FanoutBarSink {
         FanoutBarSink {
             registry: Arc::clone(&self.registry),
+            dominants: Arc::clone(&self.dominants),
             batcher: self.batcher.clone(),
         }
     }
@@ -756,22 +785,29 @@ impl KlineService {
         Ok(())
     }
 
-    /// 南向订阅登记：把该策略对若干标的的 1m K线订阅加入登记表（幂等）。
-    pub fn subscribe(&self, strategy: &str, venue: &str, symbols: &[String]) {
+    /// 南向订阅登记（幂等）：`all_contracts=false`（缺省语义）时品种前缀只推当前主力；
+    /// `true` 时推该品种全部在交易合约。具体合约订阅两者一致（直收自身 bar）。
+    ///
+    /// 同一策略对同一标的只保留**最新一次**订阅范围：先摘两种模式再按本次登记，
+    /// 使“先订全部合约、再订仅主力”能真正降级（避免旧模式 key 残留导致多推）。
+    pub fn subscribe(&self, strategy: &str, venue: &str, symbols: &[String], all_contracts: bool) {
         let itype = self.itype_for(venue);
         for symbol in symbols {
             let symbol = symbol.trim();
             if symbol.is_empty() {
                 continue;
             }
+            self.clear_symbol_scopes(strategy, venue, itype, symbol);
             self.registry.subscribe(
                 strategy,
-                trading_core::kline::KlineKey::new(venue, itype, symbol, KLINE_INTERVAL),
+                trading_core::kline::KlineKey::new(venue, itype, symbol, KLINE_INTERVAL)
+                    .with_all_contracts(all_contracts),
             );
         }
     }
 
     /// 南向退订：移除该策略的对应订阅（归零自动退订交易所合约）。
+    /// 同一标的的两种订阅范围（仅主力/全部合约）都摘除，避免漏传开关导致残留。
     pub fn unsubscribe(&self, strategy: &str, venue: &str, symbols: &[String]) {
         let itype = self.itype_for(venue);
         for symbol in symbols {
@@ -779,9 +815,23 @@ impl KlineService {
             if symbol.is_empty() {
                 continue;
             }
+            self.clear_symbol_scopes(strategy, venue, itype, symbol);
+        }
+    }
+
+    /// 摘除该策略在某标的上的两种订阅范围（仅主力/全部合约）。
+    fn clear_symbol_scopes(
+        &self,
+        strategy: &str,
+        venue: &str,
+        itype: InstrumentType,
+        symbol: &str,
+    ) {
+        for all_contracts in [false, true] {
             self.registry.unsubscribe(
                 strategy,
-                &trading_core::kline::KlineKey::new(venue, itype, symbol, KLINE_INTERVAL),
+                &trading_core::kline::KlineKey::new(venue, itype, symbol, KLINE_INTERVAL)
+                    .with_all_contracts(all_contracts),
             );
         }
     }
@@ -1912,7 +1962,12 @@ mod tests {
             )],
         );
         // 客户端运行时订阅与基线交叠（BTCUSDT）并新增 ETHUSDT。
-        service.subscribe("alpha", "binance", &["BTCUSDT".into(), "ETHUSDT".into()]);
+        service.subscribe(
+            "alpha",
+            "binance",
+            &["BTCUSDT".into(), "ETHUSDT".into()],
+            false,
+        );
 
         // trim/去空/去重后基线只剩 BTCUSDT 与 btcusdt 两个原值（保持原大小写）；
         // 与登记表取并集后去重排序，大小写不同的符号视为不同频道。
@@ -2015,8 +2070,13 @@ mod tests {
         let store = test_store();
         let (service, _p) = svc(store.clone());
 
-        service.subscribe("alpha", "ctp", &["cu2512".to_string(), " cu ".to_string()]);
-        service.subscribe("beta", "ctp", &["cu2512".to_string()]);
+        service.subscribe(
+            "alpha",
+            "ctp",
+            &["cu2512".to_string(), " cu ".to_string()],
+            false,
+        );
+        service.subscribe("beta", "ctp", &["cu2512".to_string()], false);
         // 两个客户端订阅同一具体合约：引用计数 2；品种订阅另算。
         assert_eq!(
             service.source_for("ctp", InstrumentType::Futures).symbols(),
@@ -2043,14 +2103,28 @@ mod tests {
             .is_empty());
     }
 
+    /// 写入 CTP 主力表（品种 → 合约），供南向“只推主力”路由判定。
+    fn set_dominant(store: &Arc<TradingStore>, product: &str, symbol: &str) {
+        store.ctp_dominants().put(
+            product,
+            trading_core::kline::DominantEntry {
+                symbol: symbol.into(),
+                trading_day: 20261024,
+                metric_value: Decimal::ZERO,
+                pending: None,
+            },
+        );
+    }
+
     #[test]
     fn finalized_bar_fans_out_to_exact_and_product_subscribers() {
         let store = test_store();
         let (service, pusher) = svc(store.clone());
-        // direct 订具体合约；product 订品种 cu（CTP 适配层已保证只来主力 bar）。
-        service.subscribe("direct", "ctp", &["cu2512".to_string()]);
-        service.subscribe("product", "ctp", &["cu".to_string()]);
-        service.subscribe("other", "ctp", &["rb2611".to_string()]);
+        set_dominant(&store, "cu", "cu2512");
+        // direct 订具体合约；product 订品种 cu（缺省 false＝只收当前主力）。
+        service.subscribe("direct", "ctp", &["cu2512".to_string()], false);
+        service.subscribe("product", "ctp", &["cu".to_string()], false);
+        service.subscribe("other", "ctp", &["rb2611".to_string()], false);
 
         // 推送 sink 只把 bar 入分钟桶，绝不写 BarTable（落盘是另一个无条件 sink 的职责）。
         service
@@ -2079,11 +2153,142 @@ mod tests {
     }
 
     #[test]
+    fn product_dominant_only_drops_non_dominant_bar() {
+        // 缺省（all_contracts=false）品种订阅只收当前主力：非主力合约 bar 不入缓冲。
+        let store = test_store();
+        let (service, pusher) = svc(store.clone());
+        set_dominant(&store, "cu", "cu2512");
+        service.subscribe("dom", "ctp", &["cu".to_string()], false);
+
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2511", 20261024, 60_000));
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 120_000));
+        // 更晚分钟形成水位线，下一拍 poll 关 120000 桶出帧。
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 180_000));
+        service.poll_push();
+
+        assert_eq!(
+            pusher.frames("dom"),
+            vec![("kline_1m_batch".to_string(), vec!["cu2512".to_string()])]
+        );
+    }
+
+    #[test]
+    fn product_without_dominant_delivers_nothing_until_election() {
+        // 品种订阅 all=false 且主力表无该品种：暂不放行（等收盘选举/重启预设）。
+        let store = test_store();
+        let (service, pusher) = svc(store.clone());
+        service.subscribe("dom", "ctp", &["cu".to_string()], false);
+
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 120_000));
+        service.poll_push();
+
+        assert!(pusher.frames("dom").is_empty());
+    }
+
+    #[test]
+    fn resubscribe_with_all_contracts_false_downgrades_scope() {
+        // 同策略先订“全部合约”再重订“仅主力”：只保留最新范围，非主力 bar 不再推。
+        let store = test_store();
+        let (service, pusher) = svc(store.clone());
+        set_dominant(&store, "cu", "cu2512");
+        service.subscribe("dom", "ctp", &["cu".to_string()], true);
+        service.subscribe("dom", "ctp", &["cu".to_string()], false);
+
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2511", 20261024, 60_000));
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 120_000));
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 180_000));
+        service.poll_push();
+
+        assert_eq!(
+            pusher.frames("dom"),
+            vec![("kline_1m_batch".to_string(), vec!["cu2512".to_string()])]
+        );
+    }
+
+    #[test]
+    fn product_all_contracts_receives_dominant_and_non_dominant_bars() {
+        // all_contracts=true：同分钟主力与非主力合约并帧推送。
+        let store = test_store();
+        let (service, pusher) = svc(store.clone());
+        set_dominant(&store, "cu", "cu2512");
+        service.subscribe("all", "ctp", &["cu".to_string()], true);
+
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2511", 20261024, 60_000));
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 120_000));
+        service.poll_push();
+
+        assert_eq!(
+            pusher.frames("all"),
+            vec![(
+                "kline_1m_batch".to_string(),
+                vec!["cu2511".to_string(), "cu2512".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn product_modes_coexist_without_crosstalk_or_duplicate_push() {
+        // 两客户端同品种不同模式：dom 只收主力、all 收全部；各推一次不重复。
+        let store = test_store();
+        let (service, pusher) = svc(store.clone());
+        set_dominant(&store, "cu", "cu2512");
+        service.subscribe("dom", "ctp", &["cu".to_string()], false);
+        service.subscribe("all", "ctp", &["cu".to_string()], true);
+
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2511", 20261024, 60_000));
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 60_000));
+        service
+            .push_sink()
+            .on_bar(&kline("ctp", "cu2512", 20261024, 120_000));
+        service.poll_push();
+
+        assert_eq!(
+            pusher.frames("dom"),
+            vec![("kline_1m_batch".to_string(), vec!["cu2512".to_string()])]
+        );
+        assert_eq!(
+            pusher.frames("all"),
+            vec![(
+                "kline_1m_batch".to_string(),
+                vec!["cu2511".to_string(), "cu2512".to_string()]
+            )]
+        );
+    }
+
+    #[test]
     fn unreachable_pusher_drops_and_counts_without_blocking() {
         let store = test_store();
         let (service, pusher) = svc(store.clone());
-        service.subscribe("dead", "ctp", &["cu2512".to_string()]);
-        service.subscribe("alive", "ctp", &["cu2512".to_string()]);
+        service.subscribe("dead", "ctp", &["cu2512".to_string()], false);
+        service.subscribe("alive", "ctp", &["cu2512".to_string()], false);
         pusher.fail_for("dead");
 
         service
@@ -2109,7 +2314,7 @@ mod tests {
         // 这里绝不能再写 BarTable（否则同一根 bar 重复 append）。
         let store = test_store();
         let (service, pusher) = svc(store.clone());
-        service.subscribe("direct", "ctp", &["cu2512".to_string()]);
+        service.subscribe("direct", "ctp", &["cu2512".to_string()], false);
 
         service
             .push_sink()
@@ -2133,7 +2338,7 @@ mod tests {
     fn persistence_sink_appends_once_and_does_not_push() {
         let store = test_store();
         let (service, pusher) = svc(store.clone());
-        service.subscribe("direct", "ctp", &["cu2512".to_string()]);
+        service.subscribe("direct", "ctp", &["cu2512".to_string()], false);
 
         service
             .persistence_sink()
@@ -2277,7 +2482,7 @@ mod tests {
         // 且不与期货作用域串扰（venue+itype 双键隔离）。
         let store = test_store();
         let (service, pusher) = svc(store.clone());
-        service.subscribe("opt", "deribit", &["ETH-18SEP26-2550-P".to_string()]);
+        service.subscribe("opt", "deribit", &["ETH-18SEP26-2550-P".to_string()], false);
 
         // 期望来源：option 作用域有该合约；同所 futures 作用域为空。
         assert_eq!(
@@ -2318,8 +2523,9 @@ mod tests {
             "alpha",
             "binance",
             &["BTCUSDT".to_string(), "ETHUSDT".to_string()],
+            false,
         );
-        service.subscribe("beta", "ctp", &["cu2512".to_string()]);
+        service.subscribe("beta", "ctp", &["cu2512".to_string()], false);
         let stop = Arc::new(AtomicBool::new(false));
         service.spawn_push_ticker(Arc::clone(&stop));
 
@@ -2403,10 +2609,11 @@ mod tests {
                 who,
                 "binance",
                 &["BTCUSDT".to_string(), "ETHUSDT".to_string()],
+                false,
             );
         }
         // 无关策略只订别的所，不应收到 binance 帧。
-        service.subscribe("gamma", "ctp", &["cu2512".to_string()]);
+        service.subscribe("gamma", "ctp", &["cu2512".to_string()], false);
 
         // 同分钟（60000）乱序定稿两根 binance bar（模拟相邻 dispatch、~880ms 散布）。
         service

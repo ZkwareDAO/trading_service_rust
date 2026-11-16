@@ -743,18 +743,21 @@ new + order_cash 示例（BTCUSDT 市价买，金额 100 USDT）：
   "exchange": "ctp",
   "instrument_type": "futures",
   "symbols": ["cu", "cu2512"],
-  "interval": "1m"
+  "interval": "1m",
+  "all_contracts": true
 }
 ```
 
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `exchange` | 是 | 精确名：`binance` / `deribit` / `hyperliquid` / `ctp` |
-| `symbols` | 是* | 标的数组：具体合约（`BTCUSDT`/`cu2512`）或 **CTP 品种前缀**（`cu`，服务端展开为该品种全部在交易合约并只推当前主力）。也可改用单个 `symbol`/`instrument` 字段 |
+| `symbols` | 是* | 标的数组：具体合约（`BTCUSDT`/`cu2512`）或 **CTP 品种前缀**（`cu`，服务端展开为该品种全部在交易合约）。也可改用单个 `symbol`/`instrument` 字段 |
 | `instrument_type` | CTP/币圈建议传 | `futures`（binance/hyperliquid/ctp）或 `option`（deribit）；缺省按 `spot`，订阅真实所时请显式传 |
 | `interval` | 否 | 仅支持 `1m`（兼容 `1min`/`1minute`/缺省）；其它周期返回 error |
+| `all_contracts` | 否 | 品种前缀订阅的推送范围：缺省/`false`＝只推该品种当前主力合约；`true`＝推该品种全部在交易合约。仅对品种前缀生效（具体合约订阅不受影响）；非 CTP 所无品种语义，该字段无副作用。兼容驼峰 `allContracts` |
 
 - 同一连接对同一 (exchange,symbol,interval) 重复订阅**幂等**；多个连接订阅同一标的时只向交易所订一份（引用计数）。
+- `all_contracts` 两种取值视为不同订阅范围（各自推送）；`unsubscribe_kline` 不传该字段时也会把同一标的的两种范围一并摘除。
 - 成功回纯文本 `ack`（`status="OK"`）；缺 `exchange`、未知所、不支持的周期、空标的列表均回 `error`（`status="REJECTED"`）。
 - 订阅后无需重复发送：服务端每 500ms 对账，首次 key 出现即自动向交易所增订。
 

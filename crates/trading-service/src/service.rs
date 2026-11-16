@@ -621,8 +621,20 @@ async fn subscribe_kline(state: AppState, strategy: String, cmd: SouthCommand) {
         .await;
         return;
     }
-    state.kline.subscribe(&strategy, &exchange, &symbols);
-    let msg = format!("已订阅 {} 个 {} 1m K线标的", symbols.len(), exchange);
+    let all_contracts = cmd.all_contracts.unwrap_or(false);
+    state
+        .kline
+        .subscribe(&strategy, &exchange, &symbols, all_contracts);
+    let scope = if all_contracts {
+        "全部合约"
+    } else {
+        "仅主力"
+    };
+    let msg = format!(
+        "已订阅 {} 个 {} 1m K线标的（{scope}）",
+        symbols.len(),
+        exchange
+    );
     send_event(
         &state,
         &strategy,
@@ -2147,6 +2159,58 @@ mod tests {
             .symbols()
             .is_empty());
         let _ = ws.next().await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_kline_all_contracts_acks_scope_and_unsubscribe_clears_both_modes() {
+        let app = crate::api::test_support::app_with_accounts("").await;
+        let url = crate::api::test_support::serve_south_ws(&app.state).await;
+        let mut ws = connect_south(&url, "s1").await;
+
+        // all_contracts=true：ack 文案标注“全部合约”。
+        let v = send_kline(
+            &mut ws,
+            r#"{"option":"subscribe_kline","exchange":"ctp","instrument_type":"futures","symbols":["cu"],"all_contracts":true}"#,
+        )
+        .await;
+        assert_eq!(v["type"], "ack");
+        assert!(
+            v["message"].as_str().unwrap_or("").contains("全部合约"),
+            "ack 应标注订阅范围: {v}"
+        );
+
+        // 退订不传开关：两种模式的 key 都摘除，作用域快照清空。
+        let v = send_kline(
+            &mut ws,
+            r#"{"option":"unsubscribe_kline","exchange":"ctp","symbols":["cu"]}"#,
+        )
+        .await;
+        assert_eq!(v["type"], "ack");
+        assert!(app
+            .state
+            .kline
+            .source_for("ctp", InstrumentType::Futures)
+            .symbols()
+            .is_empty());
+
+        // 缺省（不传开关）：按“仅主力”登记并回显。
+        let v = send_kline(
+            &mut ws,
+            r#"{"option":"subscribe_kline","exchange":"ctp","symbols":["cu"]}"#,
+        )
+        .await;
+        assert_eq!(v["type"], "ack");
+        assert!(
+            v["message"].as_str().unwrap_or("").contains("仅主力"),
+            "缺省 ack 应标注仅主力: {v}"
+        );
+        assert_eq!(
+            app.state
+                .kline
+                .source_for("ctp", InstrumentType::Futures)
+                .symbols(),
+            vec!["cu".to_string()]
+        );
     }
 
     #[tokio::test]

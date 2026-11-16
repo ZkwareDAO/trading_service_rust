@@ -26,6 +26,9 @@ pub struct KlineKey {
     pub symbol: String,
     /// 周期标识（本期仅 "1m"）。
     pub interval: String,
+    /// 品种订阅范围：false＝只推当前主力（缺省语义）；true＝推该品种全部在交易合约。
+    /// 仅对品种前缀订阅有意义，具体合约订阅不受影响。
+    pub all_contracts: bool,
 }
 
 impl KlineKey {
@@ -40,8 +43,31 @@ impl KlineKey {
             itype,
             symbol: symbol.into(),
             interval: interval.into(),
+            all_contracts: false,
         }
     }
+
+    /// 设置品种订阅范围（true＝全部在交易合约；缺省 false＝仅当前主力）。
+    /// 构造器保持 4 参以兼容既有调用点，模式用该 builder 追加。
+    pub fn with_all_contracts(mut self, all_contracts: bool) -> Self {
+        self.all_contracts = all_contracts;
+        self
+    }
+}
+
+/// 定稿 bar 的一个南向接收目标：命中方式（精确/品种前缀）与订阅范围。
+///
+/// 本层只做结构匹配，**不查主力**；「品种订阅是否只推主力」由服务层
+/// 结合 [`crate::kline::DominantTable`] 判定（`all_contracts=false` 时）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BarTarget {
+    /// 南向客户端（策略名）。
+    pub client: String,
+    /// 精确命中（该 bar 合约本身被订阅）；true 时无条件推送。
+    pub exact: bool,
+    /// 品种订阅的返回范围：true＝该品种全部合约；false＝仅当前主力。
+    /// `exact=true` 时该值无意义。
+    pub all_contracts: bool,
 }
 
 /// 客户端订阅登记表（client 为南向策略名；同 key 多 client 即引用计数）。
@@ -122,29 +148,42 @@ impl KlineRegistry {
         out.into_iter().collect()
     }
 
-    /// 定稿 bar 的南向接收方：遍历同 (venue,itype,interval) 作用域的所有 key，
-    /// 精确合约命中，或其订阅符号是 bar 合约的**品种前缀**（CTP 订阅品种 `cu`
-    /// 收主力 `cu2512` 的 bar）。返回去重有序的策略名。
-    pub fn strategies_for_bar(
+    /// 定稿 bar 的南向接收目标：遍历同 (venue,itype,interval) 作用域的所有 key，
+    /// 精确合约命中（`exact=true`），或其订阅符号是 bar 合约的**品种前缀**
+    /// （CTP 订阅品种 `cu` 可收 `cu2512` 的 bar，按 key 的 `all_contracts` 返回模式）。
+    /// 同一客户端命中多个 key 时合并为一条（exact/all 均取或），结果按客户端字典序，
+    /// 由调用方据此判定是否推送、并保证不重复推送。
+    pub fn targets_for_bar(
         &self,
         venue: &str,
         itype: InstrumentType,
         interval: &str,
         bar_symbol: &str,
-    ) -> Vec<String> {
+    ) -> Vec<BarTarget> {
         let product = product_prefix(bar_symbol);
         let subs = self.subs.lock().unwrap();
-        let mut out: BTreeSet<String> = BTreeSet::new();
+        // 先按客户端合并：同一客户端可能同时精确订阅与品种订阅。
+        let mut merged: BTreeMap<String, BarTarget> = BTreeMap::new();
         for (key, clients) in subs.iter() {
             if key.venue != venue || key.itype != itype || key.interval != interval {
                 continue;
             }
-            let hit = key.symbol == bar_symbol || product.as_deref() == Some(key.symbol.as_str());
-            if hit {
-                out.extend(clients.iter().cloned());
+            let exact = key.symbol == bar_symbol;
+            let product_hit = product.as_deref() == Some(key.symbol.as_str());
+            if !exact && !product_hit {
+                continue;
+            }
+            for client in clients.iter() {
+                let target = merged.entry(client.clone()).or_insert_with(|| BarTarget {
+                    client: client.clone(),
+                    exact: false,
+                    all_contracts: false,
+                });
+                target.exact |= exact;
+                target.all_contracts |= key.all_contracts;
             }
         }
-        out.into_iter().collect()
+        merged.into_values().collect()
     }
 }
 
@@ -268,16 +307,20 @@ mod tests {
     }
 
     #[test]
-    fn bar_routes_to_exact_and_product_subscribers_dedup() {
-        // 订阅具体合约 cu2512 → 精确命中；订阅品种 cu → 前缀命中（主力放行）。
+    fn targets_for_bar_marks_exact_and_carries_product_mode() {
+        // 具体合约订阅 exact=true；品种订阅 exact=false 并带 all_contracts 模式。
         let r = KlineRegistry::new();
         r.subscribe(
             "direct",
             KlineKey::new("ctp", InstrumentType::Futures, "cu2512", M1),
         );
         r.subscribe(
-            "product",
+            "dom",
             KlineKey::new("ctp", InstrumentType::Futures, "cu", M1),
+        );
+        r.subscribe(
+            "all",
+            KlineKey::new("ctp", InstrumentType::Futures, "cu", M1).with_all_contracts(true),
         );
         // 无关品种 / 别的作用域不应命中。
         r.subscribe(
@@ -289,22 +332,73 @@ mod tests {
             KlineKey::new("binance", InstrumentType::Futures, "BTCUSDT", M1),
         );
 
-        let got = r.strategies_for_bar("ctp", InstrumentType::Futures, M1, "cu2512");
-        assert_eq!(got, vec!["direct".to_string(), "product".to_string()]);
-        // 前缀路由对所有 cu* 合约命中品种订阅者；「只放行当前主力」是 CTP 适配层
-        // BarAggSink 的职责（非主力 bar 根本不会到 service），本层不判主力。
         assert_eq!(
-            r.strategies_for_bar("ctp", InstrumentType::Futures, M1, "cu2601"),
-            vec!["product".to_string()]
+            r.targets_for_bar("ctp", InstrumentType::Futures, M1, "cu2512"),
+            vec![
+                BarTarget {
+                    client: "all".into(),
+                    exact: false,
+                    all_contracts: true
+                },
+                BarTarget {
+                    client: "direct".into(),
+                    exact: true,
+                    all_contracts: false
+                },
+                BarTarget {
+                    client: "dom".into(),
+                    exact: false,
+                    all_contracts: false
+                },
+            ]
+        );
+        // 非主力 cu 合约：只有品种订阅命中，模式随 key 携带（是否放行由调用方判）。
+        assert_eq!(
+            r.targets_for_bar("ctp", InstrumentType::Futures, M1, "cu2601"),
+            vec![
+                BarTarget {
+                    client: "all".into(),
+                    exact: false,
+                    all_contracts: true
+                },
+                BarTarget {
+                    client: "dom".into(),
+                    exact: false,
+                    all_contracts: false
+                },
+            ]
         );
         // 无关品种 / 别的作用域不命中。
         assert!(r
-            .strategies_for_bar("ctp", InstrumentType::Futures, M1, "rb2611")
+            .targets_for_bar("ctp", InstrumentType::Futures, M1, "rb2611")
             .iter()
-            .all(|s| s != "product"));
+            .all(|t| t.client != "dom"));
         assert!(r
-            .strategies_for_bar("binance", InstrumentType::Futures, M1, "cu2512")
+            .targets_for_bar("binance", InstrumentType::Futures, M1, "cu2512")
             .is_empty());
+    }
+
+    #[test]
+    fn targets_for_bar_merges_modes_of_same_client() {
+        // 同一客户端同时精确订阅与品种订阅：合并为一条（exact 取或、all 取或），
+        // 避免同一根 bar 重复推送。
+        let r = KlineRegistry::new();
+        r.subscribe(
+            "x",
+            KlineKey::new("ctp", InstrumentType::Futures, "cu2512", M1),
+        );
+        r.subscribe(
+            "x",
+            KlineKey::new("ctp", InstrumentType::Futures, "cu", M1).with_all_contracts(true),
+        );
+        assert_eq!(
+            r.targets_for_bar("ctp", InstrumentType::Futures, M1, "cu2512"),
+            vec![BarTarget {
+                client: "x".into(),
+                exact: true,
+                all_contracts: true
+            }]
+        );
     }
 
     #[test]
