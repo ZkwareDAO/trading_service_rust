@@ -40,9 +40,15 @@ encoding_rs = { version = "0.8", optional = true }
 thiserror = { workspace = true, optional = true }
 
 [dev-dependencies]
-# 模拟所 ExchangeApi 契约测试（tests/sim_contract.rs）。
+# 交易所接口契约套件（tests/conformance/）的后端实现：trading-sim。
 trading-sim.workspace = true
 
 [features]
 default = []
 ctp = ["dep:ctp2rs", "dep:encoding_rs", "dep:thiserror"]
+
+# 后端无关的交易所接口契约套件：tests/conformance/ 目录（mod.rs 定义契约，
+# 各后端在各自子模块里跑同一套断言；当前只有 sim 后端）。
+[[test]]
+name = "conformance"
+path = "tests/conformance/mod.rs"

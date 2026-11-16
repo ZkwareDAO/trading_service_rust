@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
-# 一键门禁（M1 全链路 E2E 体系）：
+# 一键门禁（M1 自动化测试体系）：
 #   格式 → clippy → 单测/集成（默认 features）→ all-features → 覆盖率（可选）。
+#
+# 测试资产分层（workspace 自动覆盖，以下为定位问题时的聚焦命令）：
+#   cargo test -p e2e-test                    # 跨 crate 业务链 E2E（20 用例）
+#   cargo test -p trading-exchange --test conformance   # 交易所接口契约（后端无关）
+#   cargo test -p trading-service --test rest_api       # REST 协议契约
+#   cargo test -p trading-service --test south_ws       # 南向 WS 协议契约
+#   cargo test -p trading-service --test persistence    # 持久化往返
+#   cargo test -p trading-service --test properties     # L1 服务层不变量
+#   cargo test -p trading-models  --test properties     # L1 领域模型不变量
+#   cargo test -p trading-sim                            # 模拟所自测
 #
 # 用法：bash scripts/test-all.sh
 set -euo pipefail

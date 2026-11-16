@@ -1,21 +1,15 @@
-//! 集成测试支撑：用临时目录起真实 TradingStore 并装配 AppState/Router。
+//! crate 内单测支撑：委托 `crate::testkit` 的轻量装配，并额外持有临时目录句柄。
 //!
-//! 仅编译进测试。不连真实交易所：账户可配置但无外发连接，下单等触发网络
-//! 的路径只验证同步的内存结果。
-
-use std::sync::Arc;
-use std::time::Duration;
+//! 仅编译进测试。装配逻辑统一收口在 [`crate::testkit::app_with_accounts`]，
+//! 集成测试（`tests/`）与 crate 内单测走同一路径，避免两套装配漂移。
 
 use axum::Router;
-use store_core::MockClock;
 use tempfile::TempDir;
-use trading_store::init::{InitParams, Initialized};
 
-use crate::account_hub::AccountHub;
-use crate::state::{AppState, AssemblyDeps, VenueEndpoints};
+use crate::state::AppState;
 
 /// account.csv 表头（与生产一致：新 7 列，6 公共列 + credentials）。
-pub const ACCOUNT_HEADER: &str = "id,name,exchange,credentials,deleted,created_at,updated_at\n";
+pub const ACCOUNT_HEADER: &str = crate::testkit::ACCOUNT_HEADER;
 
 /// 已装配的测试应用 + 其临时目录（保留句柄防止目录提前清理）。
 pub struct TestApp {
@@ -27,88 +21,16 @@ pub struct TestApp {
 /// 用给定 account.csv 内容（不含表头）起应用；传 `""` 表示空账户表。
 pub async fn app_with_accounts(csv_body: &str) -> TestApp {
     let dir = TempDir::new().unwrap();
-    let csv = dir.path().join("account.csv");
-    let key = dir.path().join("account.key");
-    if !csv_body.is_empty() {
-        std::fs::write(&csv, format!("{ACCOUNT_HEADER}{csv_body}")).unwrap();
-    }
-
-    let clock: Arc<dyn store_core::Clock> = Arc::new(MockClock::new(1_700_000_000_000));
-    let init = Initialized::bootstrap(InitParams {
-        data_dir: dir.path().to_str().unwrap(),
-        clock: Arc::clone(&clock),
-        flush_interval: None,
-        account_file: csv,
-        account_key_file: key,
-    })
-    .await
-    .unwrap();
-
-    let accounts = AccountHub::new(init.accounts);
-    let endpoints: VenueEndpoints = Arc::new(Vec::new());
-
-    let state = AppState::assemble(AssemblyDeps {
-        store: init.store,
-        accounts,
-        // 测试用 dev 旁路鉴权；REST 不经过南向鉴权中间件。
-        south_auth: dev_south_auth(Arc::clone(&clock)),
-        rest_timeout: Duration::from_secs(5),
-        rule_refresh_interval: Duration::from_secs(3600),
-        position_debounce: Duration::from_millis(100),
-        position_reconcile_interval: Duration::from_secs(3600),
-        kline_retain_bars: 1440,
-        kline_retain_age: Duration::from_secs(24 * 60 * 60),
-        kline_history_limits: crate::kline_history::HistoryLimits::new(
-            crate::kline_history::DEFAULT_HISTORY_LIMIT,
-            crate::kline_history::MAX_HISTORY_LIMIT,
-        )
-        .unwrap(),
-        kline_gap_scan_interval: Duration::from_secs(300),
-        kline_stall_threshold: Duration::from_secs(180),
-        endpoints,
-        // 测试默认不配置任何通知通道（五 URL 全空，静默跳过）。
-        channels: crate::notify::ChannelUrls::new(
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-        ),
-        // 测试使用生产默认阈值档案（-20% / -20%）。
-        notify_profiles: Arc::new(crate::notify::profile::NotifyProfiles::from_config(
-            crate::notify::report::default_roi_alert_threshold(),
-            crate::notify::report::default_roi_alert_threshold(),
-        )),
-        venue: crate::venue_config::default_configs(),
-        // 单测沿用生产内置注册表（不联网：账户表默认为空，不建公共行情连接）。
-        registry_factory: crate::state::builtin_registry_factory(),
-    });
-
-    let router = super::router().with_state(state.clone());
+    let lite = crate::testkit::app_with_accounts(dir.path(), csv_body).await;
     TestApp {
-        router,
-        state,
+        router: lite.router,
+        state: lite.state,
         _dir: dir,
     }
 }
 
-/// 构造测试用南向鉴权（dev 旁路）。
-fn dev_south_auth(clock: Arc<dyn store_core::Clock>) -> crate::south_auth::SouthAuth {
-    let nonces = crate::south_auth::NonceGuard::new(clock, Duration::from_secs(60));
-    crate::south_auth::SouthAuth::from_secret("test-secret", nonces, true)
-}
-
-/// 在随机本地端口起南向 WS 服务（dev 旁路鉴权），返回可连接的 `/ws` 地址。
+/// 在随机本地端口起南向 WS 服务，返回可连接的 `/ws` 地址。
 /// 服务跑在后台 task，随测试结束自然终止。
-pub async fn serve_south_ws(state: &crate::state::AppState) -> String {
-    use axum::routing::get;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = axum::Router::new()
-        .route("/ws", get(crate::south::ws_handler))
-        .with_state(state.clone());
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    format!("ws://{addr}/ws")
+pub async fn serve_south_ws(state: &AppState) -> String {
+    crate::testkit::serve_south_ws(state).await
 }

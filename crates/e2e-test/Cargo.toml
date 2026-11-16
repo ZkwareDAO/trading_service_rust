@@ -1,0 +1,23 @@
+[package]
+name = "e2e-test"
+description = "Dev-only 跨 crate 业务链集成测试（真实 store/engine + 模拟所，非发布物）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# 本 crate 只承载跨 crate 的端到端场景；harness 放在 src/ 下是为了让
+# `use e2e_test::harness` 可被 tests/ 多个测试目标与外部复用。
+[dependencies]
+trading-service = { path = "../trading-service" }
+trading-sim.workspace = true
+trading-exchange.workspace = true
+trading-models.workspace = true
+trading-store.workspace = true
+store-core.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tempfile.workspace = true
+rust_decimal.workspace = true
+serde_json.workspace = true

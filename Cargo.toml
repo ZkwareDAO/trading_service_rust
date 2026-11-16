@@ -11,6 +11,8 @@ members = [
     "crates/trading-service",
     # M1 全链路 E2E 的模拟交易所测试替身（dev-only）
     "crates/trading-sim",
+    # 跨 crate 业务链 E2E 场景（dev-only，依赖上面的模拟所）
+    "crates/e2e-test",
     # 远端合入的通用存储框架（原 store-tokio 已并入 trading-store::async_rt）
     "crates/store-core",
     "crates/trading-models",
@@ -66,6 +68,8 @@ openssl-sys = { version = "0.9", features = ["vendored"] }
 
 # ---- 远端存储框架 dev-deps ----
 tempfile = "3"
+# L1 属性测试（dev-only）：不变量 + 反例最小化 + proptest-regressions 语料库
+proptest = "1"
 
 # ---- 账户凭证本地加密（AES-256-GCM）；OsRng 由 aead 提供，无需单独 rand ----
 aes-gcm = "0.10"

@@ -43,11 +43,133 @@ pub mod testkit {
     pub use crate::notify::profile::NotifyProfiles;
     pub use crate::notify::report::default_roi_alert_threshold;
     pub use crate::notify::ChannelUrls;
+    // 风控阈值比较语义（L1 属性测试的纯函数抓手）。
+    pub use crate::rules::eval::CompareOp;
+    pub use crate::south::ws_handler as south_ws_handler;
     pub use crate::south_auth::{NonceGuard, SouthAuth, NONCE_TTL};
     pub use crate::state::{
         builtin_registry_factory, AppState, AssemblyDeps, RegistryFactory, VenueEndpoints,
     };
     pub use crate::venue_config::{default_configs, LoadedVenueConfigs};
+
+    /// account.csv 表头（与生产一致：新 7 列，6 公共列 + credentials）。
+    pub const ACCOUNT_HEADER: &str = "id,name,exchange,credentials,deleted,created_at,updated_at\n";
+
+    /// 轻量装配结果：真实 [`AppState`] + REST 路由器。
+    ///
+    /// 不注入任何交易所、不启动后台流；交易所接口契约测试（conformance）与
+    /// E2E harness（注入模拟所）各自负责自己的装配。
+    pub struct AppLite {
+        pub state: AppState,
+        pub router: axum::Router,
+    }
+
+    /// 用给定目录与 account.csv 正文（不含表头；空串表示无账户）装配应用。
+    ///
+    /// 与生产同一装配路径（[`AppState::assemble`] + 内置注册表），仅把持久化周期、
+    /// 通知通道等外部副作用关掉，供 crate 级 REST / 南向协议 / 持久化契约测试使用。
+    /// `dir` 由调用方持有（集成测试用 `tempfile::TempDir`），本函数不清理目录。
+    pub async fn app_with_accounts(dir: &std::path::Path, csv_body: &str) -> AppLite {
+        assemble_app(
+            dir,
+            csv_body,
+            std::time::Duration::from_millis(100),
+            builtin_registry_factory(),
+        )
+        .await
+    }
+
+    /// 装配内核（唯一一份）：账户表 → store bootstrap → AppState/router。
+    ///
+    /// 只有 `position_debounce` 与 `registry_factory` 随测试形态不同：协议测试用
+    /// 内置注册表；E2E harness 用更短去抖并注入模拟所，其余装配参数两侧完全一致。
+    pub async fn assemble_app(
+        dir: &std::path::Path,
+        csv_body: &str,
+        position_debounce: std::time::Duration,
+        registry_factory: RegistryFactory,
+    ) -> AppLite {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use store_core::MockClock;
+        use trading_store::init::{InitParams, Initialized};
+
+        let csv = dir.join("account.csv");
+        let key = dir.join("account.key");
+        if !csv_body.is_empty() {
+            std::fs::write(&csv, format!("{ACCOUNT_HEADER}{csv_body}")).expect("写 account.csv");
+        }
+
+        let clock: Arc<dyn store_core::Clock> = Arc::new(MockClock::new(1_700_000_000_000));
+        let init = Initialized::bootstrap(InitParams {
+            data_dir: dir.to_str().expect("测试目录必须是 UTF-8 路径"),
+            clock: Arc::clone(&clock),
+            flush_interval: None,
+            account_file: csv,
+            account_key_file: key,
+        })
+        .await
+        .expect("测试 store bootstrap 失败");
+
+        let state = AppState::assemble(AssemblyDeps {
+            store: init.store,
+            accounts: AccountHub::new(init.accounts),
+            // dev 旁路鉴权：REST 不经过南向鉴权中间件，协议测试自行覆盖严格模式。
+            south_auth: SouthAuth::from_secret(
+                "test-secret",
+                NonceGuard::new(clock, NONCE_TTL),
+                true,
+            ),
+            rest_timeout: Duration::from_secs(5),
+            rule_refresh_interval: Duration::from_secs(3600),
+            position_debounce,
+            position_reconcile_interval: Duration::from_secs(3600),
+            kline_retain_bars: 1440,
+            kline_retain_age: Duration::from_secs(24 * 60 * 60),
+            kline_history_limits: HistoryLimits::new(DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT)
+                .expect("历史限额常量合法"),
+            kline_gap_scan_interval: Duration::from_secs(300),
+            kline_stall_threshold: Duration::from_secs(180),
+            endpoints: Arc::new(Vec::new()),
+            channels: ChannelUrls::new(
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
+            notify_profiles: Arc::new(NotifyProfiles::from_config(
+                default_roi_alert_threshold(),
+                default_roi_alert_threshold(),
+            )),
+            venue: default_configs(),
+            registry_factory,
+        });
+
+        let router = router().with_state(state.clone());
+        AppLite { state, router }
+    }
+
+    /// 在随机本地端口起南向 WS 服务，返回可连接的 `/ws` 地址。
+    ///
+    /// 使用 `state` 内已装配的鉴权设置（dev 旁路或严格 HMAC 由调用方决定）；
+    /// 服务跑在后台 task，随测试结束自然终止。
+    pub async fn serve_south_ws(state: &AppState) -> String {
+        use axum::routing::get;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定南向临时端口失败");
+        let addr = listener.local_addr().expect("读取临时端口失败");
+        let app = axum::Router::new()
+            .route("/ws", get(south_ws_handler))
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("ws://{addr}/ws")
+    }
 }
 
 use std::sync::atomic::{AtomicBool, Ordering};
