@@ -1302,4 +1302,32 @@ mod tests {
         // Act / Assert
         assert!(map_account_balance(resp).is_err());
     }
+
+    #[test]
+    fn query_error_minus_2013_maps_not_exists() {
+        // -2013：交易所明确应答订单不存在 → NotExists；其余错误 → Unavailable。
+        let not_found = anyhow::Error::new(ConnectorError::NotFoundError {
+            msg: "Order does not exist.".into(),
+            code: Some(-2013),
+        });
+        assert!(matches!(
+            classify_query_error(&not_found),
+            OrderLookup::NotExists
+        ));
+
+        let other_code = anyhow::Error::new(ConnectorError::NotFoundError {
+            msg: "x".into(),
+            code: Some(-1000),
+        });
+        assert!(matches!(
+            classify_query_error(&other_code),
+            OrderLookup::Unavailable
+        ));
+
+        let timeout = anyhow::Error::new(ConnectorError::NetworkError("timeout".into()));
+        assert!(matches!(
+            classify_query_error(&timeout),
+            OrderLookup::Unavailable
+        ));
+    }
 }

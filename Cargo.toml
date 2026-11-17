@@ -9,10 +9,9 @@ members = [
     "crates/trading-core",
     "crates/trading-exchange",
     "crates/trading-service",
-    # M1 全链路 E2E 的模拟交易所测试替身（dev-only）
+    # M1 全链路 E2E 的模拟交易所测试替身（dev-only，trading-service/tests 与
+    # trading-exchange/tests/conformance 共用）
     "crates/trading-sim",
-    # 跨 crate 业务链 E2E 场景（dev-only，依赖上面的模拟所）
-    "crates/e2e-test",
     # 远端合入的通用存储框架（原 store-tokio 已并入 trading-store::async_rt）
     "crates/store-core",
     "crates/trading-models",

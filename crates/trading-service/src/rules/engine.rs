@@ -669,7 +669,9 @@ mod tests {
     use super::*;
     use std::str::FromStr;
     use std::sync::Mutex;
-    use trading_exchange::api::OrderState;
+    use trading_exchange::api::{ExchangeApi, OrderState, PlaceDefer};
+    use trading_exchange::provider::VenueProvider;
+    use trading_exchange::registry::ExchangeRegistry;
     use trading_models::{
         Instrument, OrderStatus, OrderType, Side, WatchConditionKind, WatchRule, WatchRuleAction,
         WatchRuleStatus,
@@ -738,12 +740,16 @@ mod tests {
     }
 
     /// 测试用空注册表：无 provider → prepare_placement 对任意交易所透传（预检不变）。
-    fn empty_registry() -> Arc<trading_exchange::registry::ExchangeRegistry> {
-        Arc::new(trading_exchange::registry::ExchangeRegistry::from_providers(vec![]))
+    fn empty_registry() -> Arc<ExchangeRegistry> {
+        Arc::new(ExchangeRegistry::from_providers(vec![]))
     }
 
     impl Harness {
         fn new(reject: bool) -> Self {
+            Self::with_registry(reject, empty_registry())
+        }
+
+        fn with_registry(reject: bool, registry: Arc<ExchangeRegistry>) -> Self {
             let store = standalone();
             let orders = OrderRepo::new(store.table::<trading_models::Order>().unwrap());
             let positions = PositionRepo::new(store.table::<trading_models::Position>().unwrap());
@@ -761,7 +767,7 @@ mod tests {
                 Arc::clone(&quotes),
                 Arc::new(FixedAccounts),
                 placer.clone(),
-                empty_registry(),
+                registry,
             );
             Self {
                 engine,
@@ -1923,6 +1929,191 @@ mod tests {
             h.rules.get_including_deleted(rule.id).unwrap().status,
             WatchRuleStatus::Retired,
             "绑定仓位归属不匹配应按绑定失效 retire"
+        );
+    }
+
+    /// 预检桩：按剩余次数返回 Defer，耗尽后透传；build_api 不参与扫描。
+    struct DeferProvider {
+        exchange: &'static str,
+        remaining: Mutex<usize>,
+        defer: PlaceDefer,
+    }
+
+    impl VenueProvider for DeferProvider {
+        fn matches(&self, exchange: &str) -> bool {
+            exchange == self.exchange
+        }
+
+        fn prepare_placement(
+            &self,
+            _venue: &str,
+            request: PlaceOrderRequest,
+        ) -> Result<PlaceOrderRequest, PlaceDefer> {
+            let mut remaining = self.remaining.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                Err(self.defer.clone())
+            } else {
+                Ok(request)
+            }
+        }
+
+        fn build_api(
+            &self,
+            _exchange: &str,
+            _instrument_type: Option<&str>,
+            _account: &str,
+        ) -> anyhow::Result<Arc<dyn ExchangeApi>> {
+            anyhow::bail!("预检测试不需要 build_api")
+        }
+    }
+
+    fn defer_registry_for(
+        exchange: &'static str,
+        defer: PlaceDefer,
+        times: usize,
+    ) -> Arc<ExchangeRegistry> {
+        Arc::new(ExchangeRegistry::from_providers(vec![Arc::new(
+            DeferProvider {
+                exchange,
+                remaining: Mutex::new(times),
+                defer,
+            },
+        )]))
+    }
+
+    fn defer_registry(defer: PlaceDefer, times: usize) -> Arc<ExchangeRegistry> {
+        defer_registry_for("binance", defer, times)
+    }
+
+    #[tokio::test]
+    async fn data_not_ready_defers_without_claiming() {
+        // Arrange：仓位与规则命中，但预检报行情/规格未就绪。
+        let h = Harness::with_registry(false, defer_registry(PlaceDefer::DataNotReady, usize::MAX));
+        let pos = seed_long_position(&h);
+        let rule = roi_rule(&h, pos.id, ">=", "0.12");
+
+        // Act
+        let report = h.engine.run_scan().await;
+
+        // Assert：只记 deferred，不 claim、不落单、规则保持 active。
+        assert_eq!(
+            report,
+            ScanReport {
+                chained: 0,
+                fired: 0,
+                skipped: 0,
+                deferred: 1
+            }
+        );
+        assert!(h.sent().is_empty(), "预检未过不得下单");
+        assert!(h.orders.list_active().is_empty(), "预检未过不得落内存订单");
+        assert_eq!(
+            h.rules.get(rule.id).unwrap().status,
+            WatchRuleStatus::Active,
+            "规则必须保持 active 等下轮"
+        );
+    }
+
+    #[tokio::test]
+    async fn spread_defer_keeps_rule_active_then_recovers_next_scan() {
+        // Arrange：首轮价差过宽，次轮恢复。
+        let h = Harness::with_registry(
+            false,
+            defer_registry(
+                PlaceDefer::SpreadTooWide {
+                    instrument: "BTCUSDT".into(),
+                    bid: dec("100"),
+                    ask: dec("101"),
+                    spread: dec("1"),
+                    threshold: dec("0.5"),
+                },
+                1,
+            ),
+        );
+        let pos = seed_long_position(&h);
+        let rule = roi_rule(&h, pos.id, ">=", "0.12");
+
+        // Act 1：价差过宽 → defer。
+        let first = h.engine.run_scan().await;
+        assert_eq!(first.deferred, 1);
+        assert!(h.sent().is_empty());
+        assert_eq!(
+            h.rules.get(rule.id).unwrap().status,
+            WatchRuleStatus::Active
+        );
+
+        // Act 2：下一轮价差恢复 → 正常 claim 下单。
+        let second = h.engine.run_scan().await;
+        assert_eq!(second.fired, 1);
+        assert_eq!(h.sent().len(), 1);
+        assert_eq!(h.rules.get(rule.id).unwrap().status, WatchRuleStatus::InUse);
+    }
+
+    #[tokio::test]
+    async fn new_rule_with_missing_cross_position_stays_active() {
+        // 条件引用一个不存在的仓位：本轮不触发，也不能误按 0 判定。
+        let h = Harness::new(false);
+        let rule = h
+            .rules
+            .insert({
+                let mut r = WatchRule::new_open(
+                    7,
+                    0,
+                    "binance",
+                    "BTCUSDT",
+                    InstrumentType::Futures,
+                    Side::Buy,
+                    OrderType::Market,
+                    Decimal::ZERO,
+                    dec("1"),
+                    1,
+                );
+                r.condition_kind = WatchConditionKind::Position;
+                r.condition_instrument = Some("ETHUSDT".to_string());
+                // new-2 口径：关联仓位数量 > 0 才开仓；仓位不存在等价于 0，不触发。
+                r.operator = ">".to_string();
+                r.value = Decimal::ZERO;
+                r
+            })
+            .unwrap();
+
+        let report = h.engine.run_scan().await;
+        assert_eq!(report.fired, 0);
+        assert!(h.sent().is_empty());
+        assert_eq!(
+            h.rules.get(rule.id).unwrap().status,
+            WatchRuleStatus::Active,
+            "条件数据缺失时规则保持 active"
+        );
+    }
+
+    #[tokio::test]
+    async fn risk_precheck_routes_by_bound_position_exchange_when_rule_exchange_blank() {
+        // risk 规则 exchange 留空：预检必须按绑定仓位的交易所（deribit）路由。
+        let h = Harness::with_registry(
+            false,
+            defer_registry_for("deribit", PlaceDefer::DataNotReady, usize::MAX),
+        );
+        let mut p = Position::new(7, "deribit", "BTC-27DEC24-100000-C", Side::Buy);
+        p.instrument_type = InstrumentType::Option;
+        p.quantity = dec("1");
+        p.current_price = dec("0.05");
+        p.pos_price = dec("0.05");
+        p.roi = dec("0.2");
+        h.positions
+            .apply_diffs(trading_models::diff_positions(vec![p], vec![], 1))
+            .unwrap();
+        let pos = h.positions.list_active()[0].clone();
+        let rule = roi_rule(&h, pos.id, ">=", "0.12");
+        assert!(rule.exchange.is_empty(), "risk 规则 exchange 设计为留空");
+
+        let report = h.engine.run_scan().await;
+        assert_eq!(report.deferred, 1, "应按 deribit provider 命中预检");
+        assert!(h.sent().is_empty());
+        assert_eq!(
+            h.rules.get(rule.id).unwrap().status,
+            WatchRuleStatus::Active
         );
     }
 }

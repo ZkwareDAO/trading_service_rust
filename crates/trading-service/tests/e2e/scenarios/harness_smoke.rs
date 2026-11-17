@@ -4,7 +4,7 @@
 use tower::ServiceExt;
 use trading_models::{OrderStatus, OrderType, Side};
 
-use e2e_test::harness as common;
+use crate::harness as common;
 
 #[tokio::test]
 async fn harness_routes_market_order_and_reconciles_position() {

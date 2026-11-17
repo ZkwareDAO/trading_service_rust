@@ -26,6 +26,21 @@ path = "src/bin/loadtest.rs"
 name = "account-tool"
 path = "src/bin/account-tool.rs"
 
+# 跨模块业务链 E2E（in-process）：harness 在 tests/e2e/ 下，单入口挂 scenarios 模块树。
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
+
+# 进程级黑盒 smoke：启动真实 trading-service + xili-exchange 二进制，只走 REST。
+[[test]]
+name = "blackbox"
+path = "tests/blackbox/main.rs"
+
+# REST 接口级测试（真实 Router + 真实装配；按接口文档逐条组织）。
+[[test]]
+name = "api"
+path = "tests/api/main.rs"
+
 [dependencies]
 trading-core.workspace = true
 trading-exchange.workspace = true
@@ -62,5 +77,5 @@ tower = { workspace = true }
 tempfile = { workspace = true }
 # L1 属性测试：不变量（固定 seed / cases=10_000 门禁）
 proptest = { workspace = true }
-# M1 全链路 E2E 已迁至 crates/e2e-test；本 crate 的 tests/ 只做
-# REST / 南向协议 / 持久化 / L1 属性测试，不再依赖模拟所。
+# E2E 场景注入的模拟所（dev-only）：harness 在 tests/e2e/，不进入发布物。
+trading-sim.workspace = true

@@ -1,6 +1,9 @@
 //! E2E 共享 harness：临时目录 + 真实 `TradingStore/AppState/RuleEngine` +
 //! 注入 `trading-sim` 模拟所。
 //!
+//! 本文件位于 `trading-service` 的集成测试目标内，因此可直接使用
+//! `trading_service::testkit` 与 `trading-sim`（dev-dependency）。
+//!
 //! 走生产同一装配路径（`AppState::assemble` 经 `RegistryFactory` 注入），
 //! 只替换最外层交易所适配器；账户事件侧复用生产 `account_stream::run`。
 
@@ -314,11 +317,15 @@ pub async fn start_sim() -> TestApp {
 
 /// 在既有目录重新装配（重启恢复用；**不**启动账户事件流，避免空模拟所
 /// 首轮对账覆盖刚恢复的 CSV 状态）。
+///
+/// 返回的 `TestApp` 不持有 `TempDir`：**调用方必须自己持有目录**直到用例结束。
 pub async fn start_sim_at(dir_path: &std::path::Path) -> TestApp {
     assemble(dir_path, false).await
 }
 
 /// 在既有目录重新装配并启动账户事件流（重启恢复的「第一阶段」用）。
+///
+/// 返回的 `TestApp` 不持有 `TempDir`：**调用方必须自己持有目录**直到用例结束。
 pub async fn start_sim_online_at(dir_path: &std::path::Path) -> TestApp {
     assemble(dir_path, true).await
 }

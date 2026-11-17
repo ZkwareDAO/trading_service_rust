@@ -588,4 +588,30 @@ mod tests {
             Ok(CtpEvent::Error { code: 25, .. })
         ));
     }
+
+    #[test]
+    fn cancel_reject_error_msg_decodes_gb18030() {
+        // 柜台异步撤单拒绝携带 GB18030 中文原因：必须原样解码进事件，不能丢成空串。
+        let (mut spi, rx) = setup();
+        let mut rsp = ctp2rs::v1alpha1::CThostFtdcRspInfoField {
+            ErrorID: 25,
+            ..Default::default()
+        };
+        // 柜台字段是 GB18030 字节，不是 UTF-8；按 CTP 口径填充。
+        let (bytes, _, _) = encoding_rs::GB18030.encode("找不到报单");
+        assert!(bytes.len() <= rsp.ErrorMsg.len(), "测试串不得超出柜台字段");
+        for (i, b) in bytes.iter().enumerate() {
+            rsp.ErrorMsg[i] = *b as i8;
+        }
+
+        spi.on_err_rtn_order_action(None, Some(&rsp));
+
+        match rx.try_recv() {
+            Ok(CtpEvent::Error { code, msg }) => {
+                assert_eq!(code, 25);
+                assert_eq!(msg, "找不到报单");
+            }
+            other => panic!("应收到撤单拒绝错误事件，实际 {other:?}"),
+        }
+    }
 }

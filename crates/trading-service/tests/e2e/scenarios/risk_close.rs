@@ -6,7 +6,7 @@ use trading_models::{
 };
 use trading_sim::ledger::SimOrder;
 
-use e2e_test::harness::{self as common, dec, DEFAULT_INSTRUMENT};
+use crate::harness::{self as common, dec, DEFAULT_INSTRUMENT};
 
 /// risk 规则要素（用具名字段替代 10 个位置参数）。
 struct RiskRuleSpec {
@@ -434,4 +434,36 @@ async fn r09_absolute_quantity_takes_precedence_over_pct() {
         Some(dec("1"))
     );
     app.assert_position_matches_ledger(DEFAULT_INSTRUMENT);
+}
+
+#[tokio::test]
+async fn r10_price_breakout_full_close() {
+    // Arrange：2 手多仓，价格 >=105 全平。
+    let app = common::start_sim().await;
+    let position = open_long(&app, "100", "2").await;
+    let rule = app.insert_rule(risk_rule(
+        &app,
+        RiskRuleSpec::full_market(position.id, WatchConditionKind::Price, None, ">=", "105"),
+    ));
+
+    // Act：104 不触发；105 触发全平。
+    common::set_mark(&app, "104");
+    app.scan().await;
+    assert!(reduce_only_orders(&app).is_empty());
+    common::set_mark(&app, "105");
+    app.scan().await;
+
+    // Assert：reduce_only、数量=持仓、仓位关闭、规则退休。
+    app.wait_for("突破全平仓位关闭", |a| a.positions().is_empty())
+        .await;
+    app.wait_for("突破全平规则退休", |a| {
+        a.rule(rule.id).unwrap().status == WatchRuleStatus::Retired
+    })
+    .await;
+    let closes = reduce_only_orders(&app);
+    assert_eq!(closes.len(), 1);
+    assert_eq!(closes[0].side, Side::Sell);
+    assert_eq!(closes[0].quantity, dec("2"));
+    assert_eq!(closes[0].status, trading_models::OrderStatus::Filled);
+    assert_eq!(app.ledger.position(DEFAULT_INSTRUMENT), None);
 }

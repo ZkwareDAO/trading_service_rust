@@ -2,7 +2,7 @@
 
 use trading_models::{OrderStatus, OrderType};
 
-use e2e_test::harness::{self as common, dec, DEFAULT_INSTRUMENT};
+use crate::harness::{self as common, dec, DEFAULT_INSTRUMENT};
 
 #[tokio::test]
 async fn o01_market_open_fills_and_creates_position() {

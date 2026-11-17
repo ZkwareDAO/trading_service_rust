@@ -5,8 +5,8 @@ use trading_models::{
     InstrumentType, OrderType, Side, WatchConditionKind, WatchRule, WatchRuleStatus,
 };
 
-use e2e_test::harness::TestApp;
-use e2e_test::harness::{self as common, dec, DEFAULT_INSTRUMENT};
+use crate::harness::TestApp;
+use crate::harness::{self as common, dec, DEFAULT_INSTRUMENT};
 
 /// `new` 开仓规则要素（用具名字段替代 9 个位置参数）。
 struct OpenRuleSpec {

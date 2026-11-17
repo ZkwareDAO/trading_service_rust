@@ -878,24 +878,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
-name = "e2e-test"
-version = "0.1.0"
-dependencies = [
- "axum",
- "rust_decimal",
- "serde_json",
- "store-core",
- "tempfile",
- "tokio",
- "tower",
- "trading-exchange",
- "trading-models",
- "trading-service",
- "trading-sim",
- "trading-store",
-]
-
-[[package]]
 name = "ecdsa"
 version = "0.16.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3549,6 +3531,7 @@ dependencies = [
  "trading-core",
  "trading-exchange",
  "trading-models",
+ "trading-sim",
  "trading-store",
 ]
 

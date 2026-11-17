@@ -37,7 +37,6 @@
 | `crates/store-core` | 库：通用内存表（表锁 + 行子锁）、`Model` 约束、CSV 快照原子读写、跨日 rollover |
 | `crates/trading-store` | 库：业务装配门面，注册各内存表 + `OrderRepo`/`PositionRepo`/`RuleRepo` 等业务状态机仓储；`src/async_rt.rs` 为 store-core 的 tokio 适配（`spawn_blocking` 恢复/落盘 + 定时任务） |
 | `crates/trading-core` | 库：定点 Decimal 线格式、ID/时间工具、WS/REST 协议（模型类型来自 trading-models） |
-| `crates/e2e-test` | dev-only：跨 crate 业务链 E2E（20 场景）+ 共享 harness；`publish = false`，不进入发布物 |
 | `crates/trading-exchange` | 库：交易所接入层。统一契约（`api`：`ExchangeApi`/`AccountEventStream`/`MarketDataStream`/`RuleFetcher`）、对宿主的出站端口（`port`：凭证解析/订单回报）、纯映射/退避/心跳/对账内核、`binance`/`deribit`/`hyperliquid` 适配器 + `xili` 本地模拟所适配器、`provider` 装配工厂、`runtime` 账户连接监督引擎；只向下依赖 trading-core/trading-models，不反向依赖服务 |
 | `crates/trading-service/src/main.rs` | 二进制 **trading-service**：解析配置 → 实现出站端口 → 构造交易所注册表 → 南向 bind WS、管理 REST 与业务编排 |
 | `crates/trading-service/src/bin/xili-exchange.rs` | 二进制 **xili-exchange**：本地模拟交易所，固定端口同时提供 REST + `/ws` 账户事件，按节奏模拟成交 |
@@ -260,9 +259,10 @@ cargo test --workspace
 cargo test --workspace --all-features
 
 # 分层聚焦（定位失败时用）
-cargo test -p e2e-test                              # 跨 crate 业务链 E2E（20）
+cargo test -p trading-service --test e2e            # 跨模块业务链 E2E（21，in-process）
+cargo test -p trading-service --test blackbox       # 进程级黑盒 smoke（4）
 cargo test -p trading-exchange --test conformance   # 交易所接口契约
-cargo test -p trading-service --test rest_api       # REST 协议契约
+cargo test -p trading-service --test api            # REST 接口级契约（33，ctp 时 34）
 cargo test -p trading-service --test south_ws       # 南向 WS 协议契约
 cargo test -p trading-service --test persistence    # 持久化往返
 cargo test -p trading-service --test properties     # 服务层 L1 属性测试

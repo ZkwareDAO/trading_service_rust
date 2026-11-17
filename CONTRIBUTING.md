@@ -17,9 +17,10 @@
 | `cargo test --workspace --all-features` | 全 feature 测试集（含 CTP 适配代码） |
 | `cargo test -p trading-exchange --features ctp ctp` | CTP 适配层单测 |
 | `cargo test -p trading-service --features ctp` | 含 CTP feature 的服务测试 |
-| `cargo test -p e2e-test` | 跨 crate 业务链 E2E（20 用例，真实 store/engine + 模拟所） |
+| `cargo test -p trading-service --test e2e` | 跨模块业务链 E2E（21 用例，in-process 真实 store/engine + 模拟所） |
+| `cargo test -p trading-service --test blackbox` | 进程级黑盒 smoke（4 用例，真实二进制 + xili-exchange + REST） |
 | `cargo test -p trading-exchange --test conformance` | 交易所接口契约（后端无关，目前 sim 后端） |
-| `cargo test -p trading-service --test rest_api` | REST 协议契约 |
+| `cargo test -p trading-service --test api` | REST 接口级契约（33 用例，ctp 时 34） |
 | `cargo test -p trading-service --test south_ws` | 南向 WS 协议契约 |
 | `cargo test -p trading-service --test persistence` | 服务层持久化往返 |
 | `cargo test -p trading-service --test properties` | 服务层 L1 属性测试 |

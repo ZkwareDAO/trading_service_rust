@@ -6,7 +6,7 @@ use trading_models::{
     OrderStatus, OrderType, Side, WatchConditionKind, WatchRule, WatchRuleAction, WatchRuleStatus,
 };
 
-use e2e_test::harness::{self as common, dec, DEFAULT_INSTRUMENT};
+use crate::harness::{self as common, dec, DEFAULT_INSTRUMENT};
 
 #[tokio::test]
 async fn restart_recovers_state_from_csv_without_re_advancing_terminal_order() {

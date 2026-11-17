@@ -1387,4 +1387,12 @@ mod tests {
         order.rule_id = 0; // 非规则平仓。
         assert_eq!(h.drawdown_context(&order, Some(pos)), None);
     }
+
+    #[test]
+    fn spread_alert_cooldown_suppresses_duplicate_within_window() {
+        // 首次必发；冷却窗内抑制；到达窗口边界后恢复。
+        assert!(should_send_spread_alert(1_000, None, 60_000));
+        assert!(!should_send_spread_alert(60_999, Some(1_000), 60_000));
+        assert!(should_send_spread_alert(61_000, Some(1_000), 60_000));
+    }
 }

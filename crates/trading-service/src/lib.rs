@@ -151,6 +151,11 @@ pub mod testkit {
         AppLite { state, router }
     }
 
+    /// 管理面路由（与生产 `crate::admin_routes()` 同一份挂载），供接口测试复用。
+    pub fn admin_router() -> axum::Router<AppState> {
+        crate::admin_routes()
+    }
+
     /// 在随机本地端口起南向 WS 服务，返回可连接的 `/ws` 地址。
     ///
     /// 使用 `state` 内已装配的鉴权设置（dev 旁路或严格 HMAC 由调用方决定）；
@@ -458,18 +463,7 @@ pub async fn run() -> anyhow::Result<()> {
     let south_app = Router::new()
         .route("/", get(south::ws_handler))
         .route("/ws", get(south::ws_handler))
-        // 账户重载触发（预留）：POST 后重读 account.csv，连接在对账周期重建。
-        .route("/admin/accounts/reload", post(admin::reload_accounts));
-
-    // CTP 合约规格每日刷新（仅启用 ctp 时）：拉全量 → 落盘 + latest → 重灌合约目录。
-    #[cfg(feature = "ctp")]
-    let south_app = south_app.route("/admin/ctp/refresh-specs", post(admin::refresh_ctp_specs));
-
-    // K线历史手动补区间（仅 binance/deribit/hyperliquid；统一 code/message/data 信封）。
-    let south_app = south_app.route(
-        "/admin/klines/backfill",
-        post(api::handlers::klines_backfill::backfill),
-    );
+        .merge(admin_routes());
 
     let south_app = south_app
         // REST API（/health 与 /api/v1/*，与南向 WS 同端口）。
@@ -503,4 +497,23 @@ pub async fn run() -> anyhow::Result<()> {
     }
     info!("trading-service stopped");
     Ok(())
+}
+
+/// 管理面路由（生产与接口测试共用同一份挂载，避免路径漂移）。
+///
+/// * `POST /admin/accounts/reload`：重读 account.csv（连接在对账周期重建）；
+/// * `POST /admin/klines/backfill`：手动补历史 1m K线（统一信封）；
+/// * `POST /admin/ctp/refresh-specs`：CTP 合约规格刷新（仅 `feature="ctp"`）。
+fn admin_routes() -> Router<AppState> {
+    let routes = Router::new()
+        // 账户重载触发（预留）：POST 后重读 account.csv，连接在对账周期重建。
+        .route("/admin/accounts/reload", post(admin::reload_accounts));
+    // CTP 合约规格每日刷新（仅启用 ctp 时）：拉全量 → 落盘 + latest → 重灌合约目录。
+    #[cfg(feature = "ctp")]
+    let routes = routes.route("/admin/ctp/refresh-specs", post(admin::refresh_ctp_specs));
+    // K线历史手动补区间（仅 binance/deribit/hyperliquid；统一 code/message/data 信封）。
+    routes.route(
+        "/admin/klines/backfill",
+        post(api::handlers::klines_backfill::backfill),
+    )
 }

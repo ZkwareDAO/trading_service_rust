@@ -522,10 +522,46 @@ mod tests {
 
     use crate::api::test_support::app_with_accounts;
 
+    /// 带一个合成 binance 账户的 account.csv 正文。
+    const ACCOUNT_CSV: &str =
+        "0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n";
+
     /// 起带一个 binance 账户的应用。
     async fn app() -> Router {
-        let app = app_with_accounts("0,test_binance,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n").await;
+        let app = app_with_accounts(ACCOUNT_CSV).await;
         crate::api::router().with_state(app.state.clone())
+    }
+
+    /// 起带一个 binance 账户的应用，并种一条 BTCUSDT 多仓。
+    ///
+    /// 返回 `(router, 仓位 id, state)`：router 走真实 handler，state 供直接读表断言。
+    async fn app_with_long_position() -> (Router, u64, crate::state::AppState) {
+        let app = app_with_accounts(ACCOUNT_CSV).await;
+        let account_id = app
+            .state
+            .accounts
+            .resolve("test_binance", Some("binance"))
+            .unwrap()
+            .id;
+        let pos_id = app
+            .state
+            .store
+            .positions()
+            .unwrap()
+            .insert(trading_models::Position::new(
+                account_id,
+                "binance",
+                "BTCUSDT",
+                trading_models::Side::Buy,
+            ))
+            .unwrap()
+            .id;
+        let state = app.state.clone();
+        (
+            crate::api::router().with_state(state.clone()),
+            pos_id,
+            state,
+        )
     }
 
     async fn post(router: &Router, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
@@ -1110,5 +1146,66 @@ mod tests {
         let (status, v) = post(&router, "/api/v1/rules/batch", "{nope}").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(v["code"], 40001);
+    }
+
+    #[tokio::test]
+    async fn create_risk_rule_without_active_position_returns_40001() {
+        let router = app().await;
+        let body = r#"{"account":"test_binance","rule_type":"risk","position_id":999999,
+            "condition_kind":"roi","operator":">=","value":0.1}"#;
+        let (status, v) = post(&router, "/api/v1/rules", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(v["code"], 40001);
+    }
+
+    #[tokio::test]
+    async fn position_link_without_target_returns_40001() {
+        let (router, pos_id, _) = app_with_long_position().await;
+
+        let body = format!(
+            r#"{{"account":"test_binance","rule_type":"risk","position_id":{pos_id},
+                "condition_kind":"position","condition_instrument":"FILUSDT",
+                "operator":"==","value":0}}"#
+        );
+        let (status, v) = post(&router, "/api/v1/rules", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(v["code"], 40001);
+    }
+
+    #[tokio::test]
+    async fn operator_distinguishes_long_and_short_rules() {
+        let (router, pos_id, state) = app_with_long_position().await;
+
+        let long = format!(
+            r#"{{"account":"test_binance","rule_type":"risk","position_id":{pos_id},
+                "condition_kind":"roi","operator":">=","value":0.1}}"#
+        );
+        let short = format!(
+            r#"{{"account":"test_binance","rule_type":"risk","position_id":{pos_id},
+                "condition_kind":"roi","operator":"<=","value":-0.1}}"#
+        );
+        let (_, a) = post(&router, "/api/v1/rules", &long).await;
+        let (_, b) = post(&router, "/api/v1/rules", &short).await;
+        assert_ne!(a["data"]["id"], b["data"]["id"], "多空阈值应为两条独立规则");
+        assert_eq!(state.store.rule_repo().unwrap().list_active().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn new_rule_resubmit_same_identity_updates_order_type() {
+        let router = app().await;
+        let first = r#"{"account":"test_binance","rule_type":"new","exchange":"binance",
+            "instrument":"btcusdt","side":"buy","order_type":"limit","price":80000,
+            "quantity":0.1,"condition_kind":"price","condition_instrument":"BTCUSDT",
+            "operator":">=","value":90000}"#;
+        let (_, a) = post(&router, "/api/v1/rules", first).await;
+        let id = a["data"]["id"].as_u64().unwrap();
+
+        let second = r#"{"account":"test_binance","rule_type":"new","exchange":"binance",
+            "instrument":"btcusdt","side":"buy","order_type":"market",
+            "quantity":0.2,"condition_kind":"price","condition_instrument":"BTCUSDT",
+            "operator":">=","value":90000}"#;
+        let (_, b) = post(&router, "/api/v1/rules", second).await;
+        assert_eq!(b["data"]["id"].as_u64().unwrap(), id, "同身份应复用 id");
+        assert_eq!(b["data"]["order_type"], "MARKET");
     }
 }

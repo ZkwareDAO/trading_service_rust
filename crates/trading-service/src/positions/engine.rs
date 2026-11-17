@@ -1200,4 +1200,61 @@ mod tests {
         assert_eq!(binance_rows[0].quantity, dec("2"));
         assert_eq!(deribit_rows[0].quantity, dec("2"));
     }
+
+    #[tokio::test]
+    async fn empty_snapshot_sets_tombstone_close_fields() {
+        let (engine, repo) = engine_with(FakeAccounts::with(&[("alice", 7)]));
+        engine.load_and_verify(&all_profiles()).expect("档案装配");
+
+        engine
+            .on_position_snapshot(
+                "binance",
+                "alice",
+                &[info(
+                    "BTCUSDT",
+                    OrderPositionSide::Both,
+                    "1",
+                    "100",
+                    Some("125"),
+                    Some(10),
+                    None,
+                    None,
+                )],
+            )
+            .await;
+        engine.on_position_snapshot("binance", "alice", &[]).await;
+
+        let row = repo
+            .find_latest_including_deleted(
+                7,
+                "binance",
+                InstrumentType::Futures,
+                "BTCUSDT",
+                Side::Buy,
+            )
+            .expect("空快照后应保留 tombstone 行");
+        assert!(row.deleted, "空快照必须软删仓位");
+        assert!(row.close_time.is_some(), "软删必须写 close_time");
+        assert_eq!(row.quantity, dec("1"), "平仓后保留末值数量");
+    }
+
+    #[tokio::test]
+    async fn deribit_position_sync_uses_unit_leverage_and_btc_settle() {
+        let (engine, repo) = engine_with(FakeAccounts::with(&[("alice", 7)]));
+        engine.load_and_verify(&all_profiles()).expect("档案装配");
+
+        engine
+            .on_position_snapshot(
+                "deribit",
+                "alice",
+                &[deribit_info("BTC-27DEC24-100000-C", "1", Some("0.05"))],
+            )
+            .await;
+
+        let rows = repo.list_active();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].leverage, 1, "Deribit 仓位杠杆恒为 1");
+        assert_eq!(rows[0].multiplier, dec("1"), "Deribit 期权乘数按 1 记");
+        assert_eq!(rows[0].settle_currency, "BTC", "结算币种取合约首段");
+    }
 }
