@@ -12,10 +12,20 @@
 | --- | --- |
 | `cargo build --workspace` | 构建全部 crate（默认 feature） |
 | `cargo build -p trading-service --features ctp` | 构建含 CTP 期货适配的服务 |
+| `bash scripts/test-all.sh` | 一键门禁：fmt → clippy(all-features) → workspace → all-features（+ 可选覆盖率） |
 | `cargo test --workspace` | 默认测试集（**不含** `ctp` feature 代码） |
+| `cargo test --workspace --all-features` | 全 feature 测试集（含 CTP 适配代码） |
 | `cargo test -p trading-exchange --features ctp ctp` | CTP 适配层单测 |
 | `cargo test -p trading-service --features ctp` | 含 CTP feature 的服务测试 |
-| `cargo clippy --workspace --all-targets -- -D warnings` | 全目标 lint（含测试代码） |
+| `cargo test -p trading-service --test e2e` | 跨模块业务链 E2E（21 用例，in-process 真实 store/engine + 模拟所） |
+| `cargo test -p trading-service --test blackbox` | 进程级黑盒 smoke（4 用例，真实二进制 + xili-exchange + REST） |
+| `cargo test -p trading-exchange --test conformance` | 交易所接口契约（后端无关，目前 sim 后端） |
+| `cargo test -p trading-service --test api` | REST 接口级契约（33 用例，ctp 时 34） |
+| `cargo test -p trading-service --test south_ws` | 南向 WS 协议契约 |
+| `cargo test -p trading-service --test persistence` | 服务层持久化往返 |
+| `cargo test -p trading-service --test properties` | 服务层 L1 属性测试 |
+| `cargo test -p trading-models --test properties` | 领域模型 L1 属性测试 |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 全目标 lint（含测试代码与 CTP） |
 | `cargo fmt --all -- --check` | 格式检查 |
 | `scripts/build-ctp-mock.sh` | 构建 CTP 模拟器 `.so` 与 `ctp-mock-ctl`（联调 / 历史 tick 回放） |
 | `cd third_party/ctp-mock && cargo test --workspace` | CTP 模拟器自身单测（嵌套 workspace） |
@@ -23,7 +33,12 @@
 
 > `ctp` 不是默认 feature：`cargo test --workspace` 不会编译 CTP 适配代码。改动
 > `crates/trading-exchange/src/ctp/**` 或 `trading-service` 的 CTP 路径时，必须额外跑带
-> `--features ctp` 的测试。
+> `--features ctp`（或 `--all-features`）的测试。
+>
+> 测试资产分层见 `docs/internal/自动化测试体系.md`，各包集成测试清单见
+> `docs/internal/集成测试清单.md`。L1 属性测试（proptest）门禁固定 seed、
+> `cases = 10_000`；夜间用 `PROPTEST_RNG_SEED=<随机数> PROPTEST_CASES=1000000`
+> 放量。失败反例写入包根 `proptest-regressions/`，**一旦产生必须随代码提交**。
 >
 > `third_party/ctp-mock` 是**独立嵌套 workspace**（自带 `Cargo.lock` 与 `target/`）：根
 > `cargo test/clippy/fmt --workspace` 不覆盖它，改动模拟器时需在 `third_party/ctp-mock`
@@ -46,9 +61,10 @@ type 取值：`feat` / `fix` / `refactor` / `docs` / `test` / `chore` / `perf` /
 1. 从 `main` 拉出 feature 分支；
 2. 实现 + 测试——**每个 PR 必须包含完整、逻辑清晰的测试代码**，方便 reviewer 审核；
 3. 提交前自查：
-   - `cargo clippy --workspace --all-targets -- -D warnings` 零警告
+   - `cargo clippy --workspace --all-targets --all-features -- -D warnings` 零警告
    - `cargo fmt --all -- --check` 通过
-   - `cargo test --workspace` 全绿；涉及 CTP 时补 `--features ctp`
+   - `cargo test --workspace` 全绿；涉及 CTP 时补 `--features ctp` 或 `--all-features`
+   - 直接跑 `bash scripts/test-all.sh` 可一次覆盖上述门禁
 4. PR 描述写清：动机、方案要点、测试方式。
 
 ## 代码约定（摘自项目原则）

@@ -251,12 +251,24 @@ CTP 模拟器联调专用变量（`CTP_MOCK_CTRL_TD` / `CTP_MOCK_CTRL_MD` /
 ## 测试
 
 ```bash
-# 默认测试集（不含 ctp feature）
+# 一键门禁（fmt + clippy(all-features) + workspace + all-features）
+bash scripts/test-all.sh
+
+# 默认测试集（不含 ctp feature）；--all-features 覆盖 CTP 适配代码
 cargo test --workspace
-# CTP 适配不在默认 feature 中，需显式开启
-cargo test -p trading-exchange --features ctp ctp
-cargo test -p trading-service --features ctp
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-features
+
+# 分层聚焦（定位失败时用）
+cargo test -p trading-service --test e2e            # 跨模块业务链 E2E（21，in-process）
+cargo test -p trading-service --test blackbox       # 进程级黑盒 smoke（4）
+cargo test -p trading-exchange --test conformance   # 交易所接口契约
+cargo test -p trading-service --test api            # REST 接口级契约（33，ctp 时 34）
+cargo test -p trading-service --test south_ws       # 南向 WS 协议契约
+cargo test -p trading-service --test persistence    # 持久化往返
+cargo test -p trading-service --test properties     # 服务层 L1 属性测试
+cargo test -p trading-models  --test properties     # 领域模型 L1 属性测试
+
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 # CTP 模拟器是独立嵌套 workspace（自带 Cargo.lock/target，不在根 workspace 测试集内）
 cd third_party/ctp-mock && cargo test --workspace

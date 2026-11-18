@@ -1205,4 +1205,34 @@ mod tests {
     fn d(x: f64) -> Decimal {
         Decimal::try_from(x).unwrap()
     }
+
+    #[test]
+    fn ine_market_converts_to_limit_only_when_configured() {
+        let dir = dir_with("INE", 1.0, PRODUCT_FUTURES);
+        let quotes = quotes_with(Some(600.0), Some(601.0));
+
+        // INE 在集合内：买市价转卖一穿价限价。
+        let limited = prepare_ctp_market(
+            &dir,
+            &quotes,
+            1,
+            &["INE".to_string()],
+            non_shfe_market_req(Side::Buy, false),
+        )
+        .expect("有盘口应可转限价");
+        assert_eq!(limited.order_type, OrderType::Limit);
+        // 开仓买市价：卖一 601 + 1 tick 漂移 = 602。
+        assert_eq!(limited.price, Some(d(602.0)));
+
+        // INE 不在集合内：保持原生市价（DCE/CZCE 同口径）。
+        let market = prepare_ctp_market(
+            &dir,
+            &quotes,
+            1,
+            &shfe_only(),
+            non_shfe_market_req(Side::Buy, false),
+        )
+        .expect("有盘口应可直接市价");
+        assert_eq!(market.order_type, OrderType::Market);
+    }
 }

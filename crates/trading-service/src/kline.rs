@@ -720,7 +720,7 @@ impl KlineService {
     }
 
     /// 某作用域的期望来源视图（配置基线 ∪ 登记表快照；attach 与测试共用）。
-    pub fn source_for(&self, venue: &str, itype: InstrumentType) -> BaselineDesired {
+    pub(crate) fn source_for(&self, venue: &str, itype: InstrumentType) -> BaselineDesired {
         BaselineDesired {
             source: RegistrySource::new(
                 Arc::clone(&self.registry),

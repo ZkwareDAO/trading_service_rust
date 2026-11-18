@@ -18,3 +18,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 csv = { workspace = true }
+# L1 属性测试：不变量（固定 seed / cases=10_000 门禁）
+proptest = { workspace = true }

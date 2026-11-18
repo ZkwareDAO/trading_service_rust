@@ -364,4 +364,14 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn risk_pct_half_of_odd_position_yields_fractional() {
+        // 3 手 × 50% = 1.5：构造层不得静默取整；是否可下单由 CTP 适配层拒绝非整数手。
+        let mut pos = long_position();
+        pos.quantity = dec("3");
+        let rule = risk_rule(OrderType::Market, "0", "0.5");
+        let order = build_rule_order(&rule, Some(&pos), false, cid()).unwrap();
+        assert_eq!(order.order_quantity, dec("1.5"));
+    }
 }

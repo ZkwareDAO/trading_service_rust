@@ -821,4 +821,44 @@ mod tests {
             PlaceDefer::DataNotReady
         );
     }
+
+    #[test]
+    fn normalize_instrument_trims_and_is_case_sensitive() {
+        let p = CtpProvider::new(
+            deps_with(Arc::new(StubResolver(Mutex::new(
+                std::collections::HashMap::new(),
+            )))),
+            test_config(),
+        );
+        // CTP 国内合约号大小写敏感：只去首尾空白，不补后缀、不转大写。
+        assert_eq!(p.normalize_instrument("ctp", " i2601 "), "i2601");
+        assert_eq!(p.normalize_instrument("ctp", "I2601"), "I2601");
+        assert_eq!(p.normalize_instrument("ctp", ""), "");
+    }
+
+    #[test]
+    fn prepare_placement_without_specs_defers_data_not_ready() {
+        let p = CtpProvider::new(
+            deps_with(Arc::new(StubResolver(Mutex::new(
+                std::collections::HashMap::new(),
+            )))),
+            test_config(),
+        );
+        let req = crate::api::PlaceOrderRequest {
+            instrument: "rb2701".into(),
+            instrument_type: trading_models::InstrumentType::Futures,
+            side: trading_models::Side::Buy,
+            order_type: trading_models::OrderType::Market,
+            price: None,
+            quantity: rust_decimal::Decimal::ONE,
+            reduce_only: false,
+            position_side: crate::api::OrderPositionSide::Both,
+            time_in_force: None,
+            client_order_id: "c-precheck".into(),
+        };
+        assert!(matches!(
+            p.prepare_placement("ctp", req),
+            Err(crate::api::PlaceDefer::DataNotReady)
+        ));
+    }
 }

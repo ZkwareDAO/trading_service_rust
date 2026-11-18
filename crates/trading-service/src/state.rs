@@ -31,6 +31,18 @@ use crate::south_auth::SouthAuth;
 /// 启动期静态端点覆盖（进程级，随进程生命周期）。
 pub type VenueEndpoints = Arc<Vec<VenueEndpoint>>;
 
+/// 交易所注册表装配工厂。
+///
+/// 生产装配用 [`ExchangeRegistry::builtin`]；测试（如 M1 全链路 E2E）可注入
+/// 自定义 provider 集（`trading-sim`），从而复用真实 `TradingStore`/`AppState`/
+/// 规则引擎，无需改动本装配层。
+pub type RegistryFactory = Arc<dyn Fn(ProviderDeps) -> ExchangeRegistry + Send + Sync>;
+
+/// 生产默认注册表工厂：登记全部内置交易所套件。
+pub fn builtin_registry_factory() -> RegistryFactory {
+    Arc::new(ExchangeRegistry::builtin)
+}
+
 /// 装配 [`AppState`] 所需的进程级参数。
 ///
 /// 数据句柄（各 repo、行情/规则表、账户表）全部由 [`TradingStore`] 统一提供，
@@ -68,6 +80,8 @@ pub struct AssemblyDeps {
     pub notify_profiles: Arc<crate::notify::profile::NotifyProfiles>,
     /// 全部 venue 可调参数（deribit 价差/漂移、hyperliquid 滑点）。
     pub venue: crate::venue_config::LoadedVenueConfigs,
+    /// 交易所注册表装配工厂（生产 `builtin`；测试注入模拟所 provider）。
+    pub registry_factory: RegistryFactory,
 }
 
 #[derive(Clone)]
@@ -113,6 +127,7 @@ impl AppState {
             channels,
             notify_profiles,
             venue,
+            registry_factory,
         } = deps;
 
         // K线单表保留窗在任何 bar 到达前按 CLI/config 收紧（缺省 1440 条 / 24h）。
@@ -212,7 +227,8 @@ impl AppState {
                 page_delay: venue.kline.backfill.page_delay,
             },
         };
-        let exchanges = Arc::new(ExchangeRegistry::builtin(provider_deps));
+        // 注册表经注入工厂装配：生产为内置套件，E2E 测试为模拟所 provider。
+        let exchanges = Arc::new(registry_factory(provider_deps));
         // 启动自检（fail-fast）：汇总各 provider 自描述的仓位档案装入引擎并校验，
         // 装配失败（空集/重复 exchange 等）直接 panic，拒绝「某所静默不对账」带病启动。
         engine
