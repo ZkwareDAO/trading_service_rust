@@ -47,7 +47,10 @@ pub mod rules;
 pub use accounts::{AccountBrief, AccountManager, ResolvedAccount};
 pub use async_rt::{PersistRuntime, PersistTaskHandle};
 pub use history::HistoryReader;
-pub use kline::{FlushReport as KlineFlushReport, KlineRepo};
+pub use kline::{
+    FlushOptions, FlushReport as KlineFlushReport, KlineRepo, DEFAULT_FLUSH_MAX_ROWS,
+    FLUSH_SHARD_COUNT,
+};
 pub use leverage::{should_set_leverage, LeverageKey, LeverageRepo};
 pub use memory::MemoryTables;
 pub use orders::{OrderEventInput, OrderRepo, OrderRepoError};

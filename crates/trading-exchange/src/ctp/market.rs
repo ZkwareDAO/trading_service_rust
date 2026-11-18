@@ -3,6 +3,7 @@
 //! 柜台未开行情前置时（登录码 64 等）降级：不订阅、不写行情表，
 //! 仓位重估由宿主 fallback_valuation 语义处理，不阻断交易。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +44,18 @@ const KLINE_MAX_FUTURE_MS: i64 = 30 * 60_000;
 
 /// 会话内订阅集对账周期（业务 ∪ K线）；tick 很密，避免每个事件都扫仓储。
 const MD_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 判定“仍在补积压”的行情滞后阈值：`本机墙钟 − tick 事件时间` 超过该值即视为
+/// drain 落后于柜台（正常行情 lag < 100ms）。积压期延迟 sweep，避免跨品种水位
+/// 把本应入桶的尾段 tick 判成“迟到”丢弃。
+const KLINE_CATCHUP_LAG_MS: i64 = 2_000;
+
+/// 积压期最多推迟 sweep 的时长：到点强制定稿一次，防内存与推送延迟无界
+/// （推送延迟上界 ≈ 10s + 2s 合帧，绝不跨分钟桶）。
+const KLINE_MAX_SWEEP_DEFER_MS: i64 = 10_000;
+
+/// 未来时间戳脏 tick 的告警限频间隔（按合约，60s 一条 + 抑制计数）。
+const FUTURE_TICK_WARN_INTERVAL_MS: i64 = 60_000;
 
 /// 兴趣集为空时的保活重查间隔：线程不退出，睡一个分片周期后重读兴趣集。
 /// 固定间隔、**不走** [`ReconnectBackoff`]——兴趣集是冷启动竞态下的临时空窗
@@ -428,6 +441,14 @@ fn run_md_session(
     // 仍需收口 K线最后一根（否则 `idle` 永远为 false）。
     let mut last_kline_tick = std::time::Instant::now();
     let mut last_wallclock_sweep = std::time::Instant::now();
+    // 最近一笔 tick 的“本机墙钟 − 事件时间”滞后（积压判定输入）。
+    let mut last_lag_ms: i64 = 0;
+    // 最近一次**真正执行** sweep 的本地时刻；延迟拍不更新，用于硬上限计时。
+    let mut last_sweep_at = std::time::Instant::now();
+    // 积压期被推迟的 sweep 拍数（随 K线诊断周期上报）。
+    let mut deferred_sweeps: u64 = 0;
+    // 未来时间戳脏 tick 的告警限频器（按合约，避免脏数据刷爆日志）。
+    let mut future_warn = FutureTickWarnLimiter::default();
     // 诊断增量基准：FFI 回调数 / 已 drain 事件数 / 通道阻塞纳秒。
     let mut drained_ticks: u64 = 0;
     let mut last_cb: u64 = 0;
@@ -462,9 +483,12 @@ fn run_md_session(
                 if let Some(ms) = tick_ms {
                     let lag = now_ms().saturating_sub(ms).max(0);
                     min_lag_ms = min_lag_ms.min(lag);
+                    // 积压判定只看最近一笔：恢复期滞后持续 > 阈值即视为仍在补积压。
+                    last_lag_ms = lag;
                 }
-                // 诊断：逐笔 tick 合约/最新价/买卖一（debug，用于确认各所实时行情是否进表）。
-                tracing::debug!(
+                // 诊断：逐笔 tick 合约/最新价/买卖一（trace，仅排障时开启；drain 热路径
+                // 禁止同步 debug 级日志 IO，否则磁盘饱和时单批日志会膨胀成数十万行）。
+                tracing::trace!(
                     instrument = %t.instrument,
                     last = t.last_price,
                     bid = t.bids[0].price,
@@ -499,15 +523,24 @@ fn run_md_session(
                             if let (Some(update_ms), Some(price)) =
                                 (tick_ms, Decimal::try_from(t.last_price).ok())
                             {
-                                if is_future_tick(update_ms, now_ms()) {
+                                // 同一次判定只取一次墙钟：未来性判定与告警限频共用。
+                                let wall_now = now_ms();
+                                if is_future_tick(update_ms, wall_now) {
                                     // 柜台把 ActionDay 填成 TradingDay（次日/下周一）时，单条
                                     // 快照会把全局水位永久推到未来，随后当日 tick 全被判迟到。
                                     // 此类脏时间戳不进 K 线聚合（业务报价路径不受影响）。
-                                    tracing::warn!(
-                                        instrument = %t.instrument,
-                                        tick_ms = update_ms,
-                                        "丢弃未来时间戳的 K线 tick（疑似 ActionDay 脏数据）"
-                                    );
+                                    // 按合约限频：同合约 60s 内只告警一次，并带出抑制条数，
+                                    // 避免 1M+ 条 WARN 反过来把日志 IO 变成 drain 瓶颈。
+                                    if let Some(suppressed) =
+                                        future_warn.should_warn(&t.instrument, wall_now)
+                                    {
+                                        tracing::warn!(
+                                            instrument = %t.instrument,
+                                            tick_ms = update_ms,
+                                            suppressed,
+                                            "丢弃未来时间戳的 K线 tick（疑似 ActionDay 脏数据）"
+                                        );
+                                    }
                                 } else {
                                     let candle = crate::ctp::bar_agg::to_candle_tick(
                                         day,
@@ -544,23 +577,34 @@ fn run_md_session(
         // 2) 订阅对账按 ~1s 节流：tick 很密，不能每个事件都扫仓位/规则仓储；对账内容为
         //    业务兴趣 ∪ K线期望 的并集，会话内增减无需断线重连。
         if let Some(k) = kline {
-            let kline_idle = last_kline_tick.elapsed() >= KLINE_IDLE_SWEEP_AFTER;
-            if idle || (kline_idle && last_wallclock_sweep.elapsed() >= KLINE_IDLE_SWEEP_AFTER) {
-                last_wallclock_sweep = std::time::Instant::now();
-                // 先把本机墙钟按“已观测最小行情滞后”校正成行情时间，再留 grace——即便
-                // 本机时钟相对行情偏移，也不会在桶尾 tick 到达前提前定稿。
-                let feed_now = now_ms().saturating_sub(feed_offset_ms(min_lag_ms));
-                let swept = k
-                    .stream
-                    .sweep_kline_finalized(feed_now.saturating_sub(KLINE_IDLE_GRACE_MS));
-                if !swept.is_empty() {
-                    tracing::debug!(count = swept.len(), "CTP 空闲拍墙钟 sweep 定稿 K线");
-                }
+            // T5：积压期延迟 sweep（最多 KLINE_MAX_SWEEP_DEFER_MS），让恢复期尾段 tick
+            // 仍能并入在途桶，避免跨品种水位把本应入桶的 tick 判成“迟到”丢弃。
+            let behind = last_lag_ms > KLINE_CATCHUP_LAG_MS;
+            let since_last_sweep_ms =
+                last_sweep_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+            if should_defer_sweep(behind, since_last_sweep_ms) {
+                deferred_sweeps = deferred_sweeps.saturating_add(1);
             } else {
-                // 事件拍：水位定稿（水位未越界时 O(1) 返回），绝不读本机墙钟。
-                let swept = k.stream.sweep_kline_by_watermark();
-                if !swept.is_empty() {
-                    tracing::debug!(count = swept.len(), "CTP 水位 sweep 定稿 K线");
+                last_sweep_at = std::time::Instant::now();
+                let kline_idle = last_kline_tick.elapsed() >= KLINE_IDLE_SWEEP_AFTER;
+                if idle || (kline_idle && last_wallclock_sweep.elapsed() >= KLINE_IDLE_SWEEP_AFTER)
+                {
+                    last_wallclock_sweep = std::time::Instant::now();
+                    // 先把本机墙钟按“已观测最小行情滞后”校正成行情时间，再留 grace——即便
+                    // 本机时钟相对行情偏移，也不会在桶尾 tick 到达前提前定稿。
+                    let feed_now = now_ms().saturating_sub(feed_offset_ms(min_lag_ms));
+                    let swept = k
+                        .stream
+                        .sweep_kline_finalized(feed_now.saturating_sub(KLINE_IDLE_GRACE_MS));
+                    if !swept.is_empty() {
+                        tracing::debug!(count = swept.len(), "CTP 空闲拍墙钟 sweep 定稿 K线");
+                    }
+                } else {
+                    // 事件拍：水位定稿（水位未越界时 O(1) 返回），绝不读本机墙钟。
+                    let swept = k.stream.sweep_kline_by_watermark();
+                    if !swept.is_empty() {
+                        tracing::debug!(count = swept.len(), "CTP 水位 sweep 定稿 K线");
+                    }
                 }
             }
             // 周期诊断：迟到/乱序/疑似丢快照 + 行情滞后 + 回调/消费/背压增量
@@ -584,6 +628,7 @@ fn run_md_session(
                     drained_delta,
                     kline_delta,
                     blocked_delta,
+                    deferred_sweeps,
                 );
             }
         }
@@ -796,6 +841,38 @@ fn is_future_tick(tick_ms: i64, now_ms: i64) -> bool {
     tick_ms > now_ms.saturating_add(KLINE_MAX_FUTURE_MS)
 }
 
+/// 积压期是否跳过本拍 sweep（纯判定函数，便于单测）。
+///
+/// * 未积压 → 正常 sweep，行为与旧实现完全一致；
+/// * 积压且距上次真正 sweep 未到硬上限 → 推迟，给迟到 tick 留入桶窗口；
+/// * 超过硬上限 → 强制定稿一次，防内存/延迟无界。
+fn should_defer_sweep(behind: bool, since_last_sweep_ms: i64) -> bool {
+    behind && since_last_sweep_ms < KLINE_MAX_SWEEP_DEFER_MS
+}
+
+/// 未来时间戳 WARN 的按合约限频器（60s 一条 + 期间抑制计数）。
+///
+/// 柜台把 ActionDay 填成 TradingDay 时，同一合约可能每秒刷出成百上千条脏 tick，
+/// 无限制告警本身就成为日志 IO 热点，反过来加剧 drain 积压。
+#[derive(Debug, Default)]
+struct FutureTickWarnLimiter {
+    /// 合约 → （下次允许告警的本机时间毫秒，限频窗口内被抑制的条数）。
+    state: HashMap<String, (i64, u64)>,
+}
+
+impl FutureTickWarnLimiter {
+    /// 允许告警时返回 `Some(上次告警以来被抑制的条数)`，否则返回 `None`。
+    fn should_warn(&mut self, instrument: &str, now_ms: i64) -> Option<u64> {
+        let entry = self.state.entry(instrument.to_string()).or_insert((0, 0));
+        if now_ms < entry.0 {
+            entry.1 = entry.1.saturating_add(1);
+            return None;
+        }
+        entry.0 = now_ms.saturating_add(FUTURE_TICK_WARN_INTERVAL_MS);
+        Some(std::mem::replace(&mut entry.1, 0))
+    }
+}
+
 /// 空闲拍墙钟校正量：已观测到的“本机墙钟 − 行情事件时间”最小值。
 /// `i64::MAX`（尚未观测到任何 tick）与负值都按 0 处理（不校正）。
 fn feed_offset_ms(min_lag_ms: i64) -> i64 {
@@ -815,6 +892,7 @@ fn report_kline_diagnostics(
     drained_delta: u64,
     kline_delta: u64,
     blocked_ns_delta: u64,
+    deferred_sweeps: u64,
 ) {
     let watermark = stream.kline_watermark_ms();
     if watermark <= 0 {
@@ -841,6 +919,7 @@ fn report_kline_diagnostics(
             kline_ticks = kline_delta,
             tick_queue_backlog_delta = backlog,
             send_blocked_ms = blocked_ms,
+            deferred_sweeps,
             drain_lag_ms = drain_lag,
             feed_offset_ms = feed_offset_ms(min_lag_ms),
             "CTP K线聚合诊断：存在丢弃/疑似丢快照/背压"
@@ -853,6 +932,7 @@ fn report_kline_diagnostics(
             drained_ticks = drained_delta,
             kline_ticks = kline_delta,
             tick_queue_backlog_delta = backlog,
+            deferred_sweeps,
             drain_lag_ms = drain_lag,
             feed_offset_ms = feed_offset_ms(min_lag_ms),
             "CTP K线聚合诊断正常"
@@ -886,6 +966,34 @@ mod tests {
             turnover: 0.0,
             open_interest: 0.0,
         }
+    }
+
+    #[test]
+    fn future_tick_warn_limiter_is_per_instrument_and_counts_suppressed() {
+        let mut limiter = FutureTickWarnLimiter::default();
+        // 首次必告警（无抑制）。
+        assert_eq!(limiter.should_warn("dce.cu2601", 1_000), Some(0));
+        // 限频窗口内静默，只累计抑制计数。
+        assert_eq!(limiter.should_warn("dce.cu2601", 1_001), None);
+        assert_eq!(limiter.should_warn("dce.cu2601", 30_000), None);
+        // 限频按合约独立：别的合约不受影响。
+        assert_eq!(limiter.should_warn("dce.rb2601", 30_001), Some(0));
+        // 窗口到期再告警，并带出期间被抑制的条数（2 条）。
+        assert_eq!(limiter.should_warn("dce.cu2601", 61_000), Some(2));
+        assert_eq!(limiter.should_warn("dce.cu2601", 61_001), None);
+    }
+
+    #[test]
+    fn should_defer_sweep_only_while_behind_within_cap() {
+        // 正常（lag≈0）：绝不推迟，行为与旧实现完全一致。
+        assert!(!should_defer_sweep(false, 0));
+        assert!(!should_defer_sweep(false, KLINE_MAX_SWEEP_DEFER_MS + 1));
+        // 积压：允许推迟，给迟到 tick 留入桶窗口。
+        assert!(should_defer_sweep(true, 0));
+        assert!(should_defer_sweep(true, KLINE_MAX_SWEEP_DEFER_MS - 1));
+        // 到达硬上限必须强制定稿一次，防内存/推送延迟无界。
+        assert!(!should_defer_sweep(true, KLINE_MAX_SWEEP_DEFER_MS));
+        assert!(!should_defer_sweep(true, KLINE_MAX_SWEEP_DEFER_MS + 1));
     }
 
     #[test]

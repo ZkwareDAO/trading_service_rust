@@ -12,10 +12,13 @@
 //! 分层约束：本类型是唯一碰 K线文件的地方（文件 IO 收口在 store 层），
 //! exchange/service 只写内存表，不直接落盘。
 
-use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use store_core::persistence::sanitize_dir_name;
 use trading_core::kline::{BarTable, DirtyBar, SeriesKey, TickTable};
@@ -30,7 +33,7 @@ const TICK_DIR: &str = "tick";
 const NIGHT_SESSION_FORWARD_DAYS: i64 = 3;
 
 /// 一个 CSV 目标文件的身份：venue / 周期(或 tick) / 交易日 / 合约。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct CsvTarget {
     venue: String,
     interval: String,
@@ -38,19 +41,42 @@ struct CsvTarget {
     symbol: String,
 }
 
-/// tick WAL 待写窗口的最小契约：批量取出后清空，失败时整批放回队首。
-/// bar 不走这条 drain 路径——bar 表是单一事实源，flush 为非破坏式（见 [`KlineRepo::flush_bars`]）。
-trait BatchWindow<T> {
-    fn drain_all(&self) -> Vec<T>;
-    fn requeue_front(&self, batch: Vec<T>);
+/// 单批刷盘行数缺省上限：磁盘饱和时避免把数十万行一次性编码/写盘，
+/// 把单批 IO 切成多个小拍（余量留在表内/窗口等下一拍）。
+pub const DEFAULT_FLUSH_MAX_ROWS: usize = 20_000;
+
+/// 每拍写盘时间预算缺省值：超过预算的分组留到下一拍，避免单次 flush 长时间占住
+/// 刷盘线程（故障期 426 文件/批的 open/close 风暴）。
+const DEFAULT_FLUSH_WRITE_BUDGET: Duration = Duration::from_millis(200);
+
+/// 周期拍 bar 分片数：按文件分组轮转，每拍只写 1/N 组，其余保持 dirty。
+pub const FLUSH_SHARD_COUNT: usize = 4;
+
+/// CSV 文件句柄缓存上限（LRU）。每个合约日文件一个句柄；512 远小于
+/// 生产 `ulimit -n`（524288），又能覆盖全品种同时刷盘的活跃文件集。
+const HANDLE_CACHE_CAP: usize = 512;
+
+/// 一次 flush 的调度选项（单拍行数上限 / 写盘时间预算 / 分片数）。
+///
+/// 缺省 `shard_count = 1`：一次 flush 即全量写 dirty（停机收尾/测试/历史预热口径）。
+/// 周期刷盘由服务传 `FLUSH_SHARD_COUNT` 做分片轮转。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushOptions {
+    /// 单拍最多处理的行数（`0` 按 1 处理，保证进度）。
+    pub max_rows: usize,
+    /// 单拍写盘时间预算；耗尽后其余分组留到下一拍（至少写一个分组）。
+    pub write_budget: Duration,
+    /// 分片数：>1 时按目标文件稳定哈希分片，每拍只写一组（未写组保持 dirty，仅 bar）。
+    pub shard_count: usize,
 }
 
-impl BatchWindow<RawTick> for TickTable {
-    fn drain_all(&self) -> Vec<RawTick> {
-        TickTable::drain_all(self)
-    }
-    fn requeue_front(&self, batch: Vec<RawTick>) {
-        TickTable::requeue_front(self, batch)
+impl Default for FlushOptions {
+    fn default() -> Self {
+        Self {
+            max_rows: DEFAULT_FLUSH_MAX_ROWS,
+            write_budget: DEFAULT_FLUSH_WRITE_BUDGET,
+            shard_count: 1,
+        }
     }
 }
 
@@ -63,126 +89,319 @@ pub struct FlushReport {
     pub rows: usize,
 }
 
-/// K线 CSV 仓储：持有数据根目录，廉价克隆，无内部缓存。
+/// 编码+追加的结果：已写分组（供 bar 按 `(start,gen)` 精确确认）、未写行
+/// （供 tick WAL requeue）与首个 IO 错误。
+struct AppendOutcome<T> {
+    report: FlushReport,
+    written: Vec<(CsvTarget, Vec<T>)>,
+    unwritten: Vec<T>,
+    error: Option<std::io::Error>,
+}
+
+/// 一个缓存的 CSV 写入句柄（append 模式）与最近使用序号（LRU 依据）。
+#[derive(Debug)]
+struct CachedHandle {
+    file: File,
+    last_used: u64,
+}
+
+/// CSV 写入句柄的 LRU 缓存：按目标文件（venue/周期/交易日/合约）复用 append 句柄，
+/// 消除「每批每文件 open/close」的 IO 风暴（故障期单批 426 文件）。
+///
+/// 清理时机：
+/// * 写失败 → 立即失效该句柄（下次重开，避免复用一个已坏句柄）；
+/// * 换日写同一合约 → 清理旧交易日句柄；
+/// * 超过上限 → 淘汰最久未用；停机由 [`KlineRepo::close_handles`] 统一关闭。
+///
+/// 已知限制：外部对已缓存文件的截断/轮转（如 logrotate）不会被感知，追加会落到旧
+/// inode；文件按「交易日」轮换、且进程重启/换日/淘汰都会重开，故不额外做每次 stat。
+#[derive(Debug)]
+struct HandleCache {
+    entries: HashMap<CsvTarget, CachedHandle>,
+    /// 单调递增的使用序号（LRU 排序依据）。
+    tick: u64,
+    /// 句柄上限。
+    cap: usize,
+}
+
+impl HandleCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            tick: 0,
+            cap: cap.max(1),
+        }
+    }
+
+    /// 向目标文件追加一行（或一批）字节；新文件/0 字节文件先写表头。
+    fn append(
+        &mut self,
+        target: &CsvTarget,
+        path: &Path,
+        header: &str,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        self.tick = self.tick.wrapping_add(1);
+        // 已有句柄：单次查找完成「更新 LRU + 追加」；写失败即失效（下轮重开重试）。
+        let reused = self.entries.get_mut(target).map(|entry| {
+            entry.last_used = self.tick;
+            entry.file.write_all(bytes).and_then(|_| entry.file.flush())
+        });
+        if let Some(result) = reused {
+            if result.is_err() {
+                self.entries.remove(target);
+            }
+            return result;
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        // 以打开后的实际大小判定表头（0 字节残留也补表头）。
+        if file.metadata()?.len() == 0 {
+            writeln!(file, "{header}")?;
+        }
+        file.write_all(bytes)?;
+        file.flush()?;
+
+        // 换日清理：同 venue/周期/合约的旧交易日句柄不再需要。
+        self.entries.retain(|k, _| {
+            !(k.venue == target.venue
+                && k.interval == target.interval
+                && k.symbol == target.symbol
+                && k.trading_day < target.trading_day)
+        });
+        self.entries.insert(
+            target.clone(),
+            CachedHandle {
+                file,
+                last_used: self.tick,
+            },
+        );
+        self.evict_lru();
+        Ok(())
+    }
+
+    /// 超出上限时淘汰最久未用的句柄（drop 即关闭 fd）。
+    fn evict_lru(&mut self) {
+        while self.entries.len() > self.cap {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(key) => {
+                    self.entries.remove(&key);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// 关闭并清空全部缓存句柄（停机用）。
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// K线 CSV 仓储：持有数据根目录、分片游标与句柄缓存，廉价克隆（`Arc` 共享状态）。
 #[derive(Debug, Clone)]
 pub struct KlineRepo {
     root: PathBuf,
+    /// 周期拍 bar 分片轮转游标（多进程/多实例下仅本进程内有效）。
+    shard: Arc<AtomicUsize>,
+    /// CSV 写入句柄 LRU（进程单例：store 只构造一次，Clone 共享）。
+    handles: Arc<Mutex<HandleCache>>,
 }
 
 impl KlineRepo {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            shard: Arc::new(AtomicUsize::new(0)),
+            handles: Arc::new(Mutex::new(HandleCache::new(HANDLE_CACHE_CAP))),
+        }
+    }
+
+    /// 关闭并清空全部缓存句柄（优雅停机收尾调用；进程退出亦会由 OS 关闭）。
+    pub fn close_handles(&self) {
+        if let Ok(mut cache) = self.handles.lock() {
+            cache.clear();
+        }
+    }
+
+    /// 批量落盘定稿 bar（缺省选项：一次全量、单批 20k 行）。
+    pub fn flush_bars(&self, table: &BarTable) -> std::io::Result<FlushReport> {
+        self.flush_bars_with(table, FlushOptions::default())
     }
 
     /// 批量落盘定稿 bar（**非破坏式**）：快照 dirty（bar 本体保留在表内可读），按
-    /// venue/周期/交易日/合约分组追加，**全部文件成功后**才按 `(start,gen)` 确认清 dirty。
+    /// venue/周期/交易日/合约分组追加，**写成功的分组**才按 `(start,gen)` 确认清 dirty。
     ///
     /// 表头按 **venue 动态**生成（公共列 + 该所 extras 列）；同一目标文件的 venue 恒定，
     /// 故分组内表头一致。
     ///
-    /// 失败语义（at-least-once）：编码阶段先在内存完成（未触碰文件）；append 阶段任一文件
-    /// IO 失败则**不确认 dirty**，整组留下轮重写——已追加文件可能重复，读回按 start 去重兜底。
-    /// 快照后同 start 又被 upsert（gen 推进）的键不会被误清（[`BarTable::mark_flushed`] 校验 gen）。
+    /// 失败语义（at-least-once）：任一写入/编码失败则**不确认**未写分组，留下轮重写——
+    /// 已追加文件可能重复，读回按 start 去重兜底。快照后同 start 又被 upsert（gen 推进）
+    /// 的键不会被误清（[`BarTable::mark_flushed`] 校验 gen）。
     /// 无 dirty 时空批返回、不创建任何目录/文件。
-    pub fn flush_bars(&self, table: &BarTable) -> std::io::Result<FlushReport> {
+    ///
+    /// `opts` 控制单拍行数上限与写盘预算：超限/超预算的分组保持 dirty 等下一拍；
+    /// `shard_count > 1` 时按目标文件稳定哈希分片轮转，每拍只写其中一组分片。
+    pub fn flush_bars_with(
+        &self,
+        table: &BarTable,
+        opts: FlushOptions,
+    ) -> std::io::Result<FlushReport> {
         let dirty = table.snapshot_dirty();
         if dirty.is_empty() {
             return Ok(FlushReport::default());
         }
-        // 分组键＝目标文件身份；BTreeMap 保证落盘顺序确定。
-        let mut groups: BTreeMap<CsvTarget, Vec<&DirtyBar>> = BTreeMap::new();
-        for d in &dirty {
+        // 分组键＝目标文件身份；BTreeMap 保证落盘顺序确定（分片轮转也据此稳定）。
+        let mut groups: BTreeMap<CsvTarget, Vec<DirtyBar>> = BTreeMap::new();
+        for d in dirty {
             groups.entry(bar_target(&d.bar)).or_default().push(d);
         }
-        // 先在内存编码全部批次（编码失败时尚未触碰任何文件，也未确认 dirty）。
-        let mut encoded: Vec<(CsvTarget, String, Vec<u8>)> = Vec::new();
+
+        // 分片轮转：每拍取一组分片（`shard_count=1` 即全量）。
+        // 分片归属按目标文件身份的稳定哈希，而不是「快照内序号」——已写分组从快照消失
+        // 不会改变其余分组的归属，游标轮转 1..N 拍即可覆盖全部文件。
+        let shards = opts.shard_count.max(1);
+        let current = self.shard.fetch_add(1, Ordering::Relaxed) % shards;
+        let max_rows = opts.max_rows.max(1);
+        let mut selected: BTreeMap<CsvTarget, Vec<DirtyBar>> = BTreeMap::new();
+        let mut planned_rows = 0usize;
         for (target, batch) in groups {
-            // 同组 venue 恒定 → 表头取首行；分组即有行，batch 必非空。
-            let header = bar_csv_header(&batch[0].bar.exchange);
-            let mut buf = Vec::new();
-            for d in batch {
-                buf.extend_from_slice(&encode_bar(&d.bar)?);
+            if shards > 1 && shard_index(&target, shards) != current {
+                continue;
             }
-            encoded.push((target, header, buf));
+            // 单批上限：写满后其余分组留下拍（至少选一组保证进度）。
+            if planned_rows >= max_rows && !selected.is_empty() {
+                continue;
+            }
+            planned_rows += batch.len();
+            selected.insert(target, batch);
         }
-        // 逐文件 append；任一失败：不确认 dirty，整组下轮重写（读回去重兜重复）。
-        self.append_encoded(&encoded)?;
-        // 全部落盘成功才确认；快照后被覆盖（gen 推进）的键由 mark 内部按 gen 保留。
-        let confirms: Vec<(SeriesKey, i64, u64)> = dirty
+
+        let outcome = self.append_groups(
+            selected,
+            opts.write_budget,
+            |d| bar_csv_header(&d.bar.exchange),
+            |d| encode_bar(&d.bar),
+        );
+        if let Some(err) = outcome.error {
+            return Err(err);
+        }
+        // 只确认**写成功**的分组；快照后被覆盖（gen 推进）的键由 mark 内部按 gen 保留。
+        let confirms: Vec<(SeriesKey, i64, u64)> = outcome
+            .written
             .iter()
-            .map(|d| (d.key.clone(), d.start, d.gen))
+            .flat_map(|(_, batch)| batch.iter().map(|d| (d.key.clone(), d.start, d.gen)))
             .collect();
         table.mark_flushed(&confirms);
-        Ok(FlushReport {
-            files: encoded.len(),
-            rows: dirty.len(),
-        })
+        Ok(outcome.report)
     }
 
-    /// 批量落盘原始 tick：drain WAL 窗口，按 venue/tick/交易日/合约分组追加。
-    /// 失败语义同 [`Self::flush_bars`]。
+    /// 批量落盘原始 tick（缺省选项）。
     pub fn flush_ticks(&self, table: &TickTable) -> std::io::Result<FlushReport> {
-        self.flush_window(
-            table,
-            |_| RAW_TICK_CSV_HEADER.to_string(),
-            tick_target,
-            encode_tick,
-        )
+        self.flush_ticks_with(table, FlushOptions::default())
     }
 
-    /// 通用「drain 窗口 → 按目标文件分组编码 → 逐文件 append（新文件写表头）」。
-    ///
-    /// `header_of` 给每个目标文件的表头（bar 按 venue 动态、tick 固定）；同一分组内
-    /// venue 恒定，故取组内首行即可。
-    ///
-    /// 失败语义（at-least-once）：先完成全部序列化再逐文件追加；若中途 IO 失败，
-    /// 整批放回窗口队首下轮重试——已写出的文件可能在重试时重复追加该批，
-    /// 持久化数据不丢，读回侧按 (symbol,start_time) 去重。
-    fn flush_window<T>(
+    /// 批量落盘原始 tick：从 WAL 窗口取**最多 `max_rows` 行**，按 venue/tick/交易日/合约
+    /// 分组追加；预算耗尽/失败时未写行整批放回窗口队首，下轮重试（不丢数据）。
+    pub fn flush_ticks_with(
         &self,
-        window: &dyn BatchWindow<T>,
-        header_of: impl Fn(&T) -> String,
-        target: impl Fn(&T) -> CsvTarget,
-        encode_row: impl Fn(&T) -> std::io::Result<Vec<u8>>,
+        table: &TickTable,
+        opts: FlushOptions,
     ) -> std::io::Result<FlushReport> {
-        let rows = window.drain_all();
+        let rows = table.drain_n(opts.max_rows.max(1));
         if rows.is_empty() {
             return Ok(FlushReport::default());
         }
-        // 分组键＝目标文件身份；BTreeMap 保证落盘顺序确定。
-        let mut groups: BTreeMap<CsvTarget, Vec<&T>> = BTreeMap::new();
-        for row in &rows {
-            groups.entry(target(row)).or_default().push(row);
+        let mut groups: BTreeMap<CsvTarget, Vec<RawTick>> = BTreeMap::new();
+        for row in rows {
+            groups.entry(tick_target(&row)).or_default().push(row);
         }
-        // 先在内存编码全部批次（编码失败时尚未触碰任何文件）。
-        let mut encoded: Vec<(CsvTarget, String, Vec<u8>)> = Vec::new();
-        for (key, batch) in groups {
-            // 同组 venue 恒定 → 表头取首行；理论上 batch 非空（分组即有行）。
-            let header = header_of(batch[0]);
-            let mut buf = Vec::new();
-            for row in batch {
-                buf.extend_from_slice(&encode_row(row)?);
-            }
-            encoded.push((key, header, buf));
+        let outcome = self.append_groups(
+            groups,
+            opts.write_budget,
+            |_| RAW_TICK_CSV_HEADER.to_string(),
+            encode_tick,
+        );
+        // 未写行（预算截留/失败）必须放回窗口队首，下轮重试；已写文件保持 at-least-once。
+        if !outcome.unwritten.is_empty() {
+            table.requeue_front(outcome.unwritten);
         }
-        // 逐文件追加；任一失败把整批放回窗口队首。
-        if let Err(err) = self.append_encoded(&encoded) {
-            window.requeue_front(rows);
+        if let Some(err) = outcome.error {
             return Err(err);
         }
-        Ok(FlushReport {
-            files: encoded.len(),
-            rows: rows.len(),
-        })
+        Ok(outcome.report)
     }
 
-    /// 把已编码的各分组按路径追加（新文件先写该组表头）。
-    fn append_encoded(&self, encoded: &[(CsvTarget, String, Vec<u8>)]) -> std::io::Result<()> {
-        for (t, header, buf) in encoded {
-            let path = self.csv_path(&t.venue, &t.interval, t.trading_day, &t.symbol);
-            append_with_header(&path, header, buf)?;
+    /// 逐分组「内存编码 → 追加」：超过写盘预算或遇到 IO 错误时提前收手，
+    /// 返回已写分组与未写行（调用方决定确认/requeue），至少写一个分组保证进度。
+    fn append_groups<T>(
+        &self,
+        groups: BTreeMap<CsvTarget, Vec<T>>,
+        write_budget: Duration,
+        header_of: impl Fn(&T) -> String,
+        encode_row: impl Fn(&T) -> std::io::Result<Vec<u8>>,
+    ) -> AppendOutcome<T> {
+        let started = Instant::now();
+        let mut iter = groups.into_iter();
+        let mut written: Vec<(CsvTarget, Vec<T>)> = Vec::new();
+        let mut files = 0usize;
+        let mut rows = 0usize;
+        while let Some((target, batch)) = iter.next() {
+            // 预算耗尽：当前及后续分组整组留下拍（先写的已生效）。
+            if files > 0 && started.elapsed() >= write_budget {
+                return AppendOutcome {
+                    report: FlushReport { files, rows },
+                    written,
+                    unwritten: collect_remaining(
+                        std::iter::once(batch).chain(iter.map(|(_, b)| b)),
+                    ),
+                    error: None,
+                };
+            }
+            // 同组 venue 恒定 → 表头取首行；分组即有行，batch 必非空。
+            let header = header_of(&batch[0]);
+            let result = encode_batch(&batch, &encode_row).and_then(|buf| {
+                let path = self.csv_path(
+                    &target.venue,
+                    &target.interval,
+                    target.trading_day,
+                    &target.symbol,
+                );
+                // 句柄缓存：同一文件跨批复用 append 句柄；写失败内部失效后下轮重开。
+                self.handles
+                    .lock()
+                    .map_err(|_| std::io::Error::other("K线句柄缓存锁中毒"))
+                    .and_then(|mut cache| cache.append(&target, &path, &header, &buf))
+            });
+            if let Err(e) = result {
+                // 当前分组（可能部分已写）与后续全部分组都留下轮重试（at-least-once）。
+                return AppendOutcome {
+                    report: FlushReport { files, rows },
+                    written,
+                    unwritten: collect_remaining(
+                        std::iter::once(batch).chain(iter.map(|(_, b)| b)),
+                    ),
+                    error: Some(e),
+                };
+            }
+            rows += batch.len();
+            files += 1;
+            written.push((target, batch));
         }
-        Ok(())
+        AppendOutcome {
+            report: FlushReport { files, rows },
+            written,
+            unwritten: Vec::new(),
+            error: None,
+        }
     }
 
     /// 目标 CSV 路径：`root/kline/{venue}/{interval}/{day}/{symbol}.csv`，
@@ -359,6 +578,32 @@ pub struct ReadBars {
 }
 
 /// bar 行 → 目标文件（固定 1m 周期目录）。
+/// 分批编码：任一行失败即返回错误（此时尚未触碰任何文件）。
+fn encode_batch<T>(
+    batch: &[T],
+    encode_row: &impl Fn(&T) -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<Vec<u8>> {
+    batch
+        .iter()
+        .try_fold(Vec::with_capacity(batch.len() * 96), |mut buf, row| {
+            buf.extend_from_slice(&encode_row(row)?);
+            Ok(buf)
+        })
+}
+
+/// 把当前分组与剩余分组按原顺序展平成未写行（下轮重试用）。
+fn collect_remaining<T>(batches: impl Iterator<Item = Vec<T>>) -> Vec<T> {
+    batches.flatten().collect()
+}
+
+/// 目标文件 → 分片号（稳定哈希：同一文件恒属同一分片，轮转游标覆盖全部）。
+fn shard_index(target: &CsvTarget, shards: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    target.hash(&mut hasher);
+    (hasher.finish() as usize) % shards
+}
+
 fn bar_target(bar: &Bar) -> CsvTarget {
     CsvTarget {
         venue: bar.exchange.clone(),
@@ -403,21 +648,6 @@ fn encode_tick(tick: &RawTick) -> std::io::Result<Vec<u8>> {
         wtr.flush()?;
     }
     Ok(buf)
-}
-
-/// 向 `path` 追加字节；目标文件为空（不存在，或崩溃残留的 0 字节）时先写一行表头，
-/// 非空则纯追加。以「打开后的实际大小」而非 `exists()` 判定，避免建文件后、写表头前
-/// 崩溃留下 0 字节文件，重启后被误判为「已有表头」而永久缺表头。
-fn append_with_header(path: &Path, header: &str, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    if file.metadata()?.len() == 0 {
-        writeln!(file, "{header}")?;
-    }
-    file.write_all(bytes)?;
-    file.flush()
 }
 
 #[cfg(test)]
@@ -723,6 +953,242 @@ mod tests {
         assert_eq!(back.volume, 50_000);
         assert_eq!(back.bid[0], d("75090"));
         assert_eq!(back.ask_vol[0], 5);
+    }
+
+    // ---- T4：CSV 文件句柄 LRU -------------------------------------------
+
+    /// 同一文件多拍追加复用句柄（不再每批 open/close）。
+    #[test]
+    fn handle_cache_reuses_one_handle_per_file() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new(dir.path().to_path_buf());
+        let table = BarTable::new();
+        table.upsert(bar("cu2512", 20261024, 60_000, 10));
+        repo.flush_bars(&table).unwrap();
+        table.upsert(bar("cu2512", 20261024, 120_000, 7));
+        repo.flush_bars(&table).unwrap();
+
+        assert_eq!(repo.handles.lock().unwrap().entries.len(), 1);
+        let lines = read_lines(&dir.path().join("kline/ctp/1m/20261024/cu2512.csv"));
+        assert_eq!(lines.len(), 3, "表头 + 两行，复用句柄不得重复表头");
+    }
+
+    /// 换日写同一合约：旧交易日句柄被清理，新日文件独立。
+    #[test]
+    fn handle_cache_evicts_previous_day_for_same_symbol() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new(dir.path().to_path_buf());
+        // 两天的 bar 放同一批：先写 day1 再写 day2（BTreeMap 按交易日升序）。
+        let table = BarTable::new();
+        table.upsert(bar("cu2512", 20261024, 60_000, 10));
+        // 同一序列键下 start 必须互异（BarTable 按 start 存桶），故次日取 120_000。
+        table.upsert(bar("cu2512", 20261025, 120_000, 20));
+        repo.flush_bars(&table).unwrap();
+
+        // 同一合约只保留当日句柄（day1 被清理）。
+        assert_eq!(repo.handles.lock().unwrap().entries.len(), 1);
+        assert_eq!(
+            read_lines(&dir.path().join("kline/ctp/1m/20261024/cu2512.csv")).len(),
+            2
+        );
+        assert_eq!(
+            read_lines(&dir.path().join("kline/ctp/1m/20261025/cu2512.csv")).len(),
+            2
+        );
+    }
+
+    /// 句柄数受 LRU 上限约束；停机清理后再次写入仍正确追加。
+    #[test]
+    fn handle_cache_is_bounded_and_fully_closable() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new(dir.path().to_path_buf());
+        // 测试用极小上限（生产 512），验证淘汰逻辑。
+        repo.handles.lock().unwrap().cap = 2;
+
+        let table = BarTable::new();
+        for s in ["a2512", "b2512", "c2512"] {
+            table.upsert(bar(s, 20261024, 60_000, 10));
+        }
+        repo.flush_bars(&table).unwrap();
+        assert!(
+            repo.handles.lock().unwrap().entries.len() <= 2,
+            "句柄数必须受 LRU 上限约束"
+        );
+
+        // 停机清理：全部句柄关闭（fd 释放），随后写同一批仍不丢不重。
+        repo.close_handles();
+        assert!(repo.handles.lock().unwrap().entries.is_empty());
+
+        table.upsert(bar("a2512", 20261024, 120_000, 11));
+        repo.flush_bars(&table).unwrap();
+        assert_eq!(
+            read_lines(&dir.path().join("kline/ctp/1m/20261024/a2512.csv")).len(),
+            3
+        ); // 表头 + 两行，无重复表头
+    }
+
+    // ---- T2：单批行数上限 / 每拍写盘预算 --------------------------------
+
+    /// 单拍取 n 行、余量留窗，下一拍补齐且不重不丢。
+    #[test]
+    fn flush_ticks_caps_rows_per_batch_and_keeps_remainder() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new(dir.path().to_path_buf());
+        let table = TickTable::new();
+        for i in 0..5 {
+            table.append(tick("cu2512", 20261024, 1_760_000_000_000 + i, 100 + i));
+        }
+
+        let opts = FlushOptions {
+            max_rows: 3,
+            ..FlushOptions::default()
+        };
+        let first = repo.flush_ticks_with(&table, opts).unwrap();
+        assert_eq!(first.rows, 3);
+        assert_eq!(first.files, 1);
+        assert_eq!(table.len(), 2, "超出单批上限的余量必须留在窗口");
+
+        let second = repo.flush_ticks_with(&table, opts).unwrap();
+        assert_eq!(second.rows, 2);
+        assert!(table.is_empty());
+
+        // CSV 恰为表头 + 5 行：两拍无丢无重。
+        let lines = read_lines(&dir.path().join("kline/ctp/tick/20261024/cu2512.csv"));
+        assert_eq!(lines.len(), 6);
+    }
+
+    /// 预算耗尽提前收手：未写分组整组放回窗口队首，后续拍补齐且不丢。
+    #[test]
+    fn flush_ticks_write_budget_requeues_unwritten_rows() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new(dir.path().to_path_buf());
+        let table = TickTable::new();
+        // 两个目标文件：按 BTreeMap 顺序 cu2512 先写、rb2611 被预算截留。
+        table.append(tick("cu2512", 20261024, 1_760_000_000_000, 1));
+        table.append(tick("rb2611", 20261024, 1_760_000_000_001, 2));
+        table.append(tick("cu2512", 20261024, 1_760_000_000_002, 3));
+
+        let tight = FlushOptions {
+            max_rows: 100,
+            write_budget: std::time::Duration::ZERO,
+            ..FlushOptions::default()
+        };
+        let first = repo.flush_ticks_with(&table, tight).unwrap();
+        assert_eq!(first.files, 1, "预算=0 仍保证至少写一个分组（进度保证）");
+        assert_eq!(first.rows, 2, "首组 cu2512 两行已写");
+        assert_eq!(table.len(), 1, "未写分组 rb2611 必须放回窗口");
+
+        let second = repo.flush_ticks_with(&table, tight).unwrap();
+        assert_eq!(second.rows, 1);
+        assert!(table.is_empty());
+
+        assert_eq!(
+            read_lines(&dir.path().join("kline/ctp/tick/20261024/cu2512.csv")).len(),
+            3
+        ); // 表头 + 2 行
+        assert_eq!(
+            read_lines(&dir.path().join("kline/ctp/tick/20261024/rb2611.csv")).len(),
+            2
+        ); // 表头 + 1 行
+    }
+
+    /// bar 单批上限：写满上限后其余分组保持 dirty，下一拍补齐。
+    #[test]
+    fn flush_bars_caps_rows_and_keeps_rest_dirty() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new(dir.path().to_path_buf());
+        let table = BarTable::new();
+        table.upsert(bar("cu2512", 20261024, 60_000, 10));
+        table.upsert(bar("rb2611", 20261024, 60_000, 20));
+        assert_eq!(table.snapshot_dirty().len(), 2);
+
+        let opts = FlushOptions {
+            max_rows: 1,
+            ..FlushOptions::default()
+        };
+        let first = repo.flush_bars_with(&table, opts).unwrap();
+        assert_eq!(first.rows, 1);
+        assert_eq!(table.snapshot_dirty().len(), 1, "未写分组必须保持 dirty");
+
+        let second = repo.flush_bars_with(&table, opts).unwrap();
+        assert_eq!(second.rows, 1);
+        assert!(table.snapshot_dirty().is_empty());
+    }
+
+    /// 周期拍分片轮转：4 拍覆盖全部分组，无丢无重；未轮到的分组保持 dirty。
+    #[test]
+    fn flush_bars_rotates_shards_without_loss_or_duplication() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new(dir.path().to_path_buf());
+        let table = BarTable::new();
+        let symbols = ["a2512", "b2512", "c2512", "d2512", "e2512"];
+        for s in symbols {
+            table.upsert(bar(s, 20261024, 60_000, 10));
+        }
+
+        let opts = FlushOptions {
+            shard_count: FLUSH_SHARD_COUNT,
+            ..FlushOptions::default()
+        };
+        // 首拍照游标=0 只写 0 号分片；其余分片的分组保持 dirty。
+        // 期望文件数由稳定哈希算出（测试不依赖具体散列分布）。
+        let target_of = |s: &str| CsvTarget {
+            venue: "ctp".into(),
+            interval: M1_DIR.into(),
+            trading_day: 20261024,
+            symbol: s.into(),
+        };
+        let expected_first = symbols
+            .iter()
+            .filter(|s| shard_index(&target_of(s), FLUSH_SHARD_COUNT) == 0)
+            .count();
+        let first = repo.flush_bars_with(&table, opts).unwrap();
+        assert_eq!(first.files, expected_first, "首拍只写 0 号分片");
+        if expected_first < symbols.len() {
+            assert!(
+                !table.snapshot_dirty().is_empty(),
+                "未轮到分片必须保持 dirty"
+            );
+        }
+
+        // 补齐剩余 3 拍：总行数恰为 5，dirty 清空。
+        let mut total = first.rows;
+        for _ in 0..(FLUSH_SHARD_COUNT - 1) {
+            total += repo.flush_bars_with(&table, opts).unwrap().rows;
+        }
+        assert_eq!(total, symbols.len(), "分片轮转不得丢行");
+        assert!(table.snapshot_dirty().is_empty());
+
+        // 每个文件恰好表头 + 1 行：不得重复追加。
+        for s in symbols {
+            let path = dir.path().join(format!("kline/ctp/1m/20261024/{s}.csv"));
+            assert_eq!(read_lines(&path).len(), 2, "{s} 行数异常（重复或缺失）");
+        }
+        // 无 dirty 时下一拍空转，不产生写入。
+        assert_eq!(repo.flush_bars_with(&table, opts).unwrap().rows, 0);
+    }
+
+    /// bar 写盘预算耗尽：未写分组保持 dirty（非破坏式，下次重试）。
+    #[test]
+    fn flush_bars_write_budget_leaves_rest_dirty() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new(dir.path().to_path_buf());
+        let table = BarTable::new();
+        table.upsert(bar("cu2512", 20261024, 60_000, 10));
+        table.upsert(bar("rb2611", 20261024, 60_000, 20));
+
+        let tight = FlushOptions {
+            max_rows: 100,
+            write_budget: std::time::Duration::ZERO,
+            ..FlushOptions::default()
+        };
+        let first = repo.flush_bars_with(&table, tight).unwrap();
+        assert_eq!(first.rows, 1);
+        assert_eq!(table.snapshot_dirty().len(), 1);
+
+        let second = repo.flush_bars_with(&table, tight).unwrap();
+        assert_eq!(second.rows, 1);
+        assert!(table.snapshot_dirty().is_empty());
     }
 
     #[test]

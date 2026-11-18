@@ -79,6 +79,16 @@ impl TickTable {
         std::mem::take(&mut *self.rows.lock().unwrap())
     }
 
+    /// 取出窗口**最前面的 n 行**（最多 n 行）并从窗口移除，余量按原顺序留在窗口。
+    ///
+    /// 用于单批上限：磁盘饱和时避免把数十万行一次性编码/写盘，把单批 IO 切成
+    /// 多个小拍；写成功即确认，未取走的行仍在窗口等下拍。
+    pub fn drain_n(&self, n: usize) -> Vec<RawTick> {
+        let mut guard = self.rows.lock().unwrap();
+        let take = n.min(guard.len());
+        guard.drain(..take).collect()
+    }
+
     /// 写盘失败时把本批 tick 放回窗口**队首**（旧批在前、drain 后新到在后），
     /// 下轮 flush 重试，不丢数据。
     pub fn requeue_front(&self, mut batch: Vec<RawTick>) {
@@ -160,6 +170,37 @@ mod tests {
 
         // 清空后仍可继续追加（写盘任务与 drain 线程并发的正常节奏）。
         t.append(tick("rb2611", 3, 3));
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn drain_n_takes_prefix_in_order_and_keeps_remainder() {
+        // 单批上限：只取最早 n 行，余量留在窗口等下一拍（顺序不重排）。
+        let t = TickTable::new();
+        for (i, symbol) in ["cu2512", "rb2611", "cu2512", "ag2706", "cu2512"]
+            .iter()
+            .enumerate()
+        {
+            t.append(tick(symbol, i as i64, i as i64));
+        }
+
+        let first = t.drain_n(3);
+        assert_eq!(
+            first.iter().map(|r| r.timestamp).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(t.len(), 2);
+
+        // 余量仍在窗口且顺序保持；下一次 drain_n 取剩余全部。
+        let rest = t.drain_n(10);
+        assert_eq!(
+            rest.iter().map(|r| r.timestamp).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(t.is_empty());
+        // n=0 安全：不取行、不清窗。
+        t.append(tick("cu2512", 9, 9));
+        assert!(t.drain_n(0).is_empty());
         assert_eq!(t.len(), 1);
     }
 

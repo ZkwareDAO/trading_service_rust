@@ -74,7 +74,8 @@ impl BarAggSink {
     /// 定稿（tick 事件时间触发 / 水位或空闲拍 sweep）与停机/日切 flush 都必须经此，
     /// 保证每根 bar 恰好各一次、顺序一致，杜绝重复 append。
     fn emit_finalized(&mut self, bar: &Kline) {
-        tracing::debug!(
+        // 每 bar 一行：trace 级（drain 热路径不做 debug 日志 IO；排障时再开）。
+        tracing::trace!(
             symbol = %bar.symbol,
             trading_day = bar.trading_day,
             start_ms = bar.start_ms,
@@ -269,6 +270,46 @@ mod tests {
             cum_turnover: Decimal::ZERO,
             open_interest: Decimal::ZERO,
         }
+    }
+
+    #[test]
+    fn deferred_sweep_keeps_late_tick_in_bucket_and_finalizes_complete_bar() {
+        // 场景：A 合约在 09:00 桶内已有一笔；B 合约事件时间已越过 09:01 边界。
+        // 旧行为：每个事件后立即水位 sweep → A 的 09:00 桶被提前定稿，随后 A 的
+        // 尾段 tick 被判“迟到”丢弃（故障期 late_dropped 洪泛）。
+        // 新行为：积压期延迟 sweep，尾段 tick 仍能进桶，最终定稿内容完整。
+        let sink = Arc::new(RecSink::default());
+        let mut agg = BarAggSink::new("ctp", sink.clone() as Arc<dyn BarSink>, KlineInterval::M1);
+
+        agg.on_tick("cu2601", &tick(20261023, 600_010, 100, 10));
+        agg.on_tick("rb2601", &tick(20261023, 660_500, 200, 5));
+        // 积压拍：跳过 sweep（should_defer_sweep == true 时 drain 循环的行为）。
+        agg.on_tick("cu2601", &tick(20261023, 659_900, 101, 12));
+        let bars = agg.sweep_by_watermark();
+
+        let cu = bars
+            .iter()
+            .find(|b| b.symbol == "cu2601")
+            .expect("延迟 sweep 后仍应定稿 cu2601");
+        assert_eq!(cu.start_ms, 600_000);
+        assert_eq!(cu.close, Decimal::from(101), "尾段 tick 必须并入 09:00 桶");
+        assert_eq!(cu.volume, 2, "尾段成交量 12-10=2 必须完整计入");
+        assert_eq!(agg.take_diagnostics().late_dropped, 0);
+    }
+
+    #[test]
+    fn immediate_sweep_drops_late_tick_in_bucket() {
+        // 对照组：不延迟（正常行情路径）时，水位 sweep 先定稿，尾段 tick 判迟到。
+        let sink = Arc::new(RecSink::default());
+        let mut agg = BarAggSink::new("ctp", sink.clone() as Arc<dyn BarSink>, KlineInterval::M1);
+
+        agg.on_tick("cu2601", &tick(20261023, 600_010, 100, 10));
+        agg.on_tick("rb2601", &tick(20261023, 660_500, 200, 5));
+        let bars = agg.sweep_by_watermark();
+        assert!(bars.iter().any(|b| b.symbol == "cu2601"));
+        // 桶已定稿后尾段 tick 到达：闭环判定为 Late 并丢弃（对照组语义，不变）。
+        agg.on_tick("cu2601", &tick(20261023, 659_900, 101, 12));
+        assert_eq!(agg.take_diagnostics().late_dropped, 1);
     }
 
     #[test]

@@ -172,6 +172,7 @@ impl AppState {
             kline_history_limits,
             gap_cfg,
             crate::kline_backfill::BackfillRuntimeConfig::from(&venue.kline.backfill),
+            venue.kline.flush.max_rows,
         ));
 
         let provider_deps = ProviderDeps {

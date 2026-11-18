@@ -58,11 +58,40 @@ pub struct LoadedVenueConfigs {
     pub ctp: trading_exchange::ctp::CtpConfig,
 }
 
-/// K线配置段（当前仅历史回补）。
+/// K线配置段：历史回补 + 刷盘调度。
 #[derive(Debug, Clone)]
 pub struct KlineConfig {
     /// 历史缺失自动回补参数。
     pub backfill: KlineBackfillConfig,
+    /// CSV 刷盘调度参数（单批行数上限）。
+    pub flush: KlineFlushConfig,
+}
+
+/// `[kline.flush]` 强类型配置：CSV 单拍刷盘行数上限（磁盘饱和时切小单批，
+/// 余量留下拍；未配置时取 store 默认 20k）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KlineFlushConfig {
+    /// 单拍最多处理的行数（必须 ≥1）。
+    pub max_rows: usize,
+}
+
+impl Default for KlineFlushConfig {
+    fn default() -> Self {
+        Self {
+            max_rows: trading_store::DEFAULT_FLUSH_MAX_ROWS,
+        }
+    }
+}
+
+impl KlineFlushConfig {
+    /// TOML 段 → 强类型；`max_rows=0` 属非法配置，启动期 fail-fast。
+    fn from_section(s: &FlushSection) -> anyhow::Result<Self> {
+        let max_rows = s.max_rows.unwrap_or(trading_store::DEFAULT_FLUSH_MAX_ROWS);
+        if max_rows < 1 {
+            anyhow::bail!("[kline.flush] max_rows 必须 ≥1，实际 {max_rows}");
+        }
+        Ok(Self { max_rows })
+    }
 }
 
 /// `[notify]` 通知配置（各交易所差异阈值；缺失取默认）。
@@ -308,11 +337,20 @@ struct NotifySection {
     ctp_roi_alert_threshold_pct: Option<f64>,
 }
 
-/// `[kline]` 段（当前仅含 backfill 子表）。
+/// `[kline]` 段（backfill / flush 子表）。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 struct KlineSection {
     #[serde(default)]
     backfill: BackfillSection,
+    #[serde(default)]
+    flush: FlushSection,
+}
+
+/// `[kline.flush]` 原始 TOML（全部可选，缺省取 store 默认）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+struct FlushSection {
+    /// 单拍刷盘行数上限（缺省 20000）。
+    max_rows: Option<usize>,
 }
 
 /// `[kline.backfill]` 原始 TOML（时长保持字符串，在 load() 中解析为 Duration）。
@@ -383,6 +421,9 @@ pub fn load(path: &Path) -> anyhow::Result<LoadedVenueConfigs> {
     // 回补配置非法（坏时长/越界）在启动期 fail-fast。
     let backfill = KlineBackfillConfig::from_section(&parsed.kline.backfill)
         .map_err(|e| anyhow::anyhow!("解析 venue 配置 {path:?}: {e}"))?;
+    // 刷盘调度非法（max_rows=0）同样启动期 fail-fast。
+    let flush = KlineFlushConfig::from_section(&parsed.kline.flush)
+        .map_err(|e| anyhow::anyhow!("解析 venue 配置 {path:?}: {e}"))?;
     // 通知阈值：缺省取默认；inf/nan 属非法配置，启动期 fail-fast。
     let notify = NotifyConfig::from_section(&parsed.notify)
         .map_err(|e| anyhow::anyhow!("解析 venue 配置 {path:?}: {e}"))?;
@@ -427,7 +468,7 @@ pub fn load(path: &Path) -> anyhow::Result<LoadedVenueConfigs> {
         binance: BinanceVenueConfig {
             kline_symbols: parsed.binance.kline_symbols,
         },
-        kline: KlineConfig { backfill },
+        kline: KlineConfig { backfill, flush },
         notify,
         #[cfg(feature = "ctp")]
         ctp: {
@@ -477,6 +518,7 @@ pub fn default_configs() -> LoadedVenueConfigs {
         binance: BinanceVenueConfig::default(),
         kline: KlineConfig {
             backfill: KlineBackfillConfig::default(),
+            flush: KlineFlushConfig::default(),
         },
         notify: NotifyConfig::default(),
         #[cfg(feature = "ctp")]
@@ -809,6 +851,33 @@ mod tests {
         let path = dir.path().join("venue.toml");
         std::fs::write(&path, "garbage =").unwrap();
         assert!(load(&path).is_err());
+    }
+
+    // ---- [kline.flush] ----
+
+    #[test]
+    fn kline_flush_defaults_to_store_default_max_rows() {
+        // 缺省：与 store 层单批上限常量一致（不破坏旧配置）。
+        assert_eq!(
+            default_configs().kline.flush.max_rows,
+            trading_store::DEFAULT_FLUSH_MAX_ROWS
+        );
+        let loaded = load(Path::new("/nonexistent/venue.toml")).unwrap();
+        assert_eq!(
+            loaded.kline.flush.max_rows,
+            trading_store::DEFAULT_FLUSH_MAX_ROWS
+        );
+    }
+
+    #[test]
+    fn parses_kline_flush_max_rows_and_rejects_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("venue.toml");
+        std::fs::write(&path, "[kline.flush]\nmax_rows = 500\n").unwrap();
+        assert_eq!(load(&path).unwrap().kline.flush.max_rows, 500);
+
+        std::fs::write(&path, "[kline.flush]\nmax_rows = 0\n").unwrap();
+        assert!(load(&path).is_err(), "max_rows=0 非法，应启动期 fail-fast");
     }
 
     // ---- [kline.backfill] ----

@@ -32,7 +32,7 @@ use trading_exchange::market::{
 };
 use trading_exchange::registry::ExchangeRegistry;
 use trading_models::{Bar, InstrumentType};
-use trading_store::{KlineFlushReport, KlineRepo, TradingStore};
+use trading_store::{FlushOptions, KlineFlushReport, KlineRepo, TradingStore, FLUSH_SHARD_COUNT};
 
 use crate::kline_gap::{gap_supported_venue, GapScanConfig, GapScanner};
 use crate::kline_history::{merge_and_window, HistoryLimits, HistoryPage, HistoryQuery};
@@ -45,6 +45,9 @@ pub const KLINE_STEP_MS: i64 = 60_000;
 /// 定稿 bar 未落盘（dirty）积压的告警阈值：超过即认为 CSV 落盘可能持续故障。
 /// flush 失败期 dirty 豁免裁剪、只增不减，此告警**不丢数据**，只提示内存持续增长。
 const BAR_BACKLOG_WARN_THRESHOLD: usize = 100_000;
+
+/// 单次刷盘耗时告警阈值：超过即说明磁盘/文件系统明显变慢（需检查写盘负载）。
+const FLUSH_SLOW_WARN_MS: u64 = 1_000;
 
 /// 积压边沿判定：只在「正常→超阈」告警一次、回落到阈值内报一次恢复，避免每拍刷屏。
 /// 返回 `(新告警态, 是否刚越阈, 是否刚恢复)`。纯函数便于单测。
@@ -488,7 +491,8 @@ struct PersistenceBarSink {
 
 impl BarSink for PersistenceBarSink {
     fn on_bar(&self, bar: &StreamKline) {
-        tracing::debug!(
+        // 每 bar 一行：trace 级（落盘线程/drain 热路径不做 debug 日志 IO）。
+        tracing::trace!(
             venue = %bar.venue,
             symbol = %bar.symbol,
             trading_day = bar.trading_day,
@@ -613,6 +617,8 @@ pub struct KlineService {
     ticks: Arc<TickTable>,
     /// append-only CSV 仓储（进程单例）。
     repo: KlineRepo,
+    /// 单拍刷盘行数上限（venue.toml `[kline.flush].max_rows`，缺省 20k）。
+    flush_max_rows: usize,
     /// 南向推送端口（生产＝spawn 到 hub；测试可注入假实现）。
     pusher: Arc<dyn KlinePusher>,
     /// 定稿 bar 批量推送缓冲（sink 多线程 push、推送线程 drain；同所多标的聚一帧）。
@@ -656,6 +662,7 @@ impl KlineService {
         history_limits: HistoryLimits,
         gap_cfg: GapScanConfig,
         backfill_cfg: crate::kline_backfill::BackfillRuntimeConfig,
+        flush_max_rows: usize,
     ) -> Self {
         let bars = store.bar_table();
         let gaps = store.gap_registry();
@@ -667,6 +674,7 @@ impl KlineService {
             bars,
             ticks: store.ctp_ticks(),
             repo: store.kline_repo(),
+            flush_max_rows: flush_max_rows.max(1),
             pusher,
             batcher: KlineBatcher::default(),
             baselines: Arc::new(baselines),
@@ -696,9 +704,14 @@ impl KlineService {
         // 逐个 take 释放锁再 join，不持锁等待线程。
         // 先 join 推送线程：保证停机前入缓冲的最后一批 bar 已发出；再收口缺口扫描线程，
         // 最后 join 刷盘线程（缺口/实时 bar 都已登记，停机补扫/补落盘后进程才退出）。
-        join_take(&self.push_task)?;
-        join_take(&self.gap_task)?;
-        join_take(&self.flush_task)
+        // 三个线程都 join 完再关闭 CSV 句柄缓存（停机清理），任一 panic 也照常关闭。
+        let push = join_take(&self.push_task);
+        let gap = join_take(&self.gap_task);
+        let flush = join_take(&self.flush_task);
+        self.repo.close_handles();
+        push?;
+        gap?;
+        flush
     }
 
     /// 某 venue 的标的类别（deribit=option，其余本期=futures；未知默认 futures）。
@@ -901,20 +914,62 @@ impl KlineService {
     /// IO 失败时 KlineRepo 已把整批放回窗口队首下轮重试（不丢数据，可能重复），
     /// 这里仅记日志、该类计数按 0 处理，绝不向 flush 线程传播 panic。
     pub fn flush_once(&self) -> FlushOutcome {
-        let bars = match self.repo.flush_bars(&self.bars) {
+        // 全量口径（`shard_count=1`）：停机收尾/测试必须一次尽量写完，不留分片尾巴。
+        let opts = FlushOptions {
+            max_rows: self.flush_max_rows,
+            ..FlushOptions::default()
+        };
+        self.flush_once_with(opts)
+    }
+
+    /// 周期拍：bar 按文件分组分片轮转（每拍只写 1/4），tick 仍按单批上限批量写。
+    /// 分片让单拍写盘文件数骤降，避免故障恢复期 426 文件/批的 open/close 风暴。
+    fn flush_once_sharded(&self) -> FlushOutcome {
+        let opts = FlushOptions {
+            max_rows: self.flush_max_rows,
+            shard_count: FLUSH_SHARD_COUNT,
+            ..FlushOptions::default()
+        };
+        self.flush_once_with(opts)
+    }
+
+    /// 按给定调度选项各刷一批，并记录耗时/行数/文件数（慢批告警）。
+    fn flush_once_with(&self, opts: FlushOptions) -> FlushOutcome {
+        let started = std::time::Instant::now();
+        let bars = match self.repo.flush_bars_with(&self.bars, opts) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!(error = %e, "K线 bar 批量落盘失败，整批已留待重试");
+                tracing::error!(error = %e, "K线 bar 批量落盘失败，未写分组留待重试");
                 KlineFlushReport::default()
             }
         };
-        let ticks = match self.repo.flush_ticks(&self.ticks) {
+        let ticks = match self.repo.flush_ticks_with(&self.ticks, opts) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!(error = %e, "K线 tick 批量落盘失败，整批已留待重试");
+                tracing::error!(error = %e, "K线 tick 批量落盘失败，未写行已放回窗口重试");
                 KlineFlushReport::default()
             }
         };
+        let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if elapsed_ms >= FLUSH_SLOW_WARN_MS {
+            tracing::warn!(
+                elapsed_ms,
+                bar_rows = bars.rows,
+                bar_files = bars.files,
+                tick_rows = ticks.rows,
+                tick_files = ticks.files,
+                "K线 CSV 刷盘耗时过长（磁盘/文件系统明显变慢，请检查写盘负载）"
+            );
+        } else if bars.rows + ticks.rows > 0 {
+            tracing::debug!(
+                elapsed_ms,
+                bars = bars.rows,
+                bar_files = bars.files,
+                ticks = ticks.rows,
+                tick_files = ticks.files,
+                "K线 CSV 刷盘完成"
+            );
+        }
         FlushOutcome { bars, ticks }
     }
 
@@ -1135,7 +1190,7 @@ impl KlineService {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    let out = me.flush_once();
+                    let out = me.flush_once_sharded();
                     if out.bars.rows > 0 || out.ticks.rows > 0 {
                         tracing::info!(
                             bars = out.bars.rows,
@@ -1204,6 +1259,7 @@ mod tests {
     use rust_decimal::Decimal;
     use std::sync::Mutex;
     use trading_exchange::market::KlineInterval;
+    use trading_store::DEFAULT_FLUSH_MAX_ROWS;
 
     fn kline(venue: &str, symbol: &str, day: u32, start: i64) -> StreamKline {
         // CTP bar 带本所 extras（真实交易所代码 + 周期末持仓量）；其余所 extras 为空。
@@ -1598,6 +1654,7 @@ mod tests {
             default_limits(),
             test_gap_cfg(),
             test_backfill_cfg(),
+            DEFAULT_FLUSH_MAX_ROWS,
         ));
         (s, pusher)
     }
@@ -1615,6 +1672,7 @@ mod tests {
             default_limits(),
             test_gap_cfg(),
             test_backfill_cfg(),
+            DEFAULT_FLUSH_MAX_ROWS,
         ));
         (s, pusher)
     }
@@ -1633,6 +1691,7 @@ mod tests {
             default_limits(),
             test_gap_cfg(),
             test_backfill_cfg(),
+            DEFAULT_FLUSH_MAX_ROWS,
         ));
         (store, svc, repo)
     }
@@ -2434,6 +2493,7 @@ mod tests {
             default_limits(),
             cfg,
             test_backfill_cfg(),
+            DEFAULT_FLUSH_MAX_ROWS,
         ));
         // 数据锚定在“当下”：now-2min 与 now（连续无静默），中间缺 now-1min（内部缺口）。
         let now = now_utc_ms();
