@@ -52,9 +52,15 @@ const DEFAULT_FLUSH_WRITE_BUDGET: Duration = Duration::from_millis(200);
 /// 周期拍 bar 分片数：按文件分组轮转，每拍只写 1/N 组，其余保持 dirty。
 pub const FLUSH_SHARD_COUNT: usize = 4;
 
-/// CSV 文件句柄缓存上限（LRU）。每个合约日文件一个句柄；512 远小于
-/// 生产 `ulimit -n`（524288），又能覆盖全品种同时刷盘的活跃文件集。
-const HANDLE_CACHE_CAP: usize = 512;
+/// 句柄空闲 TTL：最近该时长内写过就保留句柄，超时关闭。
+/// 取 10 分钟而非按拍数：`--kline-flush-interval` 可配（默认 5s），TTL 必须显著大于
+/// 刷盘周期，否则每次拍初 sweep 都会把上一拍的句柄全部关掉、缓存退化为无缓存。
+/// 保留期只有 fd（数千个 ≈ 数 MB 内核对象），休市期延时关闭无副作用。
+const HANDLE_IDLE_TTL: Duration = Duration::from_secs(600);
+
+/// fd 安全阀：活跃句柄数超过该值才按最久未用淘汰（远低于 `ulimit -n` 524288）。
+/// 正常规模（数千合约）下不会触发，只防极端配置把 fd 耗尽。
+const HANDLE_MAX_OPEN: usize = 16_384;
 
 /// 一次 flush 的调度选项（单拍行数上限 / 写盘时间预算 / 分片数）。
 ///
@@ -98,53 +104,59 @@ struct AppendOutcome<T> {
     error: Option<std::io::Error>,
 }
 
-/// 一个缓存的 CSV 写入句柄（append 模式）与最近使用序号（LRU 依据）。
+/// 一个缓存的 CSV 写入句柄（append 模式）与最近使用时刻（空闲淘汰依据）。
 #[derive(Debug)]
 struct CachedHandle {
     file: File,
-    last_used: u64,
+    last_used: Instant,
 }
 
-/// CSV 写入句柄的 LRU 缓存：按目标文件（venue/周期/交易日/合约）复用 append 句柄，
-/// 消除「每批每文件 open/close」的 IO 风暴（故障期单批 426 文件）。
+/// CSV 写入句柄缓存：按目标文件（venue/周期/交易日/合约）复用 append 句柄，
+/// 消除「每批每文件 open/close」的 IO 风暴（故障期单批数百文件）。
 ///
-/// 清理时机：
+/// 保留策略是**活跃集 + 空闲淘汰**（而非固定条数 LRU）：
+/// * 最近 [`HANDLE_IDLE_TTL`] 内写过 → 保留（任意订阅数 N 都不会互相挤掉）；
+/// * 超过 TTL 未写 → 关闭（drop 即释放 fd）；
+/// * 活跃数超过 [`HANDLE_MAX_OPEN`] → 按最久未用淘汰到安全阀（仅防 fd 耗尽）。
+///
+/// 其他清理时机：
 /// * 写失败 → 立即失效该句柄（下次重开，避免复用一个已坏句柄）；
 /// * 换日写同一合约 → 清理旧交易日句柄；
-/// * 超过上限 → 淘汰最久未用；停机由 [`KlineRepo::close_handles`] 统一关闭。
+/// * 停机由 [`KlineRepo::close_handles`] 统一关闭。
 ///
 /// 已知限制：外部对已缓存文件的截断/轮转（如 logrotate）不会被感知，追加会落到旧
 /// inode；文件按「交易日」轮换、且进程重启/换日/淘汰都会重开，故不额外做每次 stat。
 #[derive(Debug)]
 struct HandleCache {
     entries: HashMap<CsvTarget, CachedHandle>,
-    /// 单调递增的使用序号（LRU 排序依据）。
-    tick: u64,
-    /// 句柄上限。
-    cap: usize,
+    /// fd 安全阀（活跃句柄数超过它才按最久未用淘汰）。
+    max_open: usize,
+    /// 空闲 TTL（生产用 [`HANDLE_IDLE_TTL`]；测试可注入缩短的值）。
+    idle_ttl: Duration,
 }
 
 impl HandleCache {
-    fn new(cap: usize) -> Self {
+    fn new(max_open: usize) -> Self {
         Self {
             entries: HashMap::new(),
-            tick: 0,
-            cap: cap.max(1),
+            max_open: max_open.max(1),
+            idle_ttl: HANDLE_IDLE_TTL,
         }
     }
 
     /// 向目标文件追加一行（或一批）字节；新文件/0 字节文件先写表头。
+    /// `now` 用于记录最近使用时刻（测试可注入，生产取 `Instant::now()`）。
     fn append(
         &mut self,
         target: &CsvTarget,
         path: &Path,
         header: &str,
         bytes: &[u8],
+        now: Instant,
     ) -> std::io::Result<()> {
-        self.tick = self.tick.wrapping_add(1);
-        // 已有句柄：单次查找完成「更新 LRU + 追加」；写失败即失效（下轮重开重试）。
+        // 已有句柄：单次查找完成「刷新活跃时刻 + 追加」；写失败即失效（下轮重开重试）。
         let reused = self.entries.get_mut(target).map(|entry| {
-            entry.last_used = self.tick;
+            entry.last_used = now;
             entry.file.write_all(bytes).and_then(|_| entry.file.flush())
         });
         if let Some(result) = reused {
@@ -176,16 +188,19 @@ impl HandleCache {
             target.clone(),
             CachedHandle {
                 file,
-                last_used: self.tick,
+                last_used: now,
             },
         );
-        self.evict_lru();
         Ok(())
     }
 
-    /// 超出上限时淘汰最久未用的句柄（drop 即关闭 fd）。
-    fn evict_lru(&mut self) {
-        while self.entries.len() > self.cap {
+    /// 每拍开始时调用：先按空闲 TTL 关闭句柄，再把活跃数压到安全阀以内
+    /// （本拍新打开/刷新的句柄不会被误杀）。返回本次关闭的句柄数（0 = 无淘汰）。
+    fn sweep(&mut self, now: Instant) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, entry| now.saturating_duration_since(entry.last_used) < self.idle_ttl);
+        while self.entries.len() > self.max_open {
             let oldest = self
                 .entries
                 .iter()
@@ -198,6 +213,7 @@ impl HandleCache {
                 None => break,
             }
         }
+        before - self.entries.len()
     }
 
     /// 关闭并清空全部缓存句柄（停机用）。
@@ -221,7 +237,7 @@ impl KlineRepo {
         Self {
             root,
             shard: Arc::new(AtomicUsize::new(0)),
-            handles: Arc::new(Mutex::new(HandleCache::new(HANDLE_CACHE_CAP))),
+            handles: Arc::new(Mutex::new(HandleCache::new(HANDLE_MAX_OPEN))),
         }
     }
 
@@ -229,6 +245,24 @@ impl KlineRepo {
     pub fn close_handles(&self) {
         if let Ok(mut cache) = self.handles.lock() {
             cache.clear();
+        }
+    }
+
+    /// 每拍开始：按空闲 TTL / 安全阀关闭不再需要的句柄（仅在确有淘汰时打 debug）。
+    /// 锁中毒（他线程持锁 panic）不阻断刷盘，仅告警并跳过本次淘汰。
+    fn sweep_handles(&self, now: Instant) {
+        match self.handles.lock() {
+            Ok(mut cache) => {
+                let evicted = cache.sweep(now);
+                if evicted > 0 {
+                    tracing::debug!(
+                        evicted,
+                        open_handles = cache.entries.len(),
+                        "K线 CSV 句柄空闲淘汰"
+                    );
+                }
+            }
+            Err(_) => tracing::warn!("K线 CSV 句柄缓存锁中毒，跳过本次空闲淘汰"),
         }
     }
 
@@ -255,6 +289,9 @@ impl KlineRepo {
         table: &BarTable,
         opts: FlushOptions,
     ) -> std::io::Result<FlushReport> {
+        let now = Instant::now();
+        // 每拍都先淘汰空闲句柄（含无数据拍），保证休市期句柄也能按 TTL 关闭。
+        self.sweep_handles(now);
         let dirty = table.snapshot_dirty();
         if dirty.is_empty() {
             return Ok(FlushReport::default());
@@ -288,6 +325,7 @@ impl KlineRepo {
         let outcome = self.append_groups(
             selected,
             opts.write_budget,
+            now,
             |d| bar_csv_header(&d.bar.exchange),
             |d| encode_bar(&d.bar),
         );
@@ -316,6 +354,9 @@ impl KlineRepo {
         table: &TickTable,
         opts: FlushOptions,
     ) -> std::io::Result<FlushReport> {
+        let now = Instant::now();
+        // 每拍都先淘汰空闲句柄（含无数据拍），保证休市期句柄也能按 TTL 关闭。
+        self.sweep_handles(now);
         let rows = table.drain_n(opts.max_rows.max(1));
         if rows.is_empty() {
             return Ok(FlushReport::default());
@@ -327,6 +368,7 @@ impl KlineRepo {
         let outcome = self.append_groups(
             groups,
             opts.write_budget,
+            now,
             |_| RAW_TICK_CSV_HEADER.to_string(),
             encode_tick,
         );
@@ -346,6 +388,7 @@ impl KlineRepo {
         &self,
         groups: BTreeMap<CsvTarget, Vec<T>>,
         write_budget: Duration,
+        now: Instant,
         header_of: impl Fn(&T) -> String,
         encode_row: impl Fn(&T) -> std::io::Result<Vec<u8>>,
     ) -> AppendOutcome<T> {
@@ -379,7 +422,7 @@ impl KlineRepo {
                 self.handles
                     .lock()
                     .map_err(|_| std::io::Error::other("K线句柄缓存锁中毒"))
-                    .and_then(|mut cache| cache.append(&target, &path, &header, &buf))
+                    .and_then(|mut cache| cache.append(&target, &path, &header, &buf, now))
             });
             if let Err(e) = result {
                 // 当前分组（可能部分已写）与后续全部分组都留下轮重试（at-least-once）。
@@ -997,25 +1040,98 @@ mod tests {
         );
     }
 
-    /// 句柄数受 LRU 上限约束；停机清理后再次写入仍正确追加。
+    // ---- T4'：活跃集 + 空闲淘汰 ------------------------------------------
+
+    fn csv_target(symbol: &str, day: u32) -> CsvTarget {
+        CsvTarget {
+            venue: "ctp".into(),
+            interval: M1_DIR.into(),
+            trading_day: day,
+            symbol: symbol.into(),
+        }
+    }
+
+    /// 空闲未到 TTL 保留，达到 TTL 才关闭（不再按条数误杀活跃文件）。
     #[test]
-    fn handle_cache_is_bounded_and_fully_closable() {
+    fn idle_handle_is_evicted_only_after_ttl() {
+        let dir = tempdir().unwrap();
+        let mut cache = HandleCache::new(HANDLE_MAX_OPEN);
+        let target = csv_target("cu2512", 20261024);
+        let path = dir.path().join("cu2512.csv");
+        let t0 = Instant::now();
+        cache.append(&target, &path, "h", b"1\n", t0).unwrap();
+        assert_eq!(cache.entries.len(), 1);
+
+        // TTL 内：保留。
+        assert_eq!(
+            cache.sweep(t0 + HANDLE_IDLE_TTL - Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(cache.entries.len(), 1);
+        // 到达 TTL：关闭句柄。
+        assert_eq!(cache.sweep(t0 + HANDLE_IDLE_TTL), 1);
+        assert!(cache.entries.is_empty());
+    }
+
+    /// 任意 N：TTL 内 600 个活跃文件全部持有句柄（旧固定 512 上限会抖动）。
+    #[test]
+    fn active_handles_beyond_old_fixed_cap_are_all_retained() {
         let dir = tempdir().unwrap();
         let repo = KlineRepo::new(dir.path().to_path_buf());
-        // 测试用极小上限（生产 512），验证淘汰逻辑。
-        repo.handles.lock().unwrap().cap = 2;
+        let table = BarTable::new();
+        for i in 0..600 {
+            table.upsert(bar(&format!("s{i:04}"), 20261024, 60_000, 10));
+        }
+        repo.flush_bars(&table).unwrap();
+        assert_eq!(
+            repo.handles.lock().unwrap().entries.len(),
+            600,
+            "活跃集全部保留，不按固定条数淘汰"
+        );
+    }
 
+    /// max_open 仅作 fd 安全阀：超过时按最久未用淘汰到上限。
+    #[test]
+    fn max_open_is_only_a_safety_valve() {
+        let dir = tempdir().unwrap();
+        let mut cache = HandleCache::new(2);
+        let now = Instant::now();
+        for i in 0..3 {
+            let target = csv_target(&format!("s{i}"), 20261024);
+            let path = dir.path().join(format!("s{i}.csv"));
+            cache.append(&target, &path, "h", b"1\n", now).unwrap();
+        }
+        assert_eq!(cache.sweep(now), 1);
+        assert_eq!(cache.entries.len(), 2);
+    }
+
+    /// 无数据拍也要 sweep：休市后没有任何 bar/tick 时，空闲句柄仍按 TTL 关闭。
+    #[test]
+    fn empty_flush_still_sweeps_idle_handles() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new(dir.path().to_path_buf());
+        let table = BarTable::new();
+        table.upsert(bar("cu2512", 20261024, 60_000, 10));
+        repo.flush_bars(&table).unwrap();
+        assert_eq!(repo.handles.lock().unwrap().entries.len(), 1);
+
+        // 缩短 TTL 后跑一次空拍（无 dirty）：句柄应被关闭。
+        repo.handles.lock().unwrap().idle_ttl = Duration::ZERO;
+        repo.flush_bars(&BarTable::new()).unwrap();
+        assert!(repo.handles.lock().unwrap().entries.is_empty());
+    }
+
+    /// 停机清理：全部句柄关闭（fd 释放），随后写同一文件仍正确追加。
+    #[test]
+    fn handle_cache_is_fully_closable() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new(dir.path().to_path_buf());
         let table = BarTable::new();
         for s in ["a2512", "b2512", "c2512"] {
             table.upsert(bar(s, 20261024, 60_000, 10));
         }
         repo.flush_bars(&table).unwrap();
-        assert!(
-            repo.handles.lock().unwrap().entries.len() <= 2,
-            "句柄数必须受 LRU 上限约束"
-        );
 
-        // 停机清理：全部句柄关闭（fd 释放），随后写同一批仍不丢不重。
         repo.close_handles();
         assert!(repo.handles.lock().unwrap().entries.is_empty());
 
