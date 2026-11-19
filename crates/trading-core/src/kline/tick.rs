@@ -101,6 +101,11 @@ impl TickTable {
         self.rows.lock().unwrap().len()
     }
 
+    /// 窗口积压上限（观测/告警用：与 [`Self::len`] 一起给出占用比例）。
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rows.lock().unwrap().is_empty()
     }
@@ -132,6 +137,13 @@ mod tests {
             bid_vol: [0; 5],
             ask_vol: [0; 5],
         }
+    }
+
+    #[test]
+    fn capacity_reports_constructor_limit() {
+        // 观测用途：日志需同时给出积压与上限，便于直观看出占用比例。
+        assert_eq!(TickTable::new().capacity(), DEFAULT_MAX_PENDING_TICKS);
+        assert_eq!(TickTable::with_capacity(7).capacity(), 7);
     }
 
     #[test]

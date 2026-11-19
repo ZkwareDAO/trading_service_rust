@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::fd_limits;
 use store_core::persistence::sanitize_dir_name;
 use trading_core::kline::{BarTable, DirtyBar, SeriesKey, TickTable};
 use trading_models::{bar_csv_header, Bar, RawTick, RAW_TICK_CSV_HEADER};
@@ -58,10 +59,6 @@ pub const FLUSH_SHARD_COUNT: usize = 4;
 /// 保留期只有 fd（数千个 ≈ 数 MB 内核对象），休市期延时关闭无副作用。
 const HANDLE_IDLE_TTL: Duration = Duration::from_secs(600);
 
-/// fd 安全阀：活跃句柄数超过该值才按最久未用淘汰（远低于 `ulimit -n` 524288）。
-/// 正常规模（数千合约）下不会触发，只防极端配置把 fd 耗尽。
-const HANDLE_MAX_OPEN: usize = 16_384;
-
 /// 一次 flush 的调度选项（单拍行数上限 / 写盘时间预算 / 分片数）。
 ///
 /// 缺省 `shard_count = 1`：一次 flush 即全量写 dirty（停机收尾/测试/历史预热口径）。
@@ -86,13 +83,31 @@ impl Default for FlushOptions {
     }
 }
 
+/// 单组 append（内存编码 + 写盘）的慢组阈值：超过即计入 `slow_appends`，
+/// 用区分「预算裁切」与「单次 syscall 卡顿」。
+const SLOW_APPEND_MS: u64 = 50;
+
 /// 一次 flush 的产出计数（观测用）。
+///
+/// Phase A 只加观测、不改变刷盘行为：调用方据 `budget_hit/deferred_rows/max_append_ms`
+/// 判断「占空比受限」（预算裁切但单组很快）还是「磁盘延迟受限」（单组数百 ms）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FlushReport {
-    /// 本轮写入（或追加）的文件数。
+    /// 本轮写入（或追加）的文件数（等价于成功 append 的分组数）。
     pub files: usize,
     /// 本轮落盘的数据行数。
     pub rows: usize,
+    /// 本拍未写、留待下轮的行数：预算截留或 IO 失败（tick 放回窗口队列，
+    /// bar 保持 dirty）。
+    pub deferred_rows: usize,
+    /// 本拍 `append_groups` 编码+写盘墙钟（毫秒）。
+    pub io_ms: u64,
+    /// 本拍是否因写盘预算提前收手。
+    pub budget_hit: bool,
+    /// 单组 append 的最长墙钟（毫秒）。
+    pub max_append_ms: u64,
+    /// 单组 append 墙钟 ≥ [`SLOW_APPEND_MS`] 的组数。
+    pub slow_appends: usize,
 }
 
 /// 编码+追加的结果：已写分组（供 bar 按 `(start,gen)` 精确确认）、未写行
@@ -117,7 +132,8 @@ struct CachedHandle {
 /// 保留策略是**活跃集 + 空闲淘汰**（而非固定条数 LRU）：
 /// * 最近 [`HANDLE_IDLE_TTL`] 内写过 → 保留（任意订阅数 N 都不会互相挤掉）；
 /// * 超过 TTL 未写 → 关闭（drop 即释放 fd）；
-/// * 活跃数超过 [`HANDLE_MAX_OPEN`] → 按最久未用淘汰到安全阀（仅防 fd 耗尽）。
+/// * 活跃数超过按 `nofile` soft limit 推导的上限（见 [`fd_limits::derive_max_open`]）
+///   → 按最久未用淘汰（插入时与每拍 sweep 两条路径，仅防 fd 耗尽）。
 ///
 /// 其他清理时机：
 /// * 写失败 → 立即失效该句柄（下次重开，避免复用一个已坏句柄）；
@@ -166,6 +182,14 @@ impl HandleCache {
             return result;
         }
 
+        // fd 预算：打开新句柄前先压回上限，避免单拍批量写入（如全量 flush）越过安全阀。
+        // 峰值最多 `max_open + 1`（当前待插入这一个），1/4 预算已留给 socket/快照。
+        while self.entries.len() >= self.max_open {
+            if !self.evict_oldest() {
+                break;
+            }
+        }
+
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -201,19 +225,28 @@ impl HandleCache {
         self.entries
             .retain(|_, entry| now.saturating_duration_since(entry.last_used) < self.idle_ttl);
         while self.entries.len() > self.max_open {
-            let oldest = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone());
-            match oldest {
-                Some(key) => {
-                    self.entries.remove(&key);
-                }
-                None => break,
+            if !self.evict_oldest() {
+                break;
             }
         }
         before - self.entries.len()
+    }
+
+    /// 关闭并移除最久未用的一个句柄；缓存为空返回 `false`。
+    /// 插入路径与 sweep 共用，保证两条淘汰路径语义一致。
+    fn evict_oldest(&mut self) -> bool {
+        let oldest = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone());
+        match oldest {
+            Some(key) => {
+                self.entries.remove(&key);
+                true
+            }
+            None => false,
+        }
     }
 
     /// 关闭并清空全部缓存句柄（停机用）。
@@ -234,10 +267,31 @@ pub struct KlineRepo {
 
 impl KlineRepo {
     pub fn new(root: PathBuf) -> Self {
+        // 启动自抬 nofile soft（普通进程即可到 64k），失败只 WARN 不退出；
+        // 读不到限制时按保守值 1024 推导，保证句柄缓存不越进程 fd 预算。
+        let limit = fd_limits::ensure_min(fd_limits::DEFAULT_NOFILE_TARGET).unwrap_or_else(|| {
+            tracing::warn!("读取 nofile 限制失败，按保守值 1024 推导 K线句柄上限");
+            fd_limits::FdLimit {
+                soft: 1024,
+                hard: 1024,
+            }
+        });
+        Self::new_with_limit(root, limit)
+    }
+
+    /// 按给定 fd 限制构造（生产走 [`Self::new`] 自抬后推导；测试可注入上限）。
+    fn new_with_limit(root: PathBuf, limit: fd_limits::FdLimit) -> Self {
+        let max_open = fd_limits::derive_max_open(limit.soft);
+        tracing::info!(
+            nofile_soft = limit.soft,
+            nofile_hard = limit.hard,
+            max_open,
+            "K线句柄缓存上限按 RLIMIT 推导"
+        );
         Self {
             root,
             shard: Arc::new(AtomicUsize::new(0)),
-            handles: Arc::new(Mutex::new(HandleCache::new(HANDLE_MAX_OPEN))),
+            handles: Arc::new(Mutex::new(HandleCache::new(max_open))),
         }
     }
 
@@ -397,19 +451,31 @@ impl KlineRepo {
         let mut written: Vec<(CsvTarget, Vec<T>)> = Vec::new();
         let mut files = 0usize;
         let mut rows = 0usize;
+        // 单组耗时观测：只配一次 `Instant::now()`/组，无 per-row 开销。
+        let mut max_append_ms = 0u64;
+        let mut slow_appends = 0usize;
         while let Some((target, batch)) = iter.next() {
             // 预算耗尽：当前及后续分组整组留下拍（先写的已生效）。
             if files > 0 && started.elapsed() >= write_budget {
+                let unwritten =
+                    collect_remaining(std::iter::once(batch).chain(iter.map(|(_, b)| b)));
                 return AppendOutcome {
-                    report: FlushReport { files, rows },
+                    report: FlushReport {
+                        files,
+                        rows,
+                        deferred_rows: unwritten.len(),
+                        io_ms: elapsed_ms(started),
+                        budget_hit: true,
+                        max_append_ms,
+                        slow_appends,
+                    },
                     written,
-                    unwritten: collect_remaining(
-                        std::iter::once(batch).chain(iter.map(|(_, b)| b)),
-                    ),
+                    unwritten,
                     error: None,
                 };
             }
             // 同组 venue 恒定 → 表头取首行；分组即有行，batch 必非空。
+            let group_started = Instant::now();
             let header = header_of(&batch[0]);
             let result = encode_batch(&batch, &encode_row).and_then(|buf| {
                 let path = self.csv_path(
@@ -424,14 +490,27 @@ impl KlineRepo {
                     .map_err(|_| std::io::Error::other("K线句柄缓存锁中毒"))
                     .and_then(|mut cache| cache.append(&target, &path, &header, &buf, now))
             });
+            let append_ms = elapsed_ms(group_started);
+            max_append_ms = max_append_ms.max(append_ms);
+            if append_ms >= SLOW_APPEND_MS {
+                slow_appends += 1;
+            }
             if let Err(e) = result {
                 // 当前分组（可能部分已写）与后续全部分组都留下轮重试（at-least-once）。
+                let unwritten =
+                    collect_remaining(std::iter::once(batch).chain(iter.map(|(_, b)| b)));
                 return AppendOutcome {
-                    report: FlushReport { files, rows },
+                    report: FlushReport {
+                        files,
+                        rows,
+                        deferred_rows: unwritten.len(),
+                        io_ms: elapsed_ms(started),
+                        budget_hit: false,
+                        max_append_ms,
+                        slow_appends,
+                    },
                     written,
-                    unwritten: collect_remaining(
-                        std::iter::once(batch).chain(iter.map(|(_, b)| b)),
-                    ),
+                    unwritten,
                     error: Some(e),
                 };
             }
@@ -440,7 +519,15 @@ impl KlineRepo {
             written.push((target, batch));
         }
         AppendOutcome {
-            report: FlushReport { files, rows },
+            report: FlushReport {
+                files,
+                rows,
+                deferred_rows: 0,
+                io_ms: elapsed_ms(started),
+                budget_hit: false,
+                max_append_ms,
+                slow_appends,
+            },
             written,
             unwritten: Vec::new(),
             error: None,
@@ -609,6 +696,11 @@ fn finalize_bars(bars: Vec<Bar>, lo: i64, hi: i64) -> Vec<Bar> {
         .collect();
     out.sort_by_key(|b| b.start_time);
     out
+}
+
+/// 距 `started` 的墙钟毫秒（饱和到 `u64`，避免极端长挂钟溢出）。
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 /// 一次 bar 读回的结果：好行（去重、按 start 升序）+ 被跳过的坏行数。
@@ -1042,6 +1134,65 @@ mod tests {
 
     // ---- T4'：活跃集 + 空闲淘汰 ------------------------------------------
 
+    /// fd 上限按注入的 soft limit 推导（不写死 16384）。
+    #[test]
+    fn repo_derives_max_open_from_injected_limit() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new_with_limit(
+            dir.path().to_path_buf(),
+            fd_limits::FdLimit {
+                soft: 1024,
+                hard: 524_288,
+            },
+        );
+        assert_eq!(repo.handles.lock().unwrap().max_open, 768);
+    }
+
+    /// 验收：soft=1024 模拟下 900 个 target 全量 flush 全部成功，
+    /// 句柄不越推导上限（768），且首尾文件内容无丢无重（表头 + 1 行）。
+    #[test]
+    fn full_flush_under_small_soft_limit_stays_within_cap_and_writes_all() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new_with_limit(
+            dir.path().to_path_buf(),
+            fd_limits::FdLimit {
+                soft: 1024,
+                hard: 524_288,
+            },
+        );
+        let table = BarTable::new();
+        for i in 0..900 {
+            table.upsert(bar(&format!("s{i:04}"), 20261024, 60_000, 10));
+        }
+
+        let report = repo.flush_bars(&table).unwrap();
+
+        assert_eq!(report.files, 900, "900 个目标全部落盘");
+        assert_eq!(report.rows, 900);
+        assert!(
+            repo.handles.lock().unwrap().entries.len() <= fd_limits::derive_max_open(1024),
+            "活跃句柄数不得越过 soft=1024 的推导上限"
+        );
+        for sym in ["s0000", "s0899"] {
+            let path = dir.path().join(format!("kline/ctp/1m/20261024/{sym}.csv"));
+            assert_eq!(read_lines(&path).len(), 2, "{sym} 应为表头 + 1 行");
+        }
+    }
+
+    /// 生产构造：max_open 必须等于当前（自抬后）soft 的推导值，而非常量。
+    #[test]
+    fn repo_new_derives_max_open_from_current_soft_limit() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new(dir.path().to_path_buf());
+        let soft = fd_limits::current()
+            .expect("getrlimit(RLIMIT_NOFILE) 应成功")
+            .soft;
+        assert_eq!(
+            repo.handles.lock().unwrap().max_open,
+            fd_limits::derive_max_open(soft)
+        );
+    }
+
     fn csv_target(symbol: &str, day: u32) -> CsvTarget {
         CsvTarget {
             venue: "ctp".into(),
@@ -1055,7 +1206,7 @@ mod tests {
     #[test]
     fn idle_handle_is_evicted_only_after_ttl() {
         let dir = tempdir().unwrap();
-        let mut cache = HandleCache::new(HANDLE_MAX_OPEN);
+        let mut cache = HandleCache::new(fd_limits::HANDLE_MAX_OPEN_CEILING);
         let target = csv_target("cu2512", 20261024);
         let path = dir.path().join("cu2512.csv");
         let t0 = Instant::now();
@@ -1074,10 +1225,17 @@ mod tests {
     }
 
     /// 任意 N：TTL 内 600 个活跃文件全部持有句柄（旧固定 512 上限会抖动）。
+    /// 注入 64k soft，避免断言随宿主 `ulimit -n` 漂移。
     #[test]
     fn active_handles_beyond_old_fixed_cap_are_all_retained() {
         let dir = tempdir().unwrap();
-        let repo = KlineRepo::new(dir.path().to_path_buf());
+        let repo = KlineRepo::new_with_limit(
+            dir.path().to_path_buf(),
+            fd_limits::FdLimit {
+                soft: 65_536,
+                hard: 65_536,
+            },
+        );
         let table = BarTable::new();
         for i in 0..600 {
             table.upsert(bar(&format!("s{i:04}"), 20261024, 60_000, 10));
@@ -1090,19 +1248,93 @@ mod tests {
         );
     }
 
-    /// max_open 仅作 fd 安全阀：超过时按最久未用淘汰到上限。
+    /// 插入即淘汰：达到上限后写第 N+1 个目标前先关最久未用句柄（单拍批量不越阀）。
     #[test]
-    fn max_open_is_only_a_safety_valve() {
+    fn append_evicts_oldest_when_cache_is_full() {
         let dir = tempdir().unwrap();
         let mut cache = HandleCache::new(2);
         let now = Instant::now();
-        for i in 0..3 {
+        for i in 0..3u64 {
             let target = csv_target(&format!("s{i}"), 20261024);
             let path = dir.path().join(format!("s{i}.csv"));
-            cache.append(&target, &path, "h", b"1\n", now).unwrap();
+            // 递增时刻：生产按拍取 `Instant::now()`（同拍内并列，淘汰顺序任意即可）。
+            // 测试用严格递增避免并列带来的非确定性断言。
+            cache
+                .append(&target, &path, "h", b"1\n", now + Duration::from_secs(i))
+                .unwrap();
         }
-        assert_eq!(cache.sweep(now), 1);
+        assert_eq!(cache.entries.len(), 2, "插入时即压回上限");
+        assert!(
+            !cache.entries.contains_key(&csv_target("s0", 20261024)),
+            "最久未用的目标被淘汰"
+        );
+        assert!(cache.entries.contains_key(&csv_target("s2", 20261024)));
+        // 未到 TTL 且已在阀内：sweep 不再有淘汰。
+        assert_eq!(cache.sweep(now), 0);
+    }
+
+    /// 命中已缓存目标只是复用，不触发淘汰其它句柄。
+    #[test]
+    fn reused_handle_does_not_trigger_eviction() {
+        let dir = tempdir().unwrap();
+        let mut cache = HandleCache::new(2);
+        let now = Instant::now();
+        let t0 = csv_target("s0", 20261024);
+        let t1 = csv_target("s1", 20261024);
+        cache
+            .append(&t0, &dir.path().join("s0.csv"), "h", b"1\n", now)
+            .unwrap();
+        cache
+            .append(
+                &t1,
+                &dir.path().join("s1.csv"),
+                "h",
+                b"1\n",
+                now + Duration::from_secs(1),
+            )
+            .unwrap();
+        cache
+            .append(
+                &t0,
+                &dir.path().join("s0.csv"),
+                "h",
+                b"2\n",
+                now + Duration::from_secs(2),
+            )
+            .unwrap();
         assert_eq!(cache.entries.len(), 2);
+        assert!(cache.entries.contains_key(&t1), "复用命中不得淘汰其它句柄");
+    }
+
+    /// 被淘汰的目标可重新打开并正确追加（表头不重复）。
+    #[test]
+    fn evicted_target_reopens_with_correct_content() {
+        let dir = tempdir().unwrap();
+        let mut cache = HandleCache::new(2);
+        let now = Instant::now();
+        for i in 0..3u64 {
+            let target = csv_target(&format!("s{i}"), 20261024);
+            let path = dir.path().join(format!("s{i}.csv"));
+            cache
+                .append(&target, &path, "h", b"1\n", now + Duration::from_secs(i))
+                .unwrap();
+        }
+        // s0 已被淘汰：重新 append 应重开文件并追加第二行。
+        let s0 = csv_target("s0", 20261024);
+        cache
+            .append(
+                &s0,
+                &dir.path().join("s0.csv"),
+                "h",
+                b"2\n",
+                now + Duration::from_secs(3),
+            )
+            .unwrap();
+        assert!(cache.entries.contains_key(&s0));
+        assert_eq!(
+            read_lines(&dir.path().join("s0.csv")),
+            vec!["h".to_string(), "1".to_string(), "2".to_string()]
+        );
     }
 
     /// 无数据拍也要 sweep：休市后没有任何 bar/tick 时，空闲句柄仍按 TTL 关闭。
@@ -1206,6 +1438,64 @@ mod tests {
             read_lines(&dir.path().join("kline/ctp/tick/20261024/rb2611.csv")).len(),
             2
         ); // 表头 + 1 行
+    }
+
+    // ---- Phase A：刷盘可观测字段 ----------------------------------------
+
+    /// 预算截断：`budget_hit=true`、`deferred_rows` 等于被留在窗口的行数；
+    /// 未截断拍两者分别为 `false/0`；`io_ms` 覆盖所有单组计时（≥ max_append_ms）。
+    #[test]
+    fn flush_ticks_reports_budget_hit_and_deferred_rows() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new(dir.path().to_path_buf());
+        let table = TickTable::new();
+        // 两个目标文件：BTreeMap 序 cu2512 先写，rb2611 被零预算截留。
+        table.append(tick("cu2512", 20261024, 1_760_000_000_000, 1));
+        table.append(tick("rb2611", 20261024, 1_760_000_000_001, 2));
+        table.append(tick("rb2611", 20261024, 1_760_000_000_002, 3));
+
+        let tight = FlushOptions {
+            max_rows: 100,
+            write_budget: std::time::Duration::ZERO,
+            ..FlushOptions::default()
+        };
+        let first = repo.flush_ticks_with(&table, tight).unwrap();
+        assert!(first.budget_hit, "零预算必须标记本拍被预算截断");
+        assert_eq!(
+            first.deferred_rows, 2,
+            "被 requeue 的行数须计入 deferred_rows"
+        );
+        assert_eq!(first.rows, 1);
+        assert!(
+            first.io_ms >= first.max_append_ms,
+            "整拍 IO 墙钟须覆盖最慢单组（io_ms={} max_append_ms={}）",
+            first.io_ms,
+            first.max_append_ms
+        );
+
+        // 第二拍排空剩余：无截断拍两字段归零。
+        let second = repo.flush_ticks_with(&table, tight).unwrap();
+        assert!(!second.budget_hit);
+        assert_eq!(second.deferred_rows, 0);
+        assert_eq!(second.slow_appends, 0, "小批写盘不应记慢组");
+    }
+
+    /// bar 常规全量拍：未截断时 `deferred_rows=0`（dirty 由 shard/预算留在表内，
+    /// 不属于本拍的未写 outcome）。
+    #[test]
+    fn flush_bars_reports_zero_deferred_when_not_truncated() {
+        let dir = tempdir().unwrap();
+        let repo = KlineRepo::new(dir.path().to_path_buf());
+        let table = BarTable::new();
+        table.upsert(bar("cu2512", 20261024, 60_000, 10));
+
+        let report = repo
+            .flush_bars_with(&table, FlushOptions::default())
+            .unwrap();
+        assert!(!report.budget_hit);
+        assert_eq!(report.deferred_rows, 0);
+        assert_eq!(report.rows, 1);
+        assert!(report.io_ms >= report.max_append_ms);
     }
 
     /// bar 单批上限：写满上限后其余分组保持 dirty，下一拍补齐。

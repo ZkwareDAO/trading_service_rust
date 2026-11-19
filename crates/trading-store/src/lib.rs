@@ -35,6 +35,7 @@ use trading_models::{Account, Order, Position, WatchRule};
 pub mod accounts;
 pub mod async_rt;
 pub mod ctp_specs;
+pub mod fd_limits;
 pub mod history;
 pub mod init;
 pub mod kline;

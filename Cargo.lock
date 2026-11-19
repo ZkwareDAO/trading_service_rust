@@ -3557,6 +3557,7 @@ dependencies = [
  "chrono",
  "csv",
  "dashmap",
+ "libc",
  "rust_decimal",
  "serde",
  "serde_json",

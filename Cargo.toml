@@ -43,6 +43,8 @@ anyhow = "1"
 async-trait = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 once_cell = "1"
+# 进程 fd 上限（RLIMIT_NOFILE）：无稳定 std 封装，trading-store 启动自抬用。
+libc = "0.2"
 
 # ---- 双方共用（特性取并集，均为远端所需的超集）----
 serde = { version = "1", features = ["derive"] }

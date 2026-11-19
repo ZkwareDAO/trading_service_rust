@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use trading_core::kline::{
     detect_tail_gap, product_prefix, BarTable, BarTarget, DominantTable, GapRegistry,
@@ -56,9 +56,61 @@ fn backlog_edge(was_over: bool, pending: usize, threshold: usize) -> (bool, bool
     (now_over, now_over && !was_over, was_over && !now_over)
 }
 
+/// 丢弃 episode 的单拍观测结果（服务据此分级记日志；纯结果便于单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropEpisode {
+    /// 本拍无丢弃且不在 episode 内。
+    None,
+    /// 本拍首次出现丢弃（episode 起点，只在此报一次 error）。
+    First { dropped: u64 },
+    /// episode 持续：本拍仍有丢弃（只累计，不再报 error）。
+    Ongoing { total: u64 },
+    /// 本拍归零：episode 结束，携带总量与持续时长汇总。
+    Recovered { total: u64, duration_ms: u64 },
+}
+
+/// tick WAL 溢出丢弃事件聚合：同一次「积压达上限」episode 只在起点 error 一次，
+/// 恢复时 warn 汇总总量/时长，避免每拍刷屏又保留完整证据。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DropEpisodeTracker {
+    active: bool,
+    /// 本 episode 累计丢弃量。
+    total: u64,
+    /// 本 episode 持续时长（各含丢弃拍的 cycle_ms 之和）。
+    duration_ms: u64,
+}
+
+impl DropEpisodeTracker {
+    /// 观察单拍丢弃量与该拍 cycle 时长（毫秒），返回本拍应记录的事件。
+    fn observe(&mut self, dropped: u64, cycle_ms: u64) -> DropEpisode {
+        if dropped == 0 {
+            if !self.active {
+                return DropEpisode::None;
+            }
+            let (total, duration_ms) = (self.total, self.duration_ms);
+            *self = Self::default();
+            return DropEpisode::Recovered { total, duration_ms };
+        }
+        let is_first = !self.active;
+        self.active = true;
+        self.total = self.total.saturating_add(dropped);
+        self.duration_ms = self.duration_ms.saturating_add(cycle_ms);
+        if is_first {
+            DropEpisode::First { dropped }
+        } else {
+            DropEpisode::Ongoing { total: self.total }
+        }
+    }
+}
+
 /// 当前 UTC 墙钟（毫秒）；历史取数懒加载窗口锚点、缺口周期扫描生产时钟。
 pub(crate) fn now_utc_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// 距 `started` 的墙钟毫秒（饱和到 `u64`，避免极端长挂钟溢出）。
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 /// 在阻塞线程池读归档 CSV（同步文件 IO 不占 tokio worker，仿 admin::refresh-specs）。
@@ -1185,18 +1237,31 @@ impl KlineService {
         let handle = thread::Builder::new()
             .name("kline-flush".into())
             .spawn(move || {
+                // Phase A 观测状态：丢弃 episode 聚合与当日累计（均为线程私有，无共享）。
+                let mut drop_episode = DropEpisodeTracker::default();
+                let mut tick_dropped_total: u64 = 0;
+                // 上一拍结束时刻：本拍 cycle_ms = 上一拍结束 → 本拍结束（含休眠）。
+                let mut last_cycle_end = Instant::now();
                 loop {
                     interruptible_sleep(interval, &stop);
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
+                    // 刷盘前积压（drain 线程在 flush 期间仍可能写入，需前后各采一次）。
+                    let backlog_before = me.ticks.len();
                     let out = me.flush_once_sharded();
+                    let backlog_after = me.ticks.len();
+                    let cycle_ms = elapsed_ms(last_cycle_end);
+                    last_cycle_end = Instant::now();
+                    let tick_capacity = me.ticks.capacity();
                     if out.bars.rows > 0 || out.ticks.rows > 0 {
                         tracing::info!(
                             bars = out.bars.rows,
                             bar_files = out.bars.files,
                             ticks = out.ticks.rows,
                             tick_files = out.ticks.files,
+                            tick_backlog = backlog_after,
+                            tick_capacity,
                             "K线 CSV 批量刷盘"
                         );
                     }
@@ -1209,11 +1274,52 @@ impl KlineService {
                     me.check_bar_backlog();
                     // CTP 原始 tick 刷盘窗口背压丢弃（仅 ctp 有写入，非 ctp 计数恒 0）。
                     let tick_dropped = me.ticks.take_dropped();
-                    if tick_dropped > 0 {
-                        tracing::error!(
+                    tick_dropped_total = tick_dropped_total.saturating_add(tick_dropped);
+                    // Phase A：每拍一行结构化明细，供盘中区分「占空比受限 vs 磁盘延迟受限」。
+                    // drained = 本拍从 WAL 取走行数（已写 + 预算截留/失败未写）。
+                    tracing::debug!(
+                        cycle_ms,
+                        tick_backlog_before = backlog_before,
+                        tick_backlog_after = backlog_after,
+                        tick_capacity,
+                        tick_drained = out.ticks.rows + out.ticks.deferred_rows,
+                        tick_rows = out.ticks.rows,
+                        tick_deferred = out.ticks.deferred_rows,
+                        append_groups = out.ticks.files,
+                        tick_io_ms = out.ticks.io_ms,
+                        tick_max_append_ms = out.ticks.max_append_ms,
+                        tick_slow_appends = out.ticks.slow_appends,
+                        tick_budget_hit = out.ticks.budget_hit,
+                        tick_dropped_cycle = tick_dropped,
+                        tick_dropped_total,
+                        bar_rows = out.bars.rows,
+                        bar_deferred = out.bars.deferred_rows,
+                        bar_budget_hit = out.bars.budget_hit,
+                        "K线刷盘拍明细（Phase A 观测）"
+                    );
+                    match drop_episode.observe(tick_dropped, cycle_ms) {
+                        DropEpisode::First { dropped } => tracing::error!(
+                            dropped,
+                            tick_capacity,
+                            tick_backlog = backlog_after,
+                            tick_dropped_total,
+                            "CTP 原始 tick 因刷盘窗口积压超上限被丢弃（episode 起点，请检查 CSV 落盘/磁盘）"
+                        ),
+                        DropEpisode::Ongoing { total } => tracing::debug!(
                             dropped = tick_dropped,
-                            "CTP 原始 tick 因刷盘窗口积压超上限被丢弃（请检查 CSV 落盘/磁盘）"
-                        );
+                            total,
+                            tick_backlog = backlog_after,
+                            tick_dropped_total,
+                            "CTP 原始 tick WAL 丢弃持续中（同一 episode）"
+                        ),
+                        DropEpisode::Recovered { total, duration_ms } => tracing::warn!(
+                            total,
+                            duration_ms,
+                            tick_dropped_total,
+                            tick_backlog = backlog_after,
+                            "CTP 原始 tick WAL 丢弃 episode 结束（积压已恢复）"
+                        ),
+                        DropEpisode::None => {}
                     }
                 }
                 // 停机兜底：把最后一批定稿 bar/tick 落盘，避免丢窗口内数据。
@@ -1624,6 +1730,34 @@ mod tests {
         assert_eq!(backlog_edge(false, 5, T), (false, false, false));
         // 恰好等于阈值不算超阈。
         assert_eq!(backlog_edge(false, T, T), (false, false, false));
+    }
+
+    #[test]
+    fn drop_episode_tracker_reports_each_episode_once() {
+        let mut t = DropEpisodeTracker::default();
+        // 无丢弃且未处于 episode：无事件。
+        assert_eq!(t.observe(0, 5_000), DropEpisode::None);
+        // 首次丢弃：episode 起点（服务打一次 error）。
+        assert_eq!(t.observe(10, 5_000), DropEpisode::First { dropped: 10 });
+        // 持续丢弃：只累计总量，不再报 error。
+        assert_eq!(t.observe(5, 5_000), DropEpisode::Ongoing { total: 15 });
+        // 归零：episode 结束，汇总总量与持续时长（仅含发生丢弃的两拍）。
+        assert_eq!(
+            t.observe(0, 5_000),
+            DropEpisode::Recovered {
+                total: 15,
+                duration_ms: 10_000
+            }
+        );
+        // 恢复后再次溢出：重新开新 episode（而不是并入上一次）。
+        assert_eq!(t.observe(2, 5_000), DropEpisode::First { dropped: 2 });
+        assert_eq!(
+            t.observe(0, 5_000),
+            DropEpisode::Recovered {
+                total: 2,
+                duration_ms: 5_000
+            }
+        );
     }
 
     /// 测试用缺省历史取数限额。

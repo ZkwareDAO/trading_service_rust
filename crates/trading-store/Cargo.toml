@@ -28,6 +28,8 @@ serde = { workspace = true }
 tracing = { workspace = true }
 # async_rt 模块：spawn_blocking / spawn / interval（CRUD 本身仍同步，不需要 rt-multi-thread）
 tokio = { version = "1", features = ["rt", "time"] }
+# fd 上限（RLIMIT_NOFILE）读取/自抬：getrlimit/setrlimit 无稳定 std 封装。
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
