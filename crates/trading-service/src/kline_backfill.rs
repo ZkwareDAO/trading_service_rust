@@ -341,8 +341,8 @@ async fn process_one_tick(
         return;
     }
     let mut semaphores: HashMap<String, Arc<tokio::sync::Semaphore>> = HashMap::new();
-    // 每段一个并发任务，结论回传 (venue, all_segments_ok) 以更新退避。
-    let mut tasks: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
+    // 每段一个并发任务，结论回传 (venue, 失败根因 Option) 以更新退避与告警。
+    let mut tasks: tokio::task::JoinSet<(String, Option<String>)> = tokio::task::JoinSet::new();
 
     for (series, ranges) in due {
         // 退避门：仍在退避窗内的所，整组 fail 退回 pending，本轮不请求。
@@ -374,8 +374,10 @@ async fn process_one_tick(
             let history = history.clone();
             let stop = Arc::clone(&stop);
             tasks.spawn(async move {
-                let _permit = permit; // 持有到本任务结束（含在飞 REST 全程）才释放许可。
-                let ok = match history {
+                // 持有许可到本任务结束（含在飞 REST 全程）才释放。
+                let _permit = permit;
+                // 片段失败保留根因（含品种），供收口告警定位：南向错误/停机中断/无取数实现。
+                let err: Option<String> = match history {
                     Some(h) => {
                         let fut = apply_range(
                             &bars,
@@ -385,29 +387,38 @@ async fn process_one_tick(
                             range.start,
                             range.end + KLINE_STEP_MS,
                         );
-                        run_with_stop(fut, &stop).await.is_some_and(|r| r.is_ok())
+                        match run_with_stop(fut, &stop).await {
+                            None => Some(format!("{symbol}: 回补被停机中断")),
+                            Some(Ok(_)) => None,
+                            Some(Err(e)) => Some(format!("{symbol}: {e:#}")),
+                        }
                     }
-                    None => false,
+                    None => Some(format!("{symbol}: 该所无 market_history 取数实现")),
                 };
-                if ok {
+                if err.is_none() {
                     gaps_arc.complete(&venue, &symbol, &enumerate_starts(range, KLINE_STEP_MS));
                 } else {
                     gaps_arc.fail(&venue, &symbol, &[range], KLINE_STEP_MS);
+                    tracing::debug!(
+                        %venue,
+                        error = err.as_deref().unwrap_or_default(),
+                        "K线回补片段失败"
+                    );
                 }
-                (venue, ok)
+                (venue, err)
             });
         }
     }
 
     // 按所汇总结论：任一失败即升级退避；全成功才重置。
-    let mut venue_ok: HashMap<String, bool> = HashMap::new();
+    let mut outcomes: Vec<(String, Option<String>)> = Vec::new();
     while let Some(join) = tasks.join_next().await {
-        if let Ok((venue, ok)) = join {
-            *venue_ok.entry(venue).or_insert(true) &= ok;
+        if let Ok((venue, err)) = join {
+            outcomes.push((venue, err));
         }
     }
-    for (venue, all_ok) in venue_ok {
-        if all_ok {
+    for (venue, summary) in summarize_by_venue(outcomes) {
+        if summary.all_ok {
             // 全成功：清掉该所退避状态（不保留归零条目，避免退避表只增不减）。
             backoffs.remove(&venue);
         } else {
@@ -415,9 +426,45 @@ async fn process_one_tick(
             st.failures = st.failures.saturating_add(1);
             let delay = schedule.delay_after(st.failures);
             st.not_before = Some(Instant::now() + delay);
-            tracing::warn!(%venue, failures = st.failures, ?delay, "K线回补失败，退避后重试");
+            tracing::warn!(
+                %venue,
+                failures = st.failures,
+                ?delay,
+                error = summary.first_error.as_deref().unwrap_or("未知"),
+                "K线回补失败，退避后重试"
+            );
         }
     }
+}
+
+/// 一拍内按所汇总回补片段结论：任一失败即 `all_ok=false`，并保留首条错误
+/// （含品种）作为告警根因。纯函数，便于单测。
+fn summarize_by_venue(
+    outcomes: impl IntoIterator<Item = (String, Option<String>)>,
+) -> HashMap<String, VenueSummary> {
+    let mut map: HashMap<String, VenueSummary> = HashMap::new();
+    for (venue, err) in outcomes {
+        let summary = map.entry(venue).or_insert(VenueSummary {
+            all_ok: true,
+            first_error: None,
+        });
+        if let Some(message) = err {
+            summary.all_ok = false;
+            if summary.first_error.is_none() {
+                summary.first_error = Some(message);
+            }
+        }
+    }
+    map
+}
+
+/// 单个交易所一拍内的汇总结论。
+#[derive(Debug)]
+struct VenueSummary {
+    /// 该所所有回补片段是否全部成功。
+    all_ok: bool,
+    /// 首条失败根因（`symbol: error`），用于告警定位。
+    first_error: Option<String>,
 }
 
 /// 停机时不再等待取数 future（返回 None）；正常完成回传结果。
@@ -546,6 +593,32 @@ mod tests {
         assert_eq!(b.delay_after(4), Duration::from_secs(180));
         assert_eq!(b.delay_after(5), Duration::from_secs(300));
         assert_eq!(b.delay_after(99), Duration::from_secs(300)); // 封顶
+    }
+
+    #[test]
+    fn summarize_by_venue_keeps_first_error() {
+        // 同所多段：一条成功 + 两条失败，应 all_ok=false 且保留首条根因；
+        // 全成功的所 all_ok=true 且无根因。
+        let summary = summarize_by_venue(vec![
+            ("binance".to_string(), None),
+            (
+                "binance".to_string(),
+                Some("BTCUSDT: upstream 500".to_string()),
+            ),
+            (
+                "binance".to_string(),
+                Some("ETHUSDT: upstream 502".to_string()),
+            ),
+            ("ctp".to_string(), None),
+        ]);
+        let binance = &summary["binance"];
+        assert!(!binance.all_ok);
+        assert_eq!(
+            binance.first_error.as_deref(),
+            Some("BTCUSDT: upstream 500")
+        );
+        assert!(summary["ctp"].all_ok);
+        assert!(summary["ctp"].first_error.is_none());
     }
 
     #[tokio::test]
