@@ -1,0 +1,9 @@
+
+# 服务 base 地址：v1 后端已把订单 / 仓位 / 规则 / 账户合并为单一服务、同一端口。
+# 各接口路径在 SKILL.md 中定义，拼为  base + 路径（如 base + /api/v1/orders）。
+api:
+  base: "http://localhost:9100"
+
+# 生产环境配置（示例）
+# api:
+#   base: "https://api.yourdomain.com"
