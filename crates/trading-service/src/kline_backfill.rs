@@ -389,7 +389,20 @@ async fn process_one_tick(
                         );
                         match run_with_stop(fut, &stop).await {
                             None => Some(format!("{symbol}: 回补被停机中断")),
-                            Some(Ok(_)) => None,
+                            Some(Ok(r)) => {
+                                // 成功留 INFO 便于恢复期核对（仅真实缺口触发，量有限）。
+                                tracing::info!(
+                                    %venue,
+                                    %symbol,
+                                    start_ms = range.start,
+                                    end_ms = range.end + KLINE_STEP_MS,
+                                    requested = r.requested,
+                                    upserted = r.upserted,
+                                    missing_after = r.missing_after,
+                                    "K线回补完成"
+                                );
+                                None
+                            }
                             Some(Err(e)) => Some(format!("{symbol}: {e:#}")),
                         }
                     }
@@ -803,6 +816,93 @@ mod tests {
                 st: Arc::clone(&self.st),
             }))
         }
+    }
+
+    /// 回补成功必须留 INFO 日志（venue/symbol/区间/requested/upserted/missing_after），
+    /// 否则恢复期无从核对回补是否生效。
+    #[tokio::test]
+    async fn tick_success_emits_backfill_completed_log() {
+        use std::sync::Mutex;
+
+        /// 把 fmt writer 输出汇入共享缓冲，测试据此断言日志内容。
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let bars_tbl = Arc::new(BarTable::new());
+        let gaps = Arc::new(GapRegistry::new());
+        let base = recent_base();
+        assert_eq!(
+            gaps.record(
+                "binance",
+                "BTCUSDT",
+                &GapRange::new(base, base + STEP),
+                STEP
+            ),
+            2,
+            "缺口登记未生效（后续断言会因此失真）"
+        );
+        let exchanges = registry_with(
+            Arc::new(AtomicBool::new(false)),
+            vec![
+                kline_at("binance", "BTCUSDT", base),
+                kline_at("binance", "BTCUSDT", base + STEP),
+            ],
+        );
+        let schedule = BackoffSchedule::default();
+        let mut backoffs = HashMap::new();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        // current-thread runtime 上线程局部 subscriber 亦覆盖 JoinSet 内任务。
+        let guard = tracing::subscriber::set_default(subscriber);
+        process_one_tick(
+            &bars_tbl,
+            &gaps,
+            &exchanges,
+            BackfillRuntimeConfig::disabled(),
+            &schedule,
+            &mut backoffs,
+            stop,
+        )
+        .await;
+        drop(guard);
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+
+        assert!(log.contains("K线回补完成"), "缺少成功日志: {log}");
+        assert!(log.contains("venue=binance"), "缺少 venue: {log}");
+        assert!(log.contains("symbol=BTCUSDT"), "缺少 symbol: {log}");
+        // 区间为半开 [base, base+2*STEP)：start 含、end 不含。
+        assert!(
+            log.contains(&format!("start_ms={base}")),
+            "缺少 start_ms: {log}"
+        );
+        assert!(
+            log.contains(&format!("end_ms={}", base + 2 * STEP)),
+            "缺少 end_ms: {log}"
+        );
+        assert!(log.contains("requested=2"), "缺少 requested: {log}");
+        assert!(log.contains("upserted=2"), "缺少 upserted: {log}");
+        assert!(log.contains("missing_after=0"), "缺少 missing_after: {log}");
     }
 
     #[tokio::test]

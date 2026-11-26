@@ -239,7 +239,16 @@ async fn run_forever<F: WsMarketFeed>(
         if let Some(wait) = backoff.next_wait() {
             tokio::time::sleep(wait).await;
         }
-        match run_connection(label, feed.as_ref(), &hub, &quotes, observer.as_deref()).await {
+        match run_connection(
+            label,
+            feed.as_ref(),
+            &hub,
+            &quotes,
+            observer.as_deref(),
+            &mut backoff,
+        )
+        .await
+        {
             Ok(()) => {
                 // run_connection 仅在对端正常关闭时返回 Ok；仍退避重连保活。
                 tracing::warn!(stream = label, "market ws closed, reconnecting");
@@ -253,15 +262,21 @@ async fn run_forever<F: WsMarketFeed>(
 }
 
 /// 单次连接：握手 → on_connect → 周期对账 / Ping / 看门狗 / 读帧，直到关闭或错误。
+///
+/// 连接真正建立（握手与 `on_connect` 初始化帧均成功）即把 `backoff` 归零：
+/// 下次断线从 10s 重新等待，避免把秒级网络抖动放大成分钟级 bar 缺口。
 async fn run_connection<F: WsMarketFeed>(
     label: &'static str,
     feed: &F,
     hub: &HubRegistry,
     quotes: &QuoteTable,
     observer: Option<&dyn QuoteObserver>,
+    backoff: &mut ReconnectBackoff,
 ) -> anyhow::Result<()> {
     let mut ws = crate::ws::connect(feed.url()).await?;
     feed.on_connect(&mut ws).await?;
+    // 握手 + 初始化帧均成功 → 视为连接建立成功，阶梯归零。
+    backoff.reset();
     // 本连接已订阅频道；连接重建即清空 → 下轮对账整体重放。
     let mut subscribed: HashSet<String> = HashSet::new();
 
@@ -371,6 +386,95 @@ mod tests {
     #[test]
     fn feed_message_default_is_empty() {
         assert!(FeedMessage::default().is_empty());
+    }
+
+    /// 极简 feed：指向本地端口，建连后不做任何所内初始化/频道/解码。
+    struct FakeFeed {
+        url: String,
+    }
+
+    #[async_trait]
+    impl WsMarketFeed for FakeFeed {
+        fn url(&self) -> &str {
+            &self.url
+        }
+        fn reconcile(
+            &self,
+            _price_symbols: &BTreeSet<String>,
+            _bar_symbols: &BTreeSet<String>,
+            _subscribed: &HashSet<String>,
+        ) -> ChannelPlan {
+            ChannelPlan::default()
+        }
+        async fn send_subscribe(
+            &self,
+            _ws: &mut WsStream,
+            _channels: &[String],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_unsubscribe(
+            &self,
+            _ws: &mut WsStream,
+            _channels: &[String],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn decode(&self, _text: &str) -> FeedMessage {
+            FeedMessage::default()
+        }
+        fn write_quote(
+            &self,
+            _tick: &PriceTick,
+            _quotes: &QuoteTable,
+            _observer: Option<&dyn QuoteObserver>,
+        ) {
+        }
+    }
+
+    /// 连接真正建立（握手 + on_connect 成功）后，退避阶梯必须归零：
+    /// 否则成功连接后的下次断线仍按旧档（可达 5min）等待，把秒级抖动放大成分钟级缺口。
+    #[tokio::test]
+    async fn successful_connection_resets_backoff() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("ws://127.0.0.1:{port}");
+
+        let server = tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                // 握手成功后立即正常关闭，让 run_connection 走 Ok(()) 返回路径。
+                if let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await {
+                    let _ = ws.close(None).await;
+                    while let Some(Ok(_)) = ws.next().await {}
+                }
+            }
+        });
+
+        // 模拟一个已经多次失败、爬到 30s 档的进程（下一档本应是 60s）。
+        let mut backoff = ReconnectBackoff::new();
+        backoff.note_retry();
+        backoff.note_retry();
+        // 用 clone 窥视而**不消费** pending：reset 必须直接清空这个残留的 30s。
+        assert_eq!(backoff.clone().next_wait(), Some(Duration::from_secs(30)));
+
+        let feed = FakeFeed { url };
+        let hub = HubRegistry::new();
+        let quotes = QuoteTable::new();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_connection("test", &feed, &hub, &quotes, None, &mut backoff),
+        )
+        .await
+        .expect("run_connection 超时");
+        assert!(res.is_ok(), "对端正常关闭应返回 Ok: {res:?}");
+        assert_eq!(backoff.next_wait(), None, "reset 应清空残留的 30s 等待档");
+        // 阶梯已归零：再次断线从 10s 起（而非旧档之后的 60s）。
+        backoff.note_retry();
+        assert_eq!(backoff.next_wait(), Some(Duration::from_secs(10)));
+
+        server.abort();
     }
 
     /// 引擎注册的无条件 sink：driverless 引擎直接派发定稿 bar 即可收到（无任何消费者）。
