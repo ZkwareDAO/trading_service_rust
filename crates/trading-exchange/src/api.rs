@@ -153,6 +153,19 @@ pub struct OrderState {
 // 持仓 / 行情
 // =====================================================================
 
+/// 交易所合约静态规格（同步、纯内存读取；下单现金换算用）。
+///
+/// 由 provider 从本地静态目录提供（如 CTP `InstrumentDir`），不发起网络请求；
+/// 未接入该能力、或静态规格未预热时返回 None，由调用方决定 fail-closed 还是按
+/// 乘数 1 回退。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContractSpec {
+    /// 合约乘数：名义价值 = price × quantity × multiplier。
+    pub multiplier: Decimal,
+    /// 最小手数步长：`Some(s>0)` 向下取整到 s（CTP 整数手=1）；`None` 按小数精度截断。
+    pub lot_step: Option<Decimal>,
+}
+
 /// 持仓 REST 快照（一行一个持仓方向）。
 ///
 /// `signed_quantity` 带符号（正多负空），与交易所原始口径一致；hedge 模式下同标的

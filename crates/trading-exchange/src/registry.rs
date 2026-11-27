@@ -133,6 +133,21 @@ impl ExchangeRegistry {
         }
     }
 
+    /// 该所的合约静态规格（provider 同步纯内存读取）；未注册所返回 None。
+    pub fn contract_spec(
+        &self,
+        exchange: &str,
+        instrument: &str,
+    ) -> Option<crate::api::ContractSpec> {
+        self.provider(exchange)?.contract_spec(exchange, instrument)
+    }
+
+    /// 该所现金下单是否必须要有合约乘数；未注册所按 false（维持旧口径）。
+    pub fn requires_contract_multiplier(&self, exchange: &str) -> bool {
+        self.provider(exchange)
+            .is_some_and(|p| p.requires_contract_multiplier())
+    }
+
     /// 构造某 (交易所, 产品, 账户) 的下单/查询主体；未注册的所返回错误。
     pub fn connect(
         &self,

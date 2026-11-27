@@ -182,7 +182,11 @@ pub(crate) async fn submit_order_core(
 
     let orders = state.store.order_repo().expect("order repo after recover");
 
-    // 取量二选一：quantity 优先；否则 order_cash ÷ 参考价换算。
+    // 规则行在建单前取一次：现金口径的乘数/步长与后续对齐共用同一行。
+    let rule_key = trading_models::OrderRuleKey::new(&venue, instrument_type, &instrument);
+    let rule_row = state.store.order_rules().get(&rule_key);
+
+    // 取量二选一：quantity 优先；否则 cash ÷（参考价 × 乘数）换算。
     let quantity = if raw_quantity > Decimal::ZERO {
         raw_quantity
     } else if order_cash > Decimal::ZERO {
@@ -201,7 +205,15 @@ pub(crate) async fn submit_order_core(
             )
             .into());
         };
-        let Some(q) = crate::cashqty::cash_to_quantity(order_cash, ref_price) else {
+        // 规格优先级：规则行 → 交易所 provider 静态规格 → 缺省 1；CTP 缺乘数
+        // 时 fail-closed（错误信息带「合约乘数未就绪」）。
+        let spec = crate::cashqty::resolve_spec(
+            rule_row.as_deref(),
+            state.exchanges.contract_spec(&venue, &instrument),
+            state.exchanges.requires_contract_multiplier(&venue),
+        )
+        .map_err(|e| RejectReason::new(format!("order_cash 换算失败：{e}")))?;
+        let Some(q) = crate::cashqty::cash_to_quantity(order_cash, ref_price, &spec) else {
             return Err(RejectReason::new("order_cash 换算出的数量非正").into());
         };
         q
@@ -212,14 +224,11 @@ pub(crate) async fn submit_order_core(
     // 建单前按交易规则步长对齐数量（领域层收口），使订单行数量 = 实际委托量
     // = 通知数量。规则未就绪（启动同步窗口/测试未 seed）时**容错透传**：不改
     // 同步建单契约，最终对齐/校验仍由 venue 在实际下单时兜底。
-    let quantity = {
-        let rule_key = trading_models::OrderRuleKey::new(&venue, instrument_type, &instrument);
-        match state.store.order_rules().get(&rule_key) {
-            Some(qrow) => trading_core::order_rule::align_quantity(&qrow, order_type, quantity)
-                .map_err(|e| RejectReason::new(format!("数量对齐失败 {instrument}: {e:?}")))?,
-            // 规则缺失：透传原量，交给 venue 兜底（保持原同步 PLACING 行为）。
-            None => quantity,
-        }
+    let quantity = match rule_row {
+        Some(qrow) => trading_core::order_rule::align_quantity(&qrow, order_type, quantity)
+            .map_err(|e| RejectReason::new(format!("数量对齐失败 {instrument}: {e:?}")))?,
+        // 规则缺失：透传原量，交给 venue 兜底（保持原同步 PLACING 行为）。
+        None => quantity,
     };
 
     // —— 内存建单（PLACING；id/时间戳由框架表分配）——
@@ -1292,6 +1301,45 @@ mod tests {
 
         // Assert：订单行数量已对齐到 0.002（与实际仓位/通知一致）。
         assert_eq!(order.order_quantity, d("0.002"));
+    }
+
+    /// 现金口径计入规则行乘数：30000 ÷ (3000×10) = 1 手（限价单无需行情）。
+    #[tokio::test]
+    async fn submit_core_cash_quantity_accounts_rule_multiplier() {
+        let app = crate::api::test_support::app_with_accounts(
+            "0,tb,binance,\"{\"\"api_key\"\":\"\"K\"\",\"\"api_secret\"\":\"\"s\"\"}\",0,0,0\n",
+        )
+        .await;
+        let d = |s: &str| rust_decimal::Decimal::from_str(s).unwrap();
+        let mut rule = binance_rule();
+        rule.multiplier = d("10");
+        rule.qty_step = d("1");
+        rule.qty_min = Some(d("1"));
+        app.state.store.order_rules().put(rule);
+
+        let input = PlaceOrderInput {
+            exchange: "binance".into(),
+            account: "tb".into(),
+            instrument: "BTCUSDT".into(),
+            instrument_type: InstrumentType::Futures,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            price: d("3000"),
+            quantity: Decimal::ZERO,
+            order_cash: d("30000"),
+            reduce_only: false,
+            set_leverage_explicit: false,
+            leverage: 1,
+            strategy_name: None,
+            signal_id: None,
+            client_order_id: new_client_id(),
+        };
+
+        let order = submit_order_core(app.state.clone(), input, Callback::Ignore)
+            .await
+            .unwrap();
+        assert_eq!(order.order_quantity, d("1"));
     }
 
     // ---- get_order：南向 WS 查单（活动/tombstone/历史/缺参/越权）----

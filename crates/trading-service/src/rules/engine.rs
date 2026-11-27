@@ -249,7 +249,16 @@ impl RuleEngine {
             limit_price,
         )
         .ok_or_else(|| "order_cash 换算失败：缺少可用参考价（行情未就绪）".to_string())?;
-        let quantity = crate::cashqty::cash_to_quantity(rule.order_cash, ref_price)
+        // 规则引擎不持有 OrderRuleTable：规格只取自 provider 静态目录（CTP 乘数/
+        // 整数手）；其余所缺省乘数 1，维持原口径。CTP 未预热时 fail-closed。
+        let spec = crate::cashqty::resolve_spec(
+            None,
+            self.registry
+                .contract_spec(&rule.exchange, &rule.instrument),
+            self.registry.requires_contract_multiplier(&rule.exchange),
+        )
+        .map_err(|e| format!("order_cash 换算失败：{e}"))?;
+        let quantity = crate::cashqty::cash_to_quantity(rule.order_cash, ref_price, &spec)
             .ok_or_else(|| "order_cash 换算出的数量非正".to_string())?;
         let mut resolved = rule.clone();
         resolved.quantity = quantity;
@@ -700,6 +709,42 @@ mod tests {
         }
     }
 
+    /// 仅提供合约静态规格的桩 provider（模拟 CTP：乘数可选、整数手、乘数必需）。
+    struct SpecProvider {
+        multiplier: Option<Decimal>,
+    }
+
+    impl VenueProvider for SpecProvider {
+        fn matches(&self, exchange: &str) -> bool {
+            exchange == "ctp"
+        }
+
+        fn contract_spec(
+            &self,
+            _exchange: &str,
+            _instrument: &str,
+        ) -> Option<trading_exchange::api::ContractSpec> {
+            self.multiplier
+                .map(|multiplier| trading_exchange::api::ContractSpec {
+                    multiplier,
+                    lot_step: Some(Decimal::ONE),
+                })
+        }
+
+        fn requires_contract_multiplier(&self) -> bool {
+            true
+        }
+
+        fn build_api(
+            &self,
+            _exchange: &str,
+            _instrument_type: Option<&str>,
+            _account: &str,
+        ) -> anyhow::Result<Arc<dyn ExchangeApi>> {
+            anyhow::bail!("规格桩不提供下单主体")
+        }
+    }
+
     /// 记录提交请求的假下单口；reject=true 时把订单推进到 REJECTED 终态。
     struct FakePlacer {
         // cid, reduce_only, account, leverage
@@ -1022,6 +1067,81 @@ mod tests {
         assert_eq!(order.order_quantity, dec("0.002")); // cash 换算
         assert!(!order.reduce_only);
         assert_eq!(order.rule_id, rule.id);
+    }
+
+    /// 构造 CTP 现金口径 new 规则：市价买 rb2601、cash=30000、价格>=0 即命中。
+    fn ctp_cash_rule(h: &Harness) -> WatchRule {
+        h.rules
+            .insert({
+                let mut r = WatchRule::new_open(
+                    7,
+                    0,
+                    "ctp",
+                    "rb2601",
+                    InstrumentType::Futures,
+                    Side::Buy,
+                    OrderType::Market,
+                    Decimal::ZERO,
+                    Decimal::ZERO,
+                    1,
+                );
+                r.order_cash = dec("30000");
+                r.condition_kind = WatchConditionKind::Price;
+                r.condition_instrument = Some("rb2601".to_string());
+                r.operator = ">=".to_string();
+                r.value = Decimal::ZERO;
+                r
+            })
+            .unwrap()
+    }
+
+    /// 为 rb2601 写入 mark=3000 行情（市价买参考价）。
+    fn seed_rb_mark(h: &Harness) {
+        h.quotes.apply(
+            &Instrument::new(Venue::Ctp, MarketKind::Futures, "rb2601"),
+            trading_core::quote::QuoteUpdate {
+                mark: Some(dec("3000")),
+                ts_recv_ms: 1,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// new 规则现金口径计入 provider 乘数：30000 ÷ (3000×10) = 1 手。
+    #[tokio::test]
+    async fn new_rule_with_order_cash_accounts_contract_multiplier() {
+        let registry = Arc::new(ExchangeRegistry::from_providers(vec![Arc::new(
+            SpecProvider {
+                multiplier: Some(Decimal::from(10)),
+            },
+        )]));
+        let h = Harness::with_registry(false, registry);
+        let rule = ctp_cash_rule(&h);
+        seed_rb_mark(&h);
+        assert_eq!(h.engine.run_scan().await.fired, 1);
+        let cid = h.sent()[0].0.clone();
+        let order = h.orders.get_by_cid(&cid).unwrap();
+        assert_eq!(order.order_quantity, dec("1"));
+        assert_eq!(order.rule_id, rule.id);
+    }
+
+    /// provider 要求乘数但未预热：本轮跳过、不起单、规则保持 active 待下轮重试。
+    #[tokio::test]
+    async fn new_rule_cash_order_skips_when_multiplier_missing() {
+        let registry = Arc::new(ExchangeRegistry::from_providers(vec![Arc::new(
+            SpecProvider { multiplier: None },
+        )]));
+        let h = Harness::with_registry(false, registry);
+        let rule = ctp_cash_rule(&h);
+        seed_rb_mark(&h);
+        let report = h.engine.run_scan().await;
+        assert_eq!(report.fired, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(h.sent().is_empty());
+        assert_eq!(
+            h.rules.get(rule.id).unwrap().status,
+            WatchRuleStatus::Active
+        );
     }
 
     #[tokio::test]

@@ -166,6 +166,26 @@ pub trait VenueProvider: Send + Sync {
         instrument.trim().to_string()
     }
 
+    /// 该所的合约静态规格（同步、纯内存、无网络）。
+    ///
+    /// 默认 `None` = 不提供（回退共享规则行/缺省 1）；持有本地静态目录的所
+    /// （CTP `InstrumentDir`）覆盖之。仅供下单现金换算取乘数/手数步长。
+    fn contract_spec(
+        &self,
+        _exchange: &str,
+        _instrument: &str,
+    ) -> Option<crate::api::ContractSpec> {
+        None
+    }
+
+    /// 现金口径下单是否**必须**有合约乘数才能换算。
+    ///
+    /// 默认 false：缺乘数时按 1 回退（币安/HL/未知所行为不变）。CTP 覆盖为 true：
+    /// 合约目录未预热时宁可拒单，也不能按乘数 1 换算放大手数。
+    fn requires_contract_multiplier(&self) -> bool {
+        false
+    }
+
     /// claim/建单前的**同步、纯内存**预检（无网络/凭证）。
     ///
     /// 默认原样透传（Binance/xili 不覆盖=行为不变）；需要市价转限价或平仓价差

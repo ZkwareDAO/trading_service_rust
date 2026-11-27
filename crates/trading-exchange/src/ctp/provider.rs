@@ -8,8 +8,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
+use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 
+use crate::api::ContractSpec;
 use crate::ctp::account_consumer::{CtpVenueConnector, SessionRegistry};
 use crate::ctp::core::account::CtpAccount;
 use crate::ctp::instrument_dir::InstrumentDir;
@@ -267,6 +269,26 @@ impl VenueProvider for CtpProvider {
     /// CTP 合约号原样（大小写敏感，仅 trim）。
     fn normalize_instrument(&self, _exchange: &str, instrument: &str) -> String {
         instrument.trim().to_string()
+    }
+
+    /// CTP 合约乘数来自进程级 `InstrumentDir`（登录后全量预热 / 冷启动 CSV 种子）。
+    ///
+    /// 未预热或乘数非正返回 None：现金口径下单据此 fail-closed（见
+    /// [`VenueProvider::requires_contract_multiplier`]），避免按乘数 1 换算放大手数。
+    /// CTP 手数为整数手，`lot_step` 固定 1。
+    fn contract_spec(&self, _exchange: &str, instrument: &str) -> Option<ContractSpec> {
+        let multiple = self.instrument_dir.multiple(instrument);
+        if multiple <= 0 {
+            return None;
+        }
+        Some(ContractSpec {
+            multiplier: Decimal::from(multiple),
+            lot_step: Some(Decimal::ONE),
+        })
+    }
+
+    fn requires_contract_multiplier(&self) -> bool {
+        true
     }
 
     /// 建单前同步预检：**全部期权 + `market_limit_exchanges` 内的期货**市价单
@@ -749,6 +771,25 @@ mod tests {
             short_margin_ratio: 0.0,
         });
         p
+    }
+
+    /// 预热后：乘数取自 InstrumentDir，手数步长固定整数手 1。
+    #[test]
+    fn contract_spec_reads_instrument_dir_multiple() {
+        let p = provider_with("SHFE", 1.0, None, 1);
+        let spec = p.contract_spec(NAME, "rb2510").expect("预热后应有规格");
+        assert_eq!(spec.multiplier, Decimal::from(10));
+        assert_eq!(spec.lot_step, Some(Decimal::ONE));
+        assert!(p.requires_contract_multiplier());
+    }
+
+    /// 未预热：返回 None（配合 requires=true 由下单路径 fail-closed 拒单）。
+    #[test]
+    fn contract_spec_none_when_not_prewarmed() {
+        let creds: Arc<dyn CredentialResolver> =
+            Arc::new(StubResolver(Mutex::new(std::collections::HashMap::new())));
+        let p = CtpProvider::new(deps_with(creds), CtpConfig::for_tests());
+        assert!(p.contract_spec(NAME, "rb2510").is_none());
     }
 
     #[test]
